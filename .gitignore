@@ -1,0 +1,5 @@
+build/
+vk_train_splats
+cs5330_*_*/
+*.spv
+splats/

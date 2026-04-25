@@ -1,0 +1,161 @@
+# version 450
+
+# extension GL_EXT_shader_atomic_float : require
+
+// Zach Youssef, 4/21/26
+// Compute shader for performing backwards propogation of rasterizing gaussian splats
+
+// I made extensive reference of the backward implementation from the original paper,
+// which can be found at https://github.com/graphdeco-inria/diff-gaussian-rasterization/
+
+layout(local_size_x = 32, local_size_y = 32) in;
+
+struct SplatEntry {
+    uint index;
+    uint depth;
+    vec2 _padding0;
+};
+
+// depth-sorted buffer of splats from rasterizatioon
+layout(std140, binding = 0) readonly buffer TileEntries {
+    SplatEntry entries[];
+} tileEntries;
+
+struct ImagespaceSplat {
+    vec2 mean;
+    float depth;
+    vec3 conic;
+    float radius;
+    uvec4 extent;
+    vec3 rgb;
+    vec3 rgbClamped;
+    float alpha;
+};
+
+// The buffer of Splats we tried to render
+layout(std140, binding = 1) readonly buffer SplatBuffer {
+    ImagespaceSplat splats[];
+} splatBuffer;
+
+// The image we rendered
+layout(binding = 2, rgba8) uniform readonly image2D rendered;
+
+// The image we tried to replicate
+layout(binding = 3, rgba8) uniform readonly image2D actual;
+
+// Cached values for gradient computatoin
+layout(binding = 4, rg16) uniform readonly image2D grad_cache;
+
+struct RasterGrad {
+    vec3 dl_drgb;
+    vec2 dl_dmean;
+    float dl_dconicx;
+    float dl_dconicy;
+    float dl_dconicz;
+    float dl_dalpha;
+};
+
+// Buffer to store gradients for each splat calculated in this step
+layout(std140, binding = 5) buffer RasterGradients {
+    RasterGrad grads[];
+} rasterGrad;
+
+layout(binding = 6) readonly uniform ControlParams {
+    uvec4 tile_extents[16];
+    int max_splat_idx;
+    int max_splats_per_tile;
+} params;
+
+// Precompute 1/255 once for convenience
+const float R_255 = 1.0 / 255.0;
+
+void main() {
+    // Grab this tile's extent
+    int tileIdx = int(gl_GlobalInvocationID.z);
+    uvec4 tileExtent = params.tile_extents[tileIdx];
+    // Get the xy of the pixel we are backpropogating for
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy) + ivec2(tileExtent[0], tileExtent[1]);
+    bool insideTile = p.x < tileExtent[1] && p.y < tileExtent[3];
+
+    // Compute l1 difference with actual image
+    vec3 real = imageLoad(actual, p).rgb;
+    vec3 dl_dpixel = imageLoad(rendered, p).rgb - real;
+
+    // Load cached T & last_contributor
+    vec4 cached = imageLoad(grad_cache, p);
+    int last_contributor = int(cached.x);
+    float T_final = cached.y;
+
+    // Bookeeping variables
+    float T = T_final;
+    vec3 rgb_accum = vec3(0.0);
+    float lastAlpha = 0;
+    vec3 lastColor = vec3(0.0);
+
+    // 'Unwind' the calculation done for rasterization, starting at the last splat rendered
+    for(int contributor = last_contributor; contributor >= 0; --contributor) {
+        // Grab the splat
+        SplatEntry entry = tileEntries.entries[(tileIdx * params.max_splats_per_tile) + contributor];
+        ImagespaceSplat splat = splatBuffer.splats[entry.index];
+
+        // Compute the splat's opacity at this pixel
+        vec2 x = splat.mean - p;
+        vec3 conic = splat.conic;
+        float power = -0.5 * (conic.x * x.x * x.x + conic.z * x.y * x.y) - conic.y * x.x * x.y;
+        if (power > 0.0f) {
+            continue;
+        }
+        float G = exp(power);
+        float alpha = min(0.99, splat.alpha * G);
+        if (alpha < R_255) {
+            continue;
+        }
+
+        T = T / (1.0 - alpha);
+        float dchannel_dcolor = alpha * T;
+
+        // Propogate gradient to splat color, accumulating a gradient for alpha
+        float dl_dalpha = 0.0;
+        for(int i = 0; i < 3; ++i) {
+            float c = splat.rgb[i];
+            // Keep track of the color unwinding
+            rgb_accum[i] = lastAlpha * lastColor[i] + (1.f - lastAlpha) * rgb_accum[i];
+            lastColor[i] = c;
+
+            float dl_dchannel = dl_dpixel[i];
+            dl_dalpha += (c - rgb_accum[i]) * dl_dchannel;
+
+            // Update the gradient for the splat's color channel
+            if (insideTile) {
+                atomicAdd(rasterGrad.grads[entry.index].dl_drgb[i], dchannel_dcolor * dl_dchannel);
+            }
+        }
+
+        // Update alpha bookeeping
+        dl_dalpha *= T;
+        lastAlpha = alpha;
+
+        // The paper's referenced code implementation would take BG color into account, but looking at their math
+        // the term dissapears if the BG color is black like it is in my implementation
+
+        // Compute intermediate variables for the rest of the gradient updates
+        float dl_dG = splat.alpha * dl_dalpha;
+        vec2 gdx = G * x;
+        float dG_ddelx = -gdx.x * conic.x - gdx.y * conic.y;
+        float dG_ddely = -gdx.y * conic.z - gdx.x * conic.y;
+
+        if(insideTile) {
+            // Update gradients for the image-space mean of the gradient
+            atomicAdd(rasterGrad.grads[entry.index].dl_dmean.x, dl_dG * dG_ddelx * dG_ddelx);
+            atomicAdd(rasterGrad.grads[entry.index].dl_dmean.y, dl_dG * dG_ddely * dG_ddely);
+
+            // Update gradients for the conic / image-space covariance
+            atomicAdd(rasterGrad.grads[entry.index].dl_dconicx, -0.5 * gdx.x * x.x * dl_dG);
+            atomicAdd(rasterGrad.grads[entry.index].dl_dconicy, -0.5 * gdx.x * x.y * dl_dG);
+            atomicAdd(rasterGrad.grads[entry.index].dl_dconicz, -0.5 * gdx.y * x.y * dl_dG);
+
+            // Update gradient for opacity
+            atomicAdd(rasterGrad.grads[entry.index].dl_dalpha, G * dl_dalpha);
+        }
+    }
+}

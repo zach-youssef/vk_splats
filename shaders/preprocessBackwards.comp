@@ -1,0 +1,445 @@
+ # version 450
+
+// Zach Youssef, 4/21/26
+// Compute shader for backwards propogation of splat preprocessing step
+
+// I made extensive reference of the backward implementation from the original paper,
+// which can be found at https://github.com/graphdeco-inria/diff-gaussian-rasterization/
+
+// Spherical harmonics coefficients
+const float SH_C0 = 0.28209479177387814f;
+const float SH_C1 = 0.4886025119029199f;
+const float SH_C2[] = {
+	1.0925484305920792f,
+	-1.0925484305920792f,
+	0.31539156525252005f,
+	-1.0925484305920792f,
+	0.5462742152960396f
+};
+const float SH_C3[] = {
+	-0.5900435899266435f,
+	2.890611442640554f,
+	-0.4570457994644658f,
+	0.3731763325901154f,
+	-0.4570457994644658f,
+	1.445305721320277f,
+	-0.5900435899266435f
+};
+
+layout(local_size_x = 256) in;
+
+struct Splat {
+    vec3 mean;
+    vec3 scale;
+    vec4 rotation;
+    float alpha;
+    vec3 sh[16];
+};
+
+struct ImagespaceSplat {
+    vec2 mean;
+    float depth;
+    vec3 conic;
+    float radius;
+    uvec4 extent;
+    vec3 rgb;
+    vec3 rgbClamped;
+    float alpha;
+};
+
+// Input Buffer of Splats
+layout(std140, binding = 0) readonly buffer SplatBuffer {
+    Splat splats[];
+} splatBuffer;
+
+// Input buffer of splats in image space from forward pass
+layout(std140, binding = 1) readonly buffer ImagespaceBuffer {
+    ImagespaceSplat splats[];
+} imagespaceBuffer;
+
+// Camera Props
+layout(binding = 2) readonly uniform CameraProps {
+    mat4 view;
+    mat4 projection;
+    int image_size;
+    float focal_length;
+    float tan_fov;
+} cameraProps;
+
+// Additional parameters
+layout(binding = 3) readonly uniform ControlParams {
+    int max_index;
+    int sh_degree;
+    float near_plane;
+} params;
+
+struct RasterGrad {
+    vec3 dl_drgb;
+    vec2 dl_dmean;
+    float dl_dconicx;
+    float dl_dconicy;
+    float dl_dconicz;
+    float dl_dalpha;
+};
+
+// Buffer containing gradients from rasterization
+layout(std140, binding = 4) readonly buffer RasterGradients {
+    RasterGrad grads[];
+} rasterGrad;
+
+// Buffer containing the final gradients for the splat
+// (Same data shape as the splats themselves)
+layout(std140, binding = 5) buffer SplatGradients {
+    Splat splats[];
+} splatGrad;
+
+// Converts a splat's scale and rotation into it's 3D covariance matrix
+mat3 computeCovariance(vec3 scale, vec4 rotation) {
+    // Convert scale to matrix
+    mat3 S = mat3(1.0);
+    S[0][0] = scale.x;
+    S[1][1] = scale.y;
+    S[2][2] = scale.z;
+
+    // Normalize rotation & construct matrix
+    // Following example from the paper's forward.cu -> computeCov3D
+    vec4 q = normalize(rotation);
+    float r = q.x;
+    float x = q.y;
+    float y = q.z;
+    float z = q.w;
+    mat3 R = mat3(
+        1. - 2. * (y * y + z * z), 2. * (x * y - r * z), 2. * (x * z + r * y),
+		2. * (x * y + r * z), 1. - 2. * (x * x + z * z), 2. * (y * z - r * x),
+		2. * (x * z - r * y), 2. * (y * z + r * x), 1. - 2. * (x * x + y * y)
+    );
+
+    // Compute covariance
+    mat3 M = S * R;
+    return transpose(M) * M;
+}
+
+// Compute the gradient contributions from projecting our covariance into image space
+void computeCovarianceProjectionGradient(int splatIdx, bool shouldUpdate, out float dl_dcov3d[6]) {
+    // Fetch gradients & recompute relevant intermediate results
+    Splat splat = splatBuffer.splats[splatIdx];
+    vec3 mean = splat.mean;
+    vec3 dl_dconic = vec3(
+        rasterGrad.grads[splatIdx].dl_dconicx,
+        rasterGrad.grads[splatIdx].dl_dconicy,
+        rasterGrad.grads[splatIdx].dl_dconicz
+    );
+    vec4 view_mean_h = cameraProps.view * vec4(mean, 1.0);
+    float h_recip = 1.0 / view_mean_h.w;
+    vec3 t = view_mean_h.xyz * h_recip;
+
+    float limit = 1.3 * cameraProps.tan_fov;
+    float txtz = t.x / t.z;
+    float tytz = t.y / t.z;
+    t.x = min(limit, max(-limit, txtz)) * t.z;
+    t.y = min(limit, max(-limit, tytz)) * t.z;
+
+    float x_grad_mul = (txtz < -limit || txtz > limit) ? 0 : 1;
+    float y_grad_mul = (tytz < -limit || tytz > limit) ? 0 : 1;
+
+    float focal = cameraProps.focal_length;
+    mat3 J = mat3(focal / t.z,  0.0,            -(focal * t.x) / (t.z * t.z), 
+                  0.0,          focal / t.z,    -(focal * t.y) / (t.z * t.z), 
+                  0.0,          0.0,            0.0);
+    mat4 view = cameraProps.view;
+    mat3 W = mat3(view[0].xyz, view[1].xyz, view[2].xyz);
+    mat3 T = W * J;
+
+    // Reconstruct 3D covariance matrix
+    mat3 Vrk = computeCovariance(splat.scale, splat.rotation);
+
+    // Reconstruct 2D covariance matrix
+    mat3 cov2D = transpose(T) * Vrk * T;
+    // Extract relevant entries of cov2D for comnvenience
+    float c_xx = cov2D[0][0];
+    float c_xy = cov2D[0][1];
+    float c_yy = cov2D[1][1];
+
+    float denom = c_xx * c_yy - c_xy * c_xy;
+    float denom2inv = 1.0f / ((denom * denom) + 0.000000001);
+
+    // Compute gradient from conic -> 2D covariance 
+    float dL_dc_xx = denom2inv * (-c_yy * c_yy * dl_dconic.x + 2 * c_xy * c_yy * dl_dconic.y + (denom - c_xx * c_yy) * dl_dconic.z); 
+    float dL_dc_yy = denom2inv * (-c_xx * c_xx * dl_dconic.z + 2 * c_xx * c_xy * dl_dconic.y + (denom - c_xx * c_yy) * dl_dconic.x); 
+    float dL_dc_xy = denom2inv * 2 * (c_xy * c_yy * dl_dconic.x - (denom + 2 * c_xy * c_xy) * dl_dconic.y + c_xx * c_xy * dl_dconic.z);
+
+    // Compute gradient from 2D -> 3D for the diagonal entries
+	dl_dcov3d[0] = (T[0][0] * T[0][0] * dL_dc_xx + T[0][0] * T[1][0] * dL_dc_xy + T[1][0] * T[1][0] * dL_dc_yy);
+	dl_dcov3d[3] = (T[0][1] * T[0][1] * dL_dc_xx + T[0][1] * T[1][1] * dL_dc_xy + T[1][1] * T[1][1] * dL_dc_yy);
+	dl_dcov3d[5] = (T[0][2] * T[0][2] * dL_dc_xx + T[0][2] * T[1][2] * dL_dc_xy + T[1][2] * T[1][2] * dL_dc_yy);
+
+    // Compute gradient from 2D -> 3D for the off-diagonal entries
+    dl_dcov3d[1] = 2 * T[0][0] * T[0][1] * dL_dc_xx + (T[0][0] * T[1][1] + T[0][1] * T[1][0]) * dL_dc_xy + 2 * T[1][0] * T[1][1] * dL_dc_yy;
+    dl_dcov3d[2] = 2 * T[0][0] * T[0][2] * dL_dc_xx + (T[0][0] * T[1][2] + T[0][2] * T[1][0]) * dL_dc_xy + 2 * T[1][0] * T[1][2] * dL_dc_yy;
+    dl_dcov3d[4] = 2 * T[0][2] * T[0][1] * dL_dc_xx + (T[0][1] * T[1][2] + T[0][2] * T[1][1]) * dL_dc_xy + 2 * T[1][1] * T[1][2] * dL_dc_yy;
+
+    // I'm pretty sure zeroing out at the end if invalid is better than putting the computation in a branch
+    if (denom2inv == 0) {
+        for (int i = 0; i < 6; ++i) {
+            dl_dcov3d[i] = 0;
+        }
+    }
+
+    // Compute gradient from loss to upper 2x3 section of T
+	float dL_dT00 = 2 * (T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_dc_xx +
+	(T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_dc_xy;
+	float dL_dT01 = 2 * (T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_dc_xx +
+	(T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_dc_xy;
+	float dL_dT02 = 2 * (T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_dc_xx +
+	(T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_dc_xy;
+	float dL_dT10 = 2 * (T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_dc_yy +
+	(T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_dc_xy;
+	float dL_dT11 = 2 * (T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_dc_yy +
+	(T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_dc_xy;
+	float dL_dT12 = 2 * (T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_dc_yy +
+	(T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_dc_xy;
+
+    // Compute gradient from loss to upper 3x2 section of the Jacobian
+    float dL_dJ00 = W[0][0] * dL_dT00 + W[0][1] * dL_dT01 + W[0][2] * dL_dT02;
+	float dL_dJ02 = W[2][0] * dL_dT00 + W[2][1] * dL_dT01 + W[2][2] * dL_dT02;
+	float dL_dJ11 = W[1][0] * dL_dT10 + W[1][1] * dL_dT11 + W[1][2] * dL_dT12;
+	float dL_dJ12 = W[2][0] * dL_dT10 + W[2][1] * dL_dT11 + W[2][2] * dL_dT12;
+
+    // Compute gradient with respect of viewspace transformation of mean
+    float tz = 1.f / t.z;
+	float tz2 = tz * tz;
+	float tz3 = tz2 * tz;
+    float dL_dtx = x_grad_mul * -focal * tz2 * dL_dJ02;
+	float dL_dty = y_grad_mul * -focal * tz2 * dL_dJ12;
+	float dL_dtz = -focal * tz2 * dL_dJ00 - focal * tz2 * dL_dJ11 + (2 * focal * t.x) * tz3 * dL_dJ02 + (2 * focal * t.y) * tz3 * dL_dJ12;
+    vec4 dl_dmean_h = view * vec4(dL_dtx, dL_dty, dL_dtz, 1);
+    h_recip = 1.0 / dl_dmean_h.w;
+    vec3 dl_dmean = dl_dmean_h.xyz * h_recip;
+
+    // Update the total mean gradient
+    if (shouldUpdate) {
+        splatGrad.splats[splatIdx].mean += dl_dmean;
+    }
+}
+
+// Compute the gradient contributions from constructing a 3D covariance matrix from our rotation & scale
+void computeCovarianceConstructionGradient(int splatIdx, bool shouldUpdate, float dl_dcov3D[6]) {
+    // Recompute intermediate results for the original computation
+    Splat splat = splatBuffer.splats[splatIdx];
+    vec3 scale = splat.scale;
+    mat3 S = mat3(1.0);
+    S[0][0] = scale.x;
+    S[1][1] = scale.y;
+    S[2][2] = scale.z;
+    vec4 rot = splat.rotation;
+    vec4 q = normalize(rot);
+    float r = q.x;
+    float x = q.y;
+    float y = q.z;
+    float z = q.w;
+    mat3 R = mat3(
+        1. - 2. * (y * y + z * z), 2. * (x * y - r * z), 2. * (x * z + r * y),
+		2. * (x * y + r * z), 1. - 2. * (x * x + z * z), 2. * (y * z - r * x),
+		2. * (x * z - r * y), 2. * (y * z + r * x), 1. - 2. * (x * x + y * y)
+    );
+    mat3 M = S * R;
+
+    // Construct per-element covariance loss into a matrix
+    mat3 dl_dsigma = mat3(
+        dl_dcov3D[0], 0.5 * dl_dcov3D[1], 0.5 * dl_dcov3D[2],
+        0.5 * dl_dcov3D[1], dl_dcov3D[3], 0.5 * dl_dcov3D[4],
+        0.5 * dl_dcov3D[2], 0.5 * dl_dcov3D[4], dl_dcov3D[5]);
+
+    // Compute loss gradient for component matrix m/m.t
+    mat3 dl_dM = 2.0 * M * dl_dsigma;
+    mat3 Rt = transpose(R);
+    mat3 dl_dMt = transpose(dl_dM);
+
+    // Compute gradient contribution to the scale
+    vec3 dl_dscale = vec3(
+        dot(Rt[0], dl_dMt[0]),
+        dot(Rt[1], dl_dMt[1]),
+        dot(Rt[2], dl_dMt[2]));
+    if (shouldUpdate) {
+        splatGrad.splats[splatIdx].scale = dl_dscale;
+    }
+
+    // Remove scale contribution from dl_dmt
+    dl_dMt[0] *= scale.x;
+    dl_dMt[1] *= scale.y;
+    dl_dMt[2] *= scale.z;
+
+    // Compute gradient from M to the normalized quaternion
+    vec4 dl_dq;
+	dl_dq.x = 2 * z * (dl_dMt[0][1] - dl_dMt[1][0]) + 2 * y * (dl_dMt[2][0] - dl_dMt[0][2]) + 2 * x * (dl_dMt[1][2] - dl_dMt[2][1]);
+	dl_dq.y = 2 * y * (dl_dMt[1][0] + dl_dMt[0][1]) + 2 * z * (dl_dMt[2][0] + dl_dMt[0][2]) + 2 * r * (dl_dMt[1][2] - dl_dMt[2][1]) - 4 * x * (dl_dMt[2][2] + dl_dMt[1][1]);
+	dl_dq.z = 2 * x * (dl_dMt[1][0] + dl_dMt[0][1]) + 2 * r * (dl_dMt[2][0] - dl_dMt[0][2]) + 2 * z * (dl_dMt[1][2] + dl_dMt[2][1]) - 4 * y * (dl_dMt[2][2] + dl_dMt[0][0]);
+	dl_dq.w = 2 * r * (dl_dMt[0][1] - dl_dMt[1][0]) + 2 * x * (dl_dMt[2][0] + dl_dMt[0][2]) + 2 * y * (dl_dMt[1][2] + dl_dMt[2][1]) - 4 * z * (dl_dMt[1][1] + dl_dMt[0][0]);
+
+    // Propogate gradient through quaternion normalization itself
+    // Full disclosure: they kind of lose me here. This is heavily based on the auxilary 'dnormvdv' function in their auxiliary file
+    float sum2 = dot(rot, rot);
+    float invsum32 = 1.0 / sqrt(sum2 * sum2 * sum2);
+    vec4 vdv = rot * dl_dq;
+    float vdv_sum = vdv.x + vdv.y + vdv.z + vdv.w;
+    vec4 dnormvdv; 
+    dnormvdv.x = ((sum2 - rot.x * rot.x) * dl_dq.x - rot.x * (vdv_sum - vdv.x)) * invsum32; 
+    dnormvdv.y = ((sum2 - rot.y * rot.y) * dl_dq.y - rot.y * (vdv_sum - vdv.y)) * invsum32; 
+    dnormvdv.z = ((sum2 - rot.z * rot.z) * dl_dq.z - rot.z * (vdv_sum - vdv.z)) * invsum32; 
+    dnormvdv.w = ((sum2 - rot.w * rot.w) * dl_dq.w - rot.w * (vdv_sum - vdv.w)) * invsum32;
+    if (shouldUpdate) {
+        splatGrad.splats[splatIdx].rotation = dnormvdv;
+    }
+}
+
+// convenience macro for setting SH gradients since there's a lot of them
+#define SET_SH(idx, val) splatGrad.splats[splatIdx].sh[idx] = val * dl_drgb;
+
+void computeShGradients(int splatIdx, bool shouldUpdate) {
+    // Grab relevant buffer objects
+    Splat splat = splatBuffer.splats[splatIdx];
+    RasterGrad grad = rasterGrad.grads[splatIdx];
+    ImagespaceSplat img = imagespaceBuffer.splats[splatIdx];
+
+    // Follow pytorch convention and 0 out raster gradient where clamping was applied
+    vec3 dl_drgb = grad.dl_drgb;
+    dl_drgb.x *= img.rgbClamped[0];
+    dl_drgb.y *= img.rgbClamped[1];
+    dl_drgb.z *= img.rgbClamped[2];
+
+    // Reconstruct direction from point to camera
+    vec3 dir = splat.mean - cameraProps.view[3].xyz;
+    // (for convenience)
+    float x = dir.x;
+    float y = dir.y;
+    float z = dir.z;
+
+    // Initialize gradients from color to direction
+    vec3 drgb_dx = vec3(0);
+    vec3 drgb_dy = vec3(0);
+    vec3 drgb_dz = vec3(0);
+
+    // Exiting here since writing the the update check for this section would be a nightmare
+    if (!shouldUpdate) {
+        return;
+    }
+
+    // Compute the gradients for each SH degree using what the original implementation refers to
+    // as "high-school-level calculus", which is probably true, but it's been a long time since
+    // I used calculus daily and am choosing to take that comment as an insult to me specificaly
+    SET_SH(0, SH_C0) // The first few degrees are pretty straighforward lol
+    if (params.sh_degree > 0) {
+        SET_SH(1, -SH_C1 * dir.y)
+        SET_SH(2, SH_C1 * dir.z)
+        SET_SH(3, -SH_C1 * dir.x)
+
+        drgb_dx -= SH_C1 * splat.sh[3];
+        drgb_dy -= SH_C1 * splat.sh[1];
+        drgb_dz += SH_C1 * splat.sh[2];
+
+        if (params.sh_degree > 1) {
+            float xx = x * x, yy = y * y, zz = z * z;
+            float xy = x * y, xz = x * z, yz = y * z;
+
+            SET_SH(4, SH_C2[0] * xy) 
+            SET_SH(5, SH_C2[1] * yz) 
+            SET_SH(6, SH_C2[2] * (2.0 * zz - xx - yy)) 
+            SET_SH(7, SH_C2[3] * xz) 
+            SET_SH(8, SH_C2[4] * (xx - yy))
+
+			drgb_dx += SH_C2[0] * y * splat.sh[4] + SH_C2[2] * 2.0 * -x * splat.sh[6] + SH_C2[3] * z * splat.sh[7] + SH_C2[4] * 2.0 * x * splat.sh[8];
+			drgb_dy += SH_C2[0] * x * splat.sh[4] + SH_C2[1] * z * splat.sh[5] + SH_C2[2] * 2.0 * -y * splat.sh[6] + SH_C2[4] * 2.0 * -y * splat.sh[8];
+			drgb_dz += SH_C2[1] * y * splat.sh[5] + SH_C2[2] * 2.0 * 2.0 * z * splat.sh[6] + SH_C2[3] * x * splat.sh[7];
+
+            if (params.sh_degree > 2) {
+				SET_SH(9 ,SH_C3[0] * y * (3.f * xx - yy))
+				SET_SH(0 ,SH_C3[1] * xy * z)
+				SET_SH(1 ,SH_C3[2] * y * (4.f * zz - xx - yy))
+				SET_SH(2 ,SH_C3[3] * z * (2.f * zz - 3.f * xx - 3.f * yy))
+				SET_SH(3 ,SH_C3[4] * x * (4.f * zz - xx - yy))
+				SET_SH(4 ,SH_C3[5] * z * (xx - yy))
+				SET_SH(5 ,SH_C3[6] * x * (xx - 3.f * yy))
+
+				drgb_dx += (
+					SH_C3[0] * splat.sh[9] * 3.f * 2.f * xy +
+					SH_C3[1] * splat.sh[10] * yz +
+					SH_C3[2] * splat.sh[11] * -2.f * xy +
+					SH_C3[3] * splat.sh[12] * -3.f * 2.f * xz +
+					SH_C3[4] * splat.sh[13] * (-3.f * xx + 4.f * zz - yy) +
+					SH_C3[5] * splat.sh[14] * 2.f * xz +
+					SH_C3[6] * splat.sh[15] * 3.f * (xx - yy));
+
+				drgb_dy += (
+					SH_C3[0] * splat.sh[9] * 3.f * (xx - yy) +
+					SH_C3[1] * splat.sh[10] * xz +
+					SH_C3[2] * splat.sh[11] * (-3.f * yy + 4.f * zz - xx) +
+					SH_C3[3] * splat.sh[12] * -3.f * 2.f * yz +
+					SH_C3[4] * splat.sh[13] * -2.f * xy +
+					SH_C3[5] * splat.sh[14] * -2.f * yz +
+					SH_C3[6] * splat.sh[15] * -3.f * 2.f * xy);
+
+				drgb_dz += (
+					SH_C3[1] * splat.sh[10] * xy +
+					SH_C3[2] * splat.sh[11] * 4.f * 2.f * yz +
+					SH_C3[3] * splat.sh[12] * 3.f * (2.f * zz - xx - yy) +
+					SH_C3[4] * splat.sh[13] * 4.f * 2.f * xz +
+					SH_C3[5] * splat.sh[14] * (xx - yy));
+            }
+        }
+    }
+
+    // Finalize loss gradient to view direction
+    vec3 dl_ddir = vec3(dot(drgb_dx, dl_drgb), dot(drgb_dy, dl_drgb), dot(drgb_dz, dl_drgb));
+    // Use the 'dnormvdv' process to take the normalization of the direction into account
+    float sum2 = dot(dir, dir);
+    float invsum32 = 1.0f / sqrt(sum2 * sum2 * sum2);
+    vec3 dnormvdv; 
+    dnormvdv.x = ((sum2 - dir.x * dir.x) * dl_ddir.x - dir.y * dir.x * dl_ddir.y - dir.z * dir.x * dl_ddir.z) * invsum32; 
+    dnormvdv.y = (-dir.x * dir.y * dl_ddir.x + (sum2 - dir.y * dir.y) * dl_ddir.y - dir.z * dir.y * dl_ddir.z) * invsum32; 
+    dnormvdv.z = (-dir.x * dir.z * dl_ddir.x - dir.y * dir.z * dl_ddir.y + (sum2 - dir.z * dir.z) * dl_ddir.z) * invsum32;
+    
+    splatGrad.splats[splatIdx].mean += dnormvdv;
+}
+
+void main() {
+    int splatIdx = int(gl_GlobalInvocationID.x);
+    // Don't update gradients from this thread if we are a dupe
+    // (I'm pretty sure this is faster than having a branch to do no work?)
+    bool shouldUpdate = splatIdx <= params.max_index;
+    splatIdx = min(splatIdx, params.max_index);
+    Splat splat = splatBuffer.splats[splatIdx];
+    RasterGrad rasterGrad = rasterGrad.grads[splatIdx];
+
+    // Calculate gradient from projecting means to image space
+    vec3 mean = splat.mean;
+    mat4 proj = cameraProps.projection;
+    vec4 mean_h = proj * vec4(mean, 1.0);
+    float mean_w = 1.0 / (mean_h.w + 0.000000001);
+    vec3 dl_dmean;
+    vec2 dl_dmean2D = rasterGrad.dl_dmean;
+    float mul1 = (proj[0][0] * mean.x + proj[1][0] * mean.y + proj[2][0] * mean.z + proj[3][0]) * mean_w * mean_w; 
+    float mul2 = (proj[0][1] * mean.x + proj[1][1] * mean.y + proj[2][1] * mean.z + proj[3][1]) * mean_w * mean_w;
+	dl_dmean.x = (proj[0][0] * mean_w - proj[0][3] * mul1) * dl_dmean2D.x + (proj[0][1] * mean_w - proj[0][3] * mul2) * dl_dmean2D.y;
+	dl_dmean.y = (proj[0][0] * mean_w - proj[1][3] * mul1) * dl_dmean2D.x + (proj[1][1] * mean_w - proj[1][3] * mul2) * dl_dmean2D.y;
+	dl_dmean.z = (proj[0][0] * mean_w - proj[2][3] * mul1) * dl_dmean2D.x + (proj[2][1] * mean_w - proj[2][3] * mul2) * dl_dmean2D.y;
+
+    // Initialize the gradient w/ this piece (the rest will be added in later steps)
+    if (shouldUpdate) {
+        splatGrad.splats[splatIdx].mean = dl_dmean;
+    }
+
+    // Compute covariance projection gradient (also affects mean)
+    float dl_dcov3D[6];
+    computeCovarianceProjectionGradient(splatIdx, shouldUpdate, dl_dcov3D);
+
+    // Compute rotation/scale gradient from 3D covariance gradient
+    computeCovarianceConstructionGradient(splatIdx, shouldUpdate, dl_dcov3D);
+
+    // Compute SH gradients (also affects mean due to camera direction contribution)
+    computeShGradients(splatIdx, shouldUpdate);
+
+    // Copy over alpha gradient from rasterization step
+    if (shouldUpdate) {
+        splatGrad.splats[splatIdx].alpha = rasterGrad.dl_dalpha;
+    }
+}

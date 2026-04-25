@@ -1,0 +1,115 @@
+#version 450
+
+// Zach Youssef, 4/21/26
+// Compute shader for identifying which splats are contained by a given tile
+// Traverses the buffer of imagespace splats, and write out [index, depth] pairs
+// for future sorting before rasterization
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct ImagespaceSplat {
+    vec2 mean;
+    float depth;
+    vec3 conic;
+    float radius;
+    uvec4 extent;
+    vec3 rgb;
+    vec3 rgbClamped;
+    float alpha;
+};
+
+// Input Buffer of Splats
+layout(std140, binding = 0) readonly buffer SplatBuffer {
+    ImagespaceSplat splats[];
+} splatBuffer;
+
+struct SplatEntry {
+    uint index;
+    uint depth;
+    vec2 _padding0;
+};
+
+// Output buffer of [SplatIndex, SplatDepth] for sorting
+layout(std140, binding = 1) buffer TileEntries {
+    SplatEntry entries[];
+} tileEntries;
+
+layout(binding = 2) readonly uniform ControlParams {
+    uvec4 tile_extents[16];
+    int max_splat_idx;
+    int max_splats_per_tile;
+} params;
+
+layout(std140, binding = 3) writeonly buffer OutCount {
+    uint g_num_elements[16];
+} outCount;
+
+// Group memory for counting the number of splats on this tile
+shared uint[256] numSplats;
+
+// Helper for defining our parallel reduction
+// Returns the new writeOffset
+int reductionStep(int threadIdx, int stride, in int writeOffset, int regionWidth) {
+    if (threadIdx % (stride * 2) == 0) {
+        // Copy our neighbor's entries to the end of our region
+        int readOffset = (threadIdx + stride) * regionWidth;
+        for (int _i = 0; _i < numSplats[threadIdx + stride]; _i++) {
+            tileEntries.entries[writeOffset++] = tileEntries.entries[readOffset++];
+        }
+        // Update our count
+        numSplats[threadIdx] += numSplats[threadIdx + stride];
+    }
+    groupMemoryBarrier();
+    return writeOffset;
+}
+
+void main() {
+    int threadIdx = int(gl_GlobalInvocationID.x);
+    int tileIdx = int(gl_GlobalInvocationID.y);
+
+    int tileOffset = tileIdx * params.max_splats_per_tile;
+
+    int writeWidth = params.max_splats_per_tile / 256;
+    int readWidth = params.max_splat_idx / 256;
+    
+    int writeOffset = tileOffset + (threadIdx * writeWidth);
+    int readOffset = threadIdx * readWidth;
+
+    uvec4 tile = params.tile_extents[tileIdx];
+
+    // Make an entry for each splat contained by this tile
+    uint count = 0;
+    while (count < writeWidth && readOffset <= params.max_splat_idx) {
+        ImagespaceSplat splat = splatBuffer.splats[readOffset++];
+        uvec4 extent = splat.extent;
+
+        bool inTile = splat.radius > 0.0 
+            && (extent[0] > tile[0] && extent[0] < tile[2]) || (extent[2] > tile[0] && extent[2] < tile[2]) 
+            && (extent[1] > tile[1] && extent[1] < tile[3]) || (extent[3] > tile[1] && extent[3] < tile[3]);
+
+        if (inTile) {
+            tileEntries.entries[writeOffset++] = SplatEntry (uint(readOffset - 1), uint(splat.depth * 1000000), vec2(0));
+            count += 1;
+        }
+    }
+    numSplats[threadIdx] = count;
+
+    // Sync the threads before the next step
+    groupMemoryBarrier();
+
+    // Perform a parallel reduction to count the splats on this tile
+    // and put all the entries at the front of the out buffer
+    writeOffset = reductionStep(threadIdx, 1, writeOffset, writeWidth);
+    writeOffset = reductionStep(threadIdx, 2, writeOffset, writeWidth);
+    writeOffset = reductionStep(threadIdx, 4, writeOffset, writeWidth);
+    writeOffset = reductionStep(threadIdx, 8, writeOffset, writeWidth);
+    writeOffset = reductionStep(threadIdx, 16, writeOffset, writeWidth);
+    writeOffset = reductionStep(threadIdx, 32, writeOffset, writeWidth);
+    writeOffset = reductionStep(threadIdx, 64, writeOffset, writeWidth);
+    writeOffset = reductionStep(threadIdx, 128, writeOffset, writeWidth);
+
+    // Write out the final count
+    if (threadIdx == 0) {
+        outCount.g_num_elements[tileIdx] = numSplats[0];
+    }
+}

@@ -1,0 +1,72 @@
+// Zach Youssef, 4/22/26
+// Header defining a class for managing training parameters on the GPU
+
+#pragma once
+
+#include <VulkanApp.h>
+
+#include "GpuTypes.h"
+
+class TrainingManager {
+public:
+    TrainingManager(const LearningRates& learningRates, int maxIndex, float near_plane)
+    :learningRates_(learningRates) {
+        controls_ = PreprocessControls {maxIndex, 0, near_plane};
+    }
+
+    // Intialize GPU objects for controlling splat processing & learning rates
+    void initBuffers(VulkanApp<1>& app) {
+        // Create buffers
+        Buffer<PreprocessControls>::create(controlBuffer_,
+                                           1,
+                                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                           app.getDevice(),
+                                           app.getPhysicalDevice());
+        Buffer<LearningRates>::create(rateBuffer_,
+                                      1,
+                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                      app.getDevice(),
+                                      app.getPhysicalDevice());
+        // Initialize them to our starting values
+        controlBuffer_->mapAndExecute(0, sizeof(PreprocessControls), [this](void* mappedBuffer){
+            memcpy(mappedBuffer, &controls_, sizeof(PreprocessControls));
+        });
+        rateBuffer_->mapAndExecute(0, sizeof(LearningRates), [this](void* mappedBuffer){
+            memcpy(mappedBuffer, &learningRates_, sizeof(LearningRates));
+        });
+    }
+
+    // Updates the number of SH degrees in use
+    void setSHDegree(VulkanApp<1>& app, int shDegree) {
+        controls_.sh_degree = shDegree; 
+        controlBuffer_->mapAndExecute(offsetof(PreprocessControls, sh_degree), sizeof(int), [shDegree](void* mapped){
+            *(int*)mapped = shDegree;
+        });
+    }
+
+    // Update the learning rate for the splat means
+    void setMeanLr(VulkanApp<1>& app, float meanLr) {
+        learningRates_.mean = meanLr;
+        rateBuffer_->mapAndExecute(offsetof(LearningRates, mean), sizeof(float), [meanLr](void* mapped){
+            *(float*)mapped = meanLr;
+        });
+    }
+
+    VkBuffer control() {
+        return controlBuffer_->getBuffer();
+    }
+
+    VkBuffer learningRates() {
+        return rateBuffer_->getBuffer();
+    }
+
+private:
+    LearningRates learningRates_;
+    PreprocessControls controls_;
+
+    // Uniform buffers
+    std::unique_ptr<Buffer<PreprocessControls>> controlBuffer_;
+    std::unique_ptr<Buffer<LearningRates>> rateBuffer_;
+};

@@ -1,0 +1,68 @@
+# version 450
+
+// Zach Youssef, 4/21/26
+// Compute shader for updating the gaussian weights based on computed gradients
+
+layout(local_size_x = 256) in;
+
+struct Splat {
+    vec3 mean;
+    vec3 scale;
+    vec4 rotation;
+    float alpha;
+    vec3 sh[16];
+};
+
+// The splats we are updating
+layout(std140, binding = 0) buffer SplatBuffer {
+    Splat splats[];
+} splatBuffer;
+
+// The gradients to apply to the splat model
+layout(std140, binding = 1) buffer GradBuffer {
+    Splat splats[];
+} gradBuffer;
+
+// Learning rates for each model parameter
+layout(std140, binding = 2) readonly uniform LearningRates {
+    float mean;
+    float scale;
+    float rotation;
+    float alpha;
+    float sh_0;
+    float sh_h;
+} learningRates;
+
+// Convenience macro for updating a property of the splat model
+#define APPLY_GRADIENT(prop) \
+    splatBuffer.splats[splatIdx].prop -= learningRates.prop * grad.prop;
+
+float sigmoid(float x){
+    return 1.0 / (1.0 + exp(-x));
+}
+vec3 sigmoid(vec3 x){
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    // Get the index of the splat this thread is responsible for
+    int splatIdx = int(gl_GlobalInvocationID.x);
+    // Grab the computed gradients
+    Splat grad = gradBuffer.splats[splatIdx];
+
+    // Update each parameter based on it's learning rate
+    APPLY_GRADIENT(mean)
+    APPLY_GRADIENT(scale)
+    APPLY_GRADIENT(rotation)
+    APPLY_GRADIENT(alpha)
+
+    // Apply sigmoid to alpha & scale
+    splatBuffer.splats[splatIdx].alpha = sigmoid(splatBuffer.splats[splatIdx].alpha);
+    splatBuffer.splats[splatIdx].scale = sigmoid(splatBuffer.splats[splatIdx].scale);
+
+    // We have a separate learning rate for the 0 order sh coefficients
+    splatBuffer.splats[splatIdx].sh[0] -= learningRates.sh_0 * grad.sh[0];
+    for (int sh_idx = 1; sh_idx < 16; ++sh_idx) {
+        splatBuffer.splats[splatIdx].sh[sh_idx] -= learningRates.sh_h * grad.sh[sh_idx];
+    }
+}
