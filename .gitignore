@@ -3,3 +3,4 @@ vk_train_splats
 cs5330_*_*/
 *.spv
 splats/
+.DS_Store
