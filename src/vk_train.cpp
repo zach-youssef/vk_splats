@@ -2,7 +2,6 @@
 // Entrypoint for vulkan implementation of training a gaussian splat model
 #define STB_IMAGE_IMPLEMENTATION
 #define VK_WRAP_UTIL_IMPL
-#define BACKPROP
 
 #include <VulkanApp.h>
 #include <Descriptor.h>
@@ -138,7 +137,7 @@ int main(int argc, char** argv) {
     TileManager tileManager(maxSplatsPerTile);
     tileManager.initBuffers(app, maxSplatIndex, image_size);
 
-    TrainingManager trainManager(lr, maxSplatIndex, 0.2 /* near plane for frustum culling*/);
+    TrainingManager trainManager(lr, maxSplatIndex, 0.01 /* near plane for frustum culling*/);
     trainManager.initBuffers(app);
 
     ///
@@ -292,7 +291,6 @@ int main(int argc, char** argv) {
     renderGraph->addEdge(preprocess, assignment);
     renderGraph->addEdge(assignment, sorting);
     renderGraph->addEdge(sorting, rasterize);
-    //renderGraph->addEdge(rasterize, graphics);
 
 #ifdef BACKPROP
     // Set up backward pass edges
@@ -355,8 +353,14 @@ int main(int argc, char** argv) {
         }, a.getGraphicsQueue(), a.getDevice(), a.getCommandPool());
 
         // Upload the next training sample
+    #ifdef DEBUG_FIRST
+        if (iteration == 0 && currentSample == 0) {
+    #endif
         std::cout << "Iteration " << iteration << ": ";
         imageData.uploadTrainingSample(currentSample, a);
+    #ifdef DEBUG_FIRST
+        }
+    #endif
 
         currentSample++;
     };

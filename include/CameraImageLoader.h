@@ -26,15 +26,17 @@ public:
                 q[i] = std::stof(line[i + 1]);
             }
             glm::mat4 rotation = glm::toMat4(q);
+            glm::mat4 view = glm::inverse(rotation);
             // Parse translation
             glm::vec3 t;
             for (int i = 0; i < 3; ++i) {
                 t[i] = std::stof(line[i + 5]);
             }
-            glm::mat4 translation = glm::translate(glm::mat4(1.0f), t);
+            view[3] = {-t[0], -t[1], -t[2], 1};
+
             imageNames.push_back(imageDirectory + "/" + line[9]);
             return CameraPosition{
-                translation * rotation, 
+                view, 
                 static_cast<int32_t>(imageNames.size() - 1)
             };
         });
