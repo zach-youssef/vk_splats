@@ -27,12 +27,22 @@ public:
             }
             glm::mat4 rotation = glm::toMat4(q);
             glm::mat4 view = glm::inverse(rotation);
+
             // Parse translation
             glm::vec3 t;
             for (int i = 0; i < 3; ++i) {
                 t[i] = std::stof(line[i + 5]);
             }
-            view[3] = {-t[0], -t[1], -t[2], 1};
+
+            /////////
+            // WHY ON EARTH IS THIS BEHAVING ROW MAJOR?
+            // It should be:
+            //view[3] = {-t[0], -t[1], -t[2], 1};
+            // But according to the XCode debugger, I need to:
+            view[0][3] = -t[0];
+            view[1][3] = -t[1];
+            view[2][3] = -t[2];
+            /////////
 
             imageNames.push_back(imageDirectory + "/" + line[9]);
             return CameraPosition{
