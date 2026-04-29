@@ -48,6 +48,7 @@ public:
         Buffer<RasterControls>::createAndInitialize(controlBuffer_,
                                                     std::vector<RasterControls>{control},
                                                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                                     app.getDevice(),
                                                     app.getPhysicalDevice(),
                                                     app.getGraphicsQueue(),
@@ -67,6 +68,12 @@ public:
 
     VkBuffer control() {
         return controlBuffer_->getBuffer();
+    }
+
+    void setMaxIndex(VulkanApp<1>& app, int maxIndex) {
+        controlBuffer_->mapAndExecute(offsetof(RasterControls, max_splat_idx), sizeof(int), [maxIndex](void* mapped){
+            *(int*)mapped = maxIndex;
+        });
     }
 
 private:

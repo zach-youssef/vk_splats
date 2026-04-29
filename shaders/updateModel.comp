@@ -48,6 +48,7 @@ layout(std140, binding = 3) buffer DensityFlags {
 // Buffer defining if density control flags should be calculated
 layout(std140, binding = 4) readonly uniform Param {
     bool performDensityControl;
+    int numSamples;
 };
 
 // Buffer tracking magnitude of 2D position gradients for each splat,
@@ -95,7 +96,7 @@ void main() {
 
     // Compute density control operations
     bool prune = splatBuffer.splats[splatIdx].alpha < EPSILON_ALPHA;
-    bool apply_density = (densityCache.posLossMagnitude[splatIdx] / 100.0) > THRESHOLD_DPOS;
+    bool apply_density = (densityCache.posLossMagnitude[splatIdx] / (100.0 * numSamples)) > THRESHOLD_DPOS;
     bool split_not_clone = length(splatBuffer.splats[splatIdx].scale) > THRESHOLD_SCALE;
     vec4 split_delta = vec4(splatBuffer.splats[splatIdx].scale / 2, 2);
     vec4 clone_delta = vec4(grad.mean, 3);

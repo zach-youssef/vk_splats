@@ -98,3 +98,8 @@ struct LearningRates {
     float sh_0;
     float sh_h;
 };
+
+struct DensityControl {
+    bool performDensityControl;
+    int numSamples;
+};

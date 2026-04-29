@@ -139,13 +139,13 @@ int main(int argc, char** argv) {
 
     int maxSplatIndex = splatModel.maxSplatIndex();
     int numSplats = maxSplatIndex + 1;
-    int maxSplatsPerTile = maxSplatIndex * .75;
+    int maxSplatsPerTile = maxSplatIndex;
 
     TileManager tileManager(maxSplatsPerTile);
     tileManager.initBuffers(app, maxSplatIndex, image_size);
 
     TrainingManager trainManager(lr, maxSplatIndex, 0.01 /* near plane for frustum culling*/);
-    trainManager.initBuffers(app);
+    trainManager.initBuffers(app, imageData.numSamples());
 
     ///
     // Create image sampler for graphics pipeline
@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
 
     auto preprocessControl = uboDescriptor<PreprocessControls>(trainManager.control());
     auto learningRates = uboDescriptor<LearningRates>(trainManager.learningRates());
-    auto densityControl = uboDescriptor<bool>(trainManager.densitySwitch());
+    auto densityControl = uboDescriptor<DensityControl>(trainManager.densitySwitch());
 
     ///
     // Calculate dispatch sizes for our various compute operations
@@ -322,13 +322,24 @@ int main(int argc, char** argv) {
     int iteration = 0;
     int currentSample = 0;
     int sh_degree = 0;
-    auto preDrawCallback = std::make_shared<std::function<void(VulkanApp<1>&, uint32_t)>>();
     bool done = false;
+    bool applyDensityControl = false;
+    auto preDrawCallback = std::make_shared<std::function<void(VulkanApp<1>&, uint32_t)>>();
     *preDrawCallback = [&](VulkanApp<1>& a, uint32_t) {
+        // Nothing more to do if training is completed
         if (done) {
             return;
         }
+
+        // On the last sample of every 100 iterations, compute density adjustments
+        if ((iteration + 1) % 100 == 0 && currentSample == imageData.numSamples() - 1) {
+            trainManager.setDensitySwitch(a, true);
+            applyDensityControl = true;
+        }
+
         
+        // If we have run out of samples, increment the iteration and start again,
+        // applying any updates to our training regimen
         if (currentSample >= imageData.numSamples()) {
             currentSample = 0;
             // Update iteration
@@ -354,7 +365,35 @@ int main(int argc, char** argv) {
                 }, a.getGraphicsQueue(), a.getDevice(), a.getCommandPool());
                 done = true;
                 splatModel.saveModel("splats/final", a);
+                return;
             }
+
+            // If we kicked off density control processing for the last iteration, apply those updates
+            if (applyDensityControl) {
+                // Performs optimization and creates new resized splat buffers
+                splatModel.performDensityOptimization(app);
+                // Update our splat count
+                maxSplatIndex = splatModel.maxSplatIndex();
+                numSplats = maxSplatIndex + 1;
+                // Update our controls
+                trainManager.setDensitySwitch(a, false);
+                trainManager.setMaxIndex(a,maxSplatIndex);
+                tileManager.setMaxIndex(a, maxSplatIndex);
+                // Update all descriptors that relied on the resized buffers
+                splatBuffer->bindBuffer(splatModel.splatBuffer(), numSplats);
+                imagespaceSplats->bindBuffer(splatModel.imagespaceSplats(), numSplats);
+                rasterGradients->bindBuffer(splatModel.rasterGradients(), numSplats);
+                finalGradients->bindBuffer(splatModel.finalGradients(), numSplats);
+                posGradientMags->bindBuffer(splatModel.positionGradientMagnitudes(), numSplats);
+                densityFlags->bindBuffer(splatModel.densityFlags(), numSplats);
+                // Update control flags
+                applyDensityControl = false;
+                descriptorsDirty = true;
+            }
+        } else if (descriptorsDirty) {
+            // If we aren't in the branch executed at the beggining of an iteration, then our descriptors
+            // should no longer be dirty
+            descriptorsDirty = false;
         }
 
         // Zero out the gradients from the previous iteration

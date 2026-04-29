@@ -15,7 +15,7 @@ public:
     }
 
     // Intialize GPU objects for controlling splat processing & learning rates
-    void initBuffers(VulkanApp<1>& app) {
+    void initBuffers(VulkanApp<1>& app, int numSamples) {
         // Create buffers
         Buffer<PreprocessControls>::create(controlBuffer_,
                                            1,
@@ -29,12 +29,12 @@ public:
                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                       app.getDevice(),
                                       app.getPhysicalDevice());
-        Buffer<bool>::create(densitySwitch_,
-                             1,
-                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                             app.getDevice(),
-                             app.getPhysicalDevice());
+        Buffer<DensityControl>::create(densitySwitch_,
+                                       1,
+                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                       app.getDevice(),
+                                       app.getPhysicalDevice());
 
         // Initialize them to our starting values
         controlBuffer_->mapAndExecute(0, sizeof(PreprocessControls), [this](void* mappedBuffer){
@@ -43,8 +43,10 @@ public:
         rateBuffer_->mapAndExecute(0, sizeof(LearningRates), [this](void* mappedBuffer){
             memcpy(mappedBuffer, &learningRates_, sizeof(LearningRates));
         });
-        densitySwitch_->mapAndExecute(0, sizeof(bool), [](void* mappedBuffer){
-            *((bool*) mappedBuffer) = false;
+        densitySwitch_->mapAndExecute(0, sizeof(DensityControl), [numSamples](void* mappedBuffer){
+            DensityControl* ubo = (DensityControl*) mappedBuffer;
+            ubo->numSamples = numSamples;
+            ubo->performDensityControl = false;
         });
     }
 
@@ -73,7 +75,7 @@ public:
     }
 
     void setDensitySwitch(VulkanApp<1>& app, bool enableDensityControl) {
-        densitySwitch_->mapAndExecute(0, sizeof(bool), [enableDensityControl](void* mappedBuffer){
+        densitySwitch_->mapAndExecute(offsetof(DensityControl, performDensityControl), sizeof(bool), [enableDensityControl](void* mappedBuffer){
             *((bool*) mappedBuffer) = enableDensityControl;
         });
     }
@@ -97,5 +99,5 @@ private:
     // Uniform buffers
     std::unique_ptr<Buffer<PreprocessControls>> controlBuffer_;
     std::unique_ptr<Buffer<LearningRates>> rateBuffer_;
-    std::unique_ptr<Buffer<bool>> densitySwitch_;
+    std::unique_ptr<Buffer<DensityControl>> densitySwitch_;
 };
