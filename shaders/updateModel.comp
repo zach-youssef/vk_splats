@@ -46,7 +46,7 @@ layout(std140, binding = 3) buffer DensityFlags {
 };
 
 // Buffer defining if density control flags should be calculated
-layout(std140, binding = 4) buffer Param {
+layout(std140, binding = 4) readonly uniform Param {
     bool performDensityControl;
 };
 
