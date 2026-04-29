@@ -21,6 +21,9 @@
 
 #include <iostream>
 
+// Must match shader side value
+const int DENSITY_ITERATION_GAP = 100;
+
 // TODO for the love of god find a better pattern than this
 bool descriptorsDirty = false;
 
@@ -332,7 +335,7 @@ int main(int argc, char** argv) {
         }
 
         // On the last sample of every 100 iterations, compute density adjustments
-        if ((iteration + 1) % 100 == 0 && currentSample == imageData.numSamples() - 1) {
+        if ((iteration + 1) % DENSITY_ITERATION_GAP == 0 && currentSample == imageData.numSamples() - 1) {
             trainManager.setDensitySwitch(a, true);
             applyDensityControl = true;
         }
@@ -372,6 +375,8 @@ int main(int argc, char** argv) {
             if (applyDensityControl) {
                 // Performs optimization and creates new resized splat buffers
                 splatModel.performDensityOptimization(app);
+                std::cout << "Density control: Splat count modified from " << numSplats << " to " 
+                          << splatModel.maxSplatIndex() + 1 << std::endl;
                 // Update our splat count
                 maxSplatIndex = splatModel.maxSplatIndex();
                 numSplats = maxSplatIndex + 1;
