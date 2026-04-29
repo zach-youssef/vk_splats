@@ -127,6 +127,20 @@ public:
                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                               app.getDevice(),
                               app.getPhysicalDevice());
+        Buffer<float>::createAndInitialize(dposMagBuffer_, 
+                                           std::vector<float>(splats.size(), 0), 
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                           app.getDevice(),
+                                           app.getPhysicalDevice(),
+                                           app.getGraphicsQueue(),
+                                           app.getCommandPool());
+        Buffer<glm::vec4>::create(densityFlagBuffer_, 
+                                  splats.size(), 
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  app.getDevice(),
+                                  app.getPhysicalDevice());
 
         // Upload initial splat data to the staging buffer
         stagingBuffer_->mapAndExecute(0, sizeof(Splat) * splats.size(), [this](void* mappedBuffer){
@@ -144,15 +158,7 @@ public:
 
     void saveModel(const std::string& outFile, VulkanApp<1>& app) {
         // Copy the current GPU data back to the CPU
-        Buffer<Splat>::copyBuffer(splatBuffer_->getBuffer(),
-                                  stagingBuffer_->getBuffer(),
-                                  sizeof(Splat) * splats.size(),
-                                  app.getGraphicsQueue(),
-                                  app.getDevice(),
-                                  app.getCommandPool());
-        stagingBuffer_->mapAndExecute(0, sizeof(Splat) * splats.size(), [this](void* mappedBuffer){
-            memcpy(splats.data(), mappedBuffer, sizeof(Splat) * splats.size());
-        });
+        syncCPUSplats(app);
 
         // Save splats to a CSV, with each line represenitng a single splat
         std::ofstream csv;
@@ -172,6 +178,57 @@ public:
             csv << std::endl;
         }
         csv.close();
+    }
+
+    void performDensityOptimization(VulkanApp<1>& app){
+        // Copy current splats to CPU
+        syncCPUSplats(app);
+
+        // Grab the density operation for each splat
+        std::vector<glm::vec4> densityFlags(splats.size(), glm::vec4(0));
+        densityFlagBuffer_->mapAndExecute(0, splats.size() * sizeof(glm::vec4), [&](void* mapped){
+            memcpy(densityFlags.data(), mapped, sizeof(glm::vec4) * splats.size());
+        });
+
+        // Perform density control
+        std::vector<Splat> newSplats;
+        newSplats.reserve(splats.size());
+        for (int idx = 0; idx < splats.size(); ++idx) {
+            const auto& splat = splats.at(idx);
+            const glm::vec4& flag = densityFlags.at(idx);
+
+            if (flag.w == 0) {
+                // Prune
+                continue;
+            } else if (flag.w == 1) {
+                // Unmodified
+                newSplats.push_back(splat);
+            } else {
+                glm::vec3 delta{flag.x, flag.y, flag.z};
+                if (flag.w == 2) {
+                    // Split
+                    Splat s0(splat);
+                    s0.scale /= 2;
+                    s0.mean += delta;
+                    newSplats.push_back(s0);
+
+                    Splat s1(splat);
+                    s1.scale /= 2;
+                    s1.mean -= delta;
+                    newSplats.push_back(s1);
+                } else if (flag.w == 3) {
+                    // Clone
+                    newSplats.push_back(splat);
+                    Splat clone(splat);
+                    clone.mean += delta;
+                    newSplats.push_back(clone);
+                }
+            }
+        }
+
+        // Reinitialize GPU objects with our new splat size
+        this->splats = newSplats;
+        initializeBuffers(app);
     }
 
     // Returns the maximum valid index into the splat buffer
@@ -195,6 +252,28 @@ public:
         return gradBuffer_->getBuffer();
     }
 
+    VkBuffer positionGradientMagnitudes() {
+        return dposMagBuffer_->getBuffer();
+    }
+
+    VkBuffer densityFlags() {
+        return densityFlagBuffer_->getBuffer();
+    }
+
+private:
+    void syncCPUSplats(VulkanApp<1>& app) {
+        // Copy the current GPU data back to the CPU
+        Buffer<Splat>::copyBuffer(splatBuffer_->getBuffer(),
+                                  stagingBuffer_->getBuffer(),
+                                  sizeof(Splat) * splats.size(),
+                                  app.getGraphicsQueue(),
+                                  app.getDevice(),
+                                  app.getCommandPool());
+        stagingBuffer_->mapAndExecute(0, sizeof(Splat) * splats.size(), [this](void* mappedBuffer){
+            memcpy(splats.data(), mappedBuffer, sizeof(Splat) * splats.size());
+        });
+    }
+
 private:
     // CPU Copy of splat data
     std::vector<Splat> splats;
@@ -212,4 +291,8 @@ private:
     std::unique_ptr<Buffer<RasterGrad>> rasterGradBuffer_;
     //  Preprocessing gradients
     std::unique_ptr<Buffer<Splat>> gradBuffer_;
+    // Density control bookeeping
+    std::unique_ptr<Buffer<float>> dposMagBuffer_;
+    // Density control flags per splat
+    std::unique_ptr<Buffer<glm::vec4>> densityFlagBuffer_;
 };
