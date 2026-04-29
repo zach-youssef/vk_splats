@@ -33,6 +33,29 @@ layout(std140, binding = 2) readonly uniform LearningRates {
     float sh_h;
 } learningRates;
 
+// Output buffer labeling how each splat should be treated in density control
+// w component of vector is the operation type
+// 0 -> prune
+// 1 -> unchanged
+// 2 -> split
+// 3 -> clone
+// If type is split or clone, xyz contains delta that should be applied to new position(s)
+// Only modified if this is a density control iteration
+layout(std140, binding = 3) buffer DensityFlags {
+    vec4 densityFlags[];
+};
+
+// Buffer defining if density control flags should be calculated
+layout(std140, binding = 4) buffer Param {
+    bool performDensityControl;
+};
+
+// Buffer tracking magnitude of 2D position gradients for each splat,
+// for use in adaptive density control
+layout(std140, binding = 6) readonly buffer DensityCache {
+    float posLossMagnitude[];
+} densityCache;
+
 // Convenience macro for updating a property of the splat model
 #define APPLY_GRADIENT(prop) \
     splatBuffer.splats[splatIdx].prop -= learningRates.prop * grad.prop;
@@ -40,9 +63,10 @@ layout(std140, binding = 2) readonly uniform LearningRates {
 float sigmoid(float x){
     return 1.0 / (1.0 + exp(-x));
 }
-vec3 sigmoid(vec3 x){
-    return 1.0 / (1.0 + exp(-x));
-}
+
+const float EPSILON_ALPHA = 1.0 / 255.0;
+const float THRESHOLD_DPOS = 0.0002;
+const float THRESHOLD_SCALE = 0.01;
 
 void main() {
     // Get the index of the splat this thread is responsible for
@@ -64,4 +88,22 @@ void main() {
     for (int sh_idx = 1; sh_idx < 16; ++sh_idx) {
         splatBuffer.splats[splatIdx].sh[sh_idx] -= learningRates.sh_h * grad.sh[sh_idx];
     }
+
+    if (!performDensityControl) {
+        return;
+    }
+
+    // Compute density control operations
+    bool prune = splatBuffer.splats[splatIdx].alpha < EPSILON_ALPHA;
+    bool apply_density = (densityCache.posLossMagnitude[splatIdx] / 100.0) > THRESHOLD_DPOS;
+    bool split_not_clone = length(splatBuffer.splats[splatIdx].scale) > THRESHOLD_SCALE;
+    vec4 split_delta = vec4(splatBuffer.splats[splatIdx].scale / 2, 2);
+    vec4 clone_delta = vec4(grad.mean, 3);
+    vec4 density_delta = split_not_clone? split_delta : clone_delta;
+
+    vec4 flags = vec4(1);
+    flags = apply_density? density_delta : flags;
+    flags *= prune ? 0 : 1;
+
+    densityFlags[splatIdx] = flags;
 }

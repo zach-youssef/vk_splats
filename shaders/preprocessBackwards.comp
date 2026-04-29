@@ -93,6 +93,12 @@ layout(std140, binding = 5) buffer SplatGradients {
     Splat splats[];
 } splatGrad;
 
+// Buffer tracking magnitude of 2D position gradients for each splat,
+// for use in adaptive density control
+layout(std140, binding = 6) buffer DensityCache {
+    float posLossMagnitude[];
+} densityCache;
+
 // Converts a splat's scale and rotation into it's 3D covariance matrix
 mat3 computeCovariance(vec3 scale, vec4 rotation) {
     // Convert scale to matrix
@@ -409,6 +415,9 @@ void main() {
     splatIdx = min(splatIdx, params.max_index);
     Splat splat = splatBuffer.splats[splatIdx];
     RasterGrad rasterGrad = rasterGrad.grads[splatIdx];
+
+    // Update density control bookeeping with dl_dmean magnitude
+    densityCache.posLossMagnitude[splatIdx] += length(rasterGrad.dl_dmean);
 
     // Calculate gradient from projecting means to image space
     vec3 mean = splat.mean;
