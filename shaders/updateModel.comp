@@ -56,9 +56,8 @@ void main() {
     APPLY_GRADIENT(rotation)
     APPLY_GRADIENT(alpha)
 
-    // Apply sigmoid to alpha & scale
+    // Apply sigmoid to alpha
     splatBuffer.splats[splatIdx].alpha = sigmoid(splatBuffer.splats[splatIdx].alpha);
-    splatBuffer.splats[splatIdx].scale = sigmoid(splatBuffer.splats[splatIdx].scale);
 
     // We have a separate learning rate for the 0 order sh coefficients
     splatBuffer.splats[splatIdx].sh[0] -= learningRates.sh_0 * grad.sh[0];

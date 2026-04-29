@@ -79,7 +79,8 @@ void main() {
 
     // Compute l1 difference with actual image
     vec3 real = imageLoad(actual, p).rgb;
-    vec3 dl_dpixel = imageLoad(rendered, p).rgb - real;
+    float inv_area = 1.0 / (params.tile_extents[15].z * params.tile_extents[15].w);
+    vec3 dl_dpixel = (imageLoad(rendered, p).rgb - real) * inv_area;
 
     // Load cached T & last_contributor
     vec4 cached = imageLoad(grad_cache, p);
