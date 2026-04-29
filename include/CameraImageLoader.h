@@ -35,13 +35,12 @@ public:
             }
 
             /////////
-            // WHY ON EARTH IS THIS BEHAVING ROW MAJOR?
             // It should be:
-            //view[3] = {-t[0], -t[1], -t[2], 1};
+            view[3] = {t[0], -t[1], -t[2], 1};
             // But according to the XCode debugger, I need to:
-            view[0][3] = -t[0];
-            view[1][3] = -t[1];
-            view[2][3] = -t[2];
+            //view[0][3] = t[0];
+            //view[1][3] = -t[1];
+            //view[2][3] = -t[2];
             /////////
 
             imageNames.push_back(imageDirectory + "/" + line[9]);
