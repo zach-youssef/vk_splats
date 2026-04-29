@@ -209,18 +209,18 @@ public:
                     // Split
                     Splat s0(splat);
                     s0.scale /= 2;
-                    s0.mean += delta;
+                    s0.mean += glm::vec4(delta, 0);
                     newSplats.push_back(s0);
 
                     Splat s1(splat);
                     s1.scale /= 2;
-                    s1.mean -= delta;
+                    s1.mean -= glm::vec4(delta, 0);
                     newSplats.push_back(s1);
                 } else if (flag.w == 3) {
                     // Clone
                     newSplats.push_back(splat);
                     Splat clone(splat);
-                    clone.mean += delta;
+                    clone.mean += glm::vec4(delta, 0);
                     newSplats.push_back(clone);
                 }
             }

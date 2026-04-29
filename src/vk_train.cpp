@@ -21,6 +21,9 @@
 
 #include <iostream>
 
+// TODO for the love of god find a better pattern than this
+bool descriptorsDirty = false;
+
 // Helpers to make descriptor construction easier
 std::shared_ptr<StorageImageDescriptor<1>> storageImageDescriptor(VkImageView image) {
     return std::make_shared<StorageImageDescriptor<1>>(VK_SHADER_STAGE_COMPUTE_BIT, std::array<VkImageView, 1>{image});
@@ -55,7 +58,11 @@ public:
         return dispatchDimensions_;
     }
 
-    void update(uint32_t currentImage, VkExtent2D swapChainExtent) override {}
+    void update(uint32_t currentImage, VkExtent2D swapChainExtent) override {
+        if (descriptorsDirty) {
+            populateDescriptorSet(currentImage);
+        }
+    }
 private: 
     glm::vec3 dispatchDimensions_;
 };
@@ -164,6 +171,8 @@ int main(int argc, char** argv) {
     auto imagespaceSplats = storageDescriptor<ImagespaceSplat>(splatModel.imagespaceSplats(), numSplats);
     auto rasterGradients = storageDescriptor<RasterGrad>(splatModel.rasterGradients(), numSplats);
     auto finalGradients = storageDescriptor<Splat>(splatModel.finalGradients(), numSplats);
+    auto posGradientMags = storageDescriptor<float>(splatModel.positionGradientMagnitudes(), numSplats);
+    auto densityFlags = storageDescriptor<glm::vec4>(splatModel.densityFlags(), numSplats);
 
     auto tileEntries0 = storageDescriptor<SplatEntry>(tileManager.tileEntries0(), maxSplatsPerTile);
     auto tileEntries1 = storageDescriptor<SplatEntry>(tileManager.tileEntries1(), maxSplatsPerTile);
@@ -173,6 +182,7 @@ int main(int argc, char** argv) {
 
     auto preprocessControl = uboDescriptor<PreprocessControls>(trainManager.control());
     auto learningRates = uboDescriptor<LearningRates>(trainManager.learningRates());
+    auto densityControl = uboDescriptor<bool>(trainManager.densitySwitch());
 
     ///
     // Calculate dispatch sizes for our various compute operations
@@ -218,12 +228,12 @@ int main(int argc, char** argv) {
 
     // Backprop preprocessing
     auto preprocessBackprop = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
-        splatBuffer, imagespaceSplats, cameraProps, preprocessControl, rasterGradients, finalGradients
+        splatBuffer, imagespaceSplats, cameraProps, preprocessControl, rasterGradients, finalGradients, posGradientMags
     }, perSplatDispatch, readFile("spirv/preprocessBackwards.spv"));
 
     // Update model
     auto updateModel = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
-        splatBuffer, finalGradients, learningRates
+        splatBuffer, finalGradients, learningRates, densityFlags, densityControl, posGradientMags
     }, perSplatDispatch, readFile("spirv/updateModel.spv"));
 #endif
     

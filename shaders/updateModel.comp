@@ -52,7 +52,7 @@ layout(std140, binding = 4) readonly uniform Param {
 
 // Buffer tracking magnitude of 2D position gradients for each splat,
 // for use in adaptive density control
-layout(std140, binding = 6) readonly buffer DensityCache {
+layout(std140, binding = 5) readonly buffer DensityCache {
     float posLossMagnitude[];
 } densityCache;
 

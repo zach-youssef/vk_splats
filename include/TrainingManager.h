@@ -29,12 +29,22 @@ public:
                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                       app.getDevice(),
                                       app.getPhysicalDevice());
+        Buffer<bool>::create(densitySwitch_,
+                             1,
+                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             app.getDevice(),
+                             app.getPhysicalDevice());
+
         // Initialize them to our starting values
         controlBuffer_->mapAndExecute(0, sizeof(PreprocessControls), [this](void* mappedBuffer){
             memcpy(mappedBuffer, &controls_, sizeof(PreprocessControls));
         });
         rateBuffer_->mapAndExecute(0, sizeof(LearningRates), [this](void* mappedBuffer){
             memcpy(mappedBuffer, &learningRates_, sizeof(LearningRates));
+        });
+        densitySwitch_->mapAndExecute(0, sizeof(bool), [](void* mappedBuffer){
+            *((bool*) mappedBuffer) = false;
         });
     }
 
@@ -54,12 +64,30 @@ public:
         });
     }
 
+    // Update the max splat index
+    void setMaxIndex(VulkanApp<1>& app, int maxIndex) {
+        controls_.max_index = maxIndex; 
+        controlBuffer_->mapAndExecute(offsetof(PreprocessControls, max_index), sizeof(int), [maxIndex](void* mapped){
+            *(int*)mapped = maxIndex;
+        });
+    }
+
+    void setDensitySwitch(VulkanApp<1>& app, bool enableDensityControl) {
+        densitySwitch_->mapAndExecute(0, sizeof(bool), [enableDensityControl](void* mappedBuffer){
+            *((bool*) mappedBuffer) = enableDensityControl;
+        });
+    }
+
     VkBuffer control() {
         return controlBuffer_->getBuffer();
     }
 
     VkBuffer learningRates() {
         return rateBuffer_->getBuffer();
+    }
+
+    VkBuffer densitySwitch() {
+        return densitySwitch_->getBuffer();
     }
 
 private:
@@ -69,4 +97,5 @@ private:
     // Uniform buffers
     std::unique_ptr<Buffer<PreprocessControls>> controlBuffer_;
     std::unique_ptr<Buffer<LearningRates>> rateBuffer_;
+    std::unique_ptr<Buffer<bool>> densitySwitch_;
 };
