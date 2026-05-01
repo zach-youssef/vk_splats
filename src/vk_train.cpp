@@ -52,13 +52,13 @@ class Compute : public ComputeMaterial<1> {
 public:
     Compute(VulkanApp<1>& app, 
             std::vector<std::shared_ptr<Descriptor>> descriptors, 
-            glm::vec3 dispatchDimensions,
+            glm::vec3* dispatchDimensions,
             const std::vector<char>& shaderCode): ComputeMaterial<1>(app.getDevice(), 
                                                                app.getPhysicalDevice(),
                                                                descriptors,
                                                                shaderCode), dispatchDimensions_(dispatchDimensions){}
     glm::vec3 getDispatchDimensions() override {
-        return dispatchDimensions_;
+        return *dispatchDimensions_;
     }
 
     void update(uint32_t currentImage, VkExtent2D swapChainExtent) override {
@@ -67,13 +67,13 @@ public:
         }
     }
 private: 
-    glm::vec3 dispatchDimensions_;
+    glm::vec3* dispatchDimensions_;
 };
 // Helper function for creating compute nodes for the render graph
 RenderGraph<1>::NodeHandle computeNode(VulkanApp<1>& app,
                                        RenderGraph<1>& graph,
                                        std::vector<std::shared_ptr<Descriptor>> descriptors,
-                                       glm::vec3 dispatchDimensions,
+                                       glm::vec3* dispatchDimensions,
                                        const std::vector<char>& shaderCode) {
     auto shader = std::make_unique<Compute>(app, descriptors, dispatchDimensions, shaderCode);
     auto node = std::make_unique<ComputeNode<1>>(std::move(shader), 
@@ -206,38 +206,38 @@ int main(int argc, char** argv) {
     // Preprocess splats
     auto preprocess = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
         splatBuffer, imagespaceSplats, cameraProps, preprocessControl
-    }, perSplatDispatch, readFile("spirv/preprocessSplats.spv"));
+    }, &perSplatDispatch, readFile("spirv/preprocessSplats.spv"));
 
     // Assign splats to tiles
     auto assignment = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
         imagespaceSplats, tileEntries0, rasterControl, splatCountWrite
-    }, tileAssignmentDispatch, readFile("spirv/assignSplatsToTile.spv"));
+    }, &tileAssignmentDispatch, readFile("spirv/assignSplatsToTile.spv"));
 
     // Sort by depth
     auto sorting = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
         tileEntries0, tileEntries1, splatCountRead, rasterControl
-    }, tileAssignmentDispatch, readFile("spirv/single_radixsort.spv"));
+    }, &tileAssignmentDispatch, readFile("spirv/single_radixsort.spv"));
 
     // Rasterize
     auto rasterize = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
         tileEntries1, imagespaceSplats, rasterStorage, gradImage, rasterControl, splatCountRead
-    }, rasterDispatch, readFile("spirv/rasterizeSplats.spv"));
+    }, &rasterDispatch, readFile("spirv/rasterizeSplats.spv"));
 
 #ifdef BACKPROP
     // Backprop rasterization
     auto rasterizeBackprop = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
         tileEntries1, imagespaceSplats, rasterStorage, trainingStorage, gradImage, rasterGradients, rasterControl
-    }, rasterDispatch, readFile("spirv/rasterizeBackwards.spv"));
+    }, &rasterDispatch, readFile("spirv/rasterizeBackwards.spv"));
 
     // Backprop preprocessing
     auto preprocessBackprop = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
         splatBuffer, imagespaceSplats, cameraProps, preprocessControl, rasterGradients, finalGradients, posGradientMags
-    }, perSplatDispatch, readFile("spirv/preprocessBackwards.spv"));
+    }, &perSplatDispatch, readFile("spirv/preprocessBackwards.spv"));
 
     // Update model
     auto updateModel = computeNode(app, *renderGraph, std::vector<std::shared_ptr<Descriptor>>{
         splatBuffer, finalGradients, learningRates, densityFlags, densityControl, posGradientMags
-    }, perSplatDispatch, readFile("spirv/updateModel.spv"));
+    }, &perSplatDispatch, readFile("spirv/updateModel.spv"));
 #endif
     
     ///
@@ -380,6 +380,7 @@ int main(int argc, char** argv) {
                 // Update our splat count
                 maxSplatIndex = splatModel.maxSplatIndex();
                 numSplats = maxSplatIndex + 1;
+                perSplatDispatch = glm::vec3{std::ceil(static_cast<float>(numSplats) / 256.0), 1, 1};
                 // Update our controls
                 trainManager.setDensitySwitch(a, false);
                 trainManager.setMaxIndex(a,maxSplatIndex);
