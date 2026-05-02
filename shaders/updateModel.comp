@@ -66,10 +66,11 @@ float sigmoid(float x){
 }
 
 const float EPSILON_ALPHA = 1.0 / 255.0;
+const float MAX_ALPHA = 0.99;
 const float THRESHOLD_DPOS = 0.0002;
 const float THRESHOLD_SCALE = 0.01;
 // Must match C++ side value
-const float DENSITY_ITERATION_GAP = 100;
+const float DENSITY_ITERATION_GAP = 10;
 
 void main() {
     // Get the index of the splat this thread is responsible for
@@ -97,7 +98,7 @@ void main() {
     }
 
     // Compute density control operations
-    bool prune = splatBuffer.splats[splatIdx].alpha < EPSILON_ALPHA;
+    bool prune = splatBuffer.splats[splatIdx].alpha < EPSILON_ALPHA || splatBuffer.splats[splatIdx].alpha > MAX_ALPHA;
     bool apply_density = (densityCache.posLossMagnitude[splatIdx] / (DENSITY_ITERATION_GAP * numSamples)) > THRESHOLD_DPOS;
     bool split_not_clone = length(splatBuffer.splats[splatIdx].scale) > THRESHOLD_SCALE;
     vec4 split_delta = vec4(splatBuffer.splats[splatIdx].scale / 2, 2);

@@ -213,7 +213,7 @@ void main() {
     float sqrt_term = sqrt(max(0.1, mid * mid - det));
     float lambda1 = mid + sqrt_term;
     float lambda2 = mid - sqrt_term;
-    float radius = ceil(3 * sqrt(max(lambda1, lambda2)));
+    float radius = ceil(10.0 * sqrt(max(lambda1, lambda2)));
 
     // Transform position into screen space
     vec2 position = ((((clipspace_mean.xyz / clipspace_mean.w).xy + 1.0) * cameraProps.image_size) - 1.0) * 0.5;

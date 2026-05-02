@@ -51,7 +51,7 @@ public:
             for (int i = 1; i < 16; i++){
                 splat.sh[i] = glm::vec4(0);
             }
-            splat.alpha = glm::vec4(0.5);
+            splat.alpha = glm::vec4(0.1);
             return splat;
         });
 

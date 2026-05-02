@@ -22,7 +22,7 @@
 #include <iostream>
 
 // Must match shader side value
-const int DENSITY_ITERATION_GAP = 100;
+const int DENSITY_ITERATION_GAP = 10;
 
 // TODO for the love of god find a better pattern than this
 bool descriptorsDirty = false;
@@ -126,10 +126,10 @@ int main(int argc, char** argv) {
     // Taken from the paper's implementation
     ///
     LearningRates lr;
-    lr.mean = 0.00016;
-    lr.scale = 0.0005;
-    lr.rotation = 0.0001;
-    lr.alpha = 0.0025;
+    lr.mean = 0.000016;
+    lr.scale = 0.00005;
+    lr.rotation = 0.00001;
+    lr.alpha = 0.00025;
     lr.sh_0 = 0.00025;
     lr.sh_h = 0.00025 / 20.0;
 
