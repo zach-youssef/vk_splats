@@ -27,18 +27,7 @@ public:
         }
 
         // Initialize buffers
-        Buffer<SplatEntry>::create(entryBuffer0_,
-                                    maxSplatsPerTile_ * 16,
-                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                    app.getDevice(),
-                                    app.getPhysicalDevice());
-        Buffer<SplatEntry>::create(entryBuffer1_,
-                                    maxSplatsPerTile_ * 16,
-                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                    app.getDevice(),
-                                    app.getPhysicalDevice());
+        initEntryBuffers(app);
         Buffer<TileSplatCount>::create(countBuffer_,
                                         1,
                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -76,8 +65,33 @@ public:
         });
     }
 
+    // Recreates entry buffers
+    void setMaxSplatsPerTile(VulkanApp<1>& app, int maxSplatsPerTile) {
+        maxSplatsPerTile_ = maxSplatsPerTile;
+        controlBuffer_->mapAndExecute(offsetof(RasterControls, max_splats_per_tile), sizeof(int), [maxSplatsPerTile](void* mapped){
+            *(int*)mapped = maxSplatsPerTile;
+        });
+        initEntryBuffers(app);
+    }
+
 private:
-    const int maxSplatsPerTile_;
+    void initEntryBuffers(VulkanApp<1>& app) {
+        Buffer<SplatEntry>::create(entryBuffer0_,
+                                    maxSplatsPerTile_ * 16,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                    app.getDevice(),
+                                    app.getPhysicalDevice());
+        Buffer<SplatEntry>::create(entryBuffer1_,
+                                    maxSplatsPerTile_ * 16,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                    app.getDevice(),
+                                    app.getPhysicalDevice());
+    }
+
+private:
+    int maxSplatsPerTile_;
 
     std::unique_ptr<Buffer<SplatEntry>> entryBuffer0_;
     std::unique_ptr<Buffer<SplatEntry>> entryBuffer1_;

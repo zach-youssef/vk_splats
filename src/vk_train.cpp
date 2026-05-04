@@ -380,11 +380,13 @@ int main(int argc, char** argv) {
                 // Update our splat count
                 maxSplatIndex = splatModel.maxSplatIndex();
                 numSplats = maxSplatIndex + 1;
+                maxSplatsPerTile = numSplats;
                 perSplatDispatch = glm::vec3{std::ceil(static_cast<float>(numSplats) / 256.0), 1, 1};
                 // Update our controls
                 trainManager.setDensitySwitch(a, false);
                 trainManager.setMaxIndex(a,maxSplatIndex);
                 tileManager.setMaxIndex(a, maxSplatIndex);
+                tileManager.setMaxSplatsPerTile(a, maxSplatsPerTile);
                 // Update all descriptors that relied on the resized buffers
                 splatBuffer->bindBuffer(splatModel.splatBuffer(), numSplats);
                 imagespaceSplats->bindBuffer(splatModel.imagespaceSplats(), numSplats);
@@ -392,6 +394,8 @@ int main(int argc, char** argv) {
                 finalGradients->bindBuffer(splatModel.finalGradients(), numSplats);
                 posGradientMags->bindBuffer(splatModel.positionGradientMagnitudes(), numSplats);
                 densityFlags->bindBuffer(splatModel.densityFlags(), numSplats);
+                tileEntries0->bindBuffer(tileManager.tileEntries0(), maxSplatsPerTile * 16);
+                tileEntries1->bindBuffer(tileManager.tileEntries1(), maxSplatsPerTile * 16);
                 // Update control flags
                 applyDensityControl = false;
                 descriptorsDirty = true;
