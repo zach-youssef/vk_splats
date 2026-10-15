@@ -2,15 +2,19 @@
 CC = /usr/bin/g++
 CXX = $(CC)
 
+# OpenCV (from pkg-config, so the paths and modules follow the installed version)
+OPENCV_CFLAGS = $(shell pkg-config --cflags opencv5)
+OPENCV_LIBS = $(shell pkg-config --libs opencv5)
+
 # Homebrew Include Path + Project Headers
-CFLAGS = -std=c++20 -Wc++11-extensions -I/opt/homebrew/include/opencv4 -I./include -I/usr/local/include -Wc++14-extensions -DENABLE_PRECOMPILED_HEADERS=OFF -Iexternal/vulkan_test/vulkan_test -I/Users/zyoussef/stb/ -I/Users/zyoussef/VulkanSDK/1.4.321.0/macOS/include/
+CFLAGS = -std=c++20 -Wc++11-extensions $(OPENCV_CFLAGS) -I./include -I/usr/local/include -Wc++14-extensions -DENABLE_PRECOMPILED_HEADERS=OFF -Iexternal/vulkan_test/vulkan_test -I/Users/zyoussef/stb/ -I/Users/zyoussef/VulkanSDK/1.4.321.0/macOS/include/
 CXXFLAGS = $(CFLAGS)
 
 # Homebrew Library Path + user/local
 LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib
 
 # Opencv Libraries
-LDLIBS = -ltiff -lpng -ljpeg -llapack -lblas -lz -ljasper -lwebp -lgs -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreServices -framework CoreGraphics -framework AppKit -framework OpenCL  -lopencv_core -lopencv_highgui -lopencv_video -lopencv_videoio -lopencv_imgcodecs -lopencv_imgproc -lopencv_objdetect -lopencv_calib3d -lglfw -lvulkan -lopencv_viz
+LDLIBS = -ltiff -lpng -ljpeg -llapack -lblas -lz -ljasper -lwebp -lgs -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreServices -framework CoreGraphics -framework AppKit -framework OpenCL  $(OPENCV_LIBS) -lglfw -lvulkan
 
 OUT = build
 SRC = src
