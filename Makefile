@@ -3,7 +3,7 @@ CC = /usr/bin/g++
 CXX = $(CC)
 
 # Homebrew Include Path + Project Headers
-CFLAGS = -std=c++20 -Wc++11-extensions -I/opt/homebrew/include/opencv4 -I./include -I/usr/local/include -Wc++14-extensions -DENABLE_PRECOMPILED_HEADERS=OFF -I/Users/zyoussef/code/vulkan_test/vulkan_test -I/Users/zyoussef/stb/ -I/Users/zyoussef/VulkanSDK/1.4.321.0/macOS/include/
+CFLAGS = -std=c++20 -Wc++11-extensions -I/opt/homebrew/include/opencv4 -I./include -I/usr/local/include -Wc++14-extensions -DENABLE_PRECOMPILED_HEADERS=OFF -Iexternal/vulkan_test/vulkan_test -I/Users/zyoussef/stb/ -I/Users/zyoussef/VulkanSDK/1.4.321.0/macOS/include/
 CXXFLAGS = $(CFLAGS)
 
 # Homebrew Library Path + user/local
