@@ -1,7 +1,13 @@
+# Build outputs (make): programs, tests, web builds
 build/
-vk_train_splats
-cs5330_*_*/
-*.spv
-splats/
+# Python caches (the data tools and their tests)
+__pycache__/
+.pytest_cache/
 .DS_Store
-.vscode
+.vscode/
+# Left in old checkouts by the pre-ZGAL code, which these branches replace: its binary, shaders,
+# splat dumps and image sets other than the committed colmap/cs5330_dense_resized
+/vk_train_splats
+/spirv/
+/splats/
+/cs5330_*/

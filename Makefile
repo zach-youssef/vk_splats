@@ -1,53 +1,102 @@
-# Compiler
-CC = /usr/bin/g++
-CXX = $(CC)
+# Gaussian splatting (Kerbl et al. 2023) in ZGAL. Each program is a ZGAL program,
+# programs/<name>/<name>.zgal (importing shared modules from lib/), built with the wrapper's rules
+# (zgal.mk) into build/<name>/<name>. Adding a program needs no change here.
+#   make           - build every program
+#   make test      - the data tools' tests (pytest), the C++ tests (tests/cpp/*.cpp) and every
+#                    program's headless test (programs/<name>/test.sh)
+#   make web       - build every program for the web into build/web/<name>
+#   make test-web  - every program's web test under Node (programs/<name>/test-web.sh)
+# docs/building-and-testing.md has the conventions.
 
-# OpenCV (from pkg-config, so the paths and modules follow the installed version)
-OPENCV_CFLAGS = $(shell pkg-config --cflags opencv5)
-OPENCV_LIBS = $(shell pkg-config --libs opencv5)
+# Compiler: clang, the one the wrapper is tested with (Apple's c++ on macOS, clang++ on Linux),
+# unless CXX is given in the environment or on the command line (make CXX=g++). make's built-in
+# default, or none under make -R, counts as not given.
+ifneq ($(filter default undefined,$(origin CXX)),)
+CXX = $(if $(filter Darwin,$(ZGAL_OS)),c++,clang++)
+endif
 
-# Homebrew Include Path + Project Headers
-CFLAGS = -std=c++20 -Wc++11-extensions $(OPENCV_CFLAGS) -I./include -I/usr/local/include -Wc++14-extensions -DENABLE_PRECOMPILED_HEADERS=OFF -Iexternal/vulkan_test/vulkan_test -I/Users/zyoussef/stb/ -I/Users/zyoussef/VulkanSDK/1.4.321.0/macOS/include/
+# The Vulkan wrapper and ZGAL (git submodule); ZGAL_ROOT=<path> builds with another checkout
+ZGAL_ROOT ?= external/vulkan_test
+
+# The platform's include and library paths (the Vulkan SDK's, GLFW's, GLM's) come from zgal.mk's
+# ZGAL_CFLAGS and ZGAL_LDFLAGS
+CFLAGS = -std=c++20
 CXXFLAGS = $(CFLAGS)
+LDFLAGS =
+LDLIBS = -lvulkan
 
-# Homebrew Library Path + user/local
-LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib
-
-# Opencv Libraries
-LDLIBS = -ltiff -lpng -ljpeg -llapack -lblas -lz -ljasper -lwebp -lgs -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreServices -framework CoreGraphics -framework AppKit -framework OpenCL  $(OPENCV_LIBS) -lglfw -lvulkan
+PYTHON ?= python3
 
 OUT = build
-SRC = src
 
-.PHONY: clean shaders
+include $(ZGAL_ROOT)/zgal.mk
 
-# Rule for building Cpp objects
-$(OUT)/%.o : $(SRC)/%.cpp
-	$(CC) -c -o $@ $< $(CFLAGS) $(CLI_FLAGS)
+.DEFAULT_GOAL := all
 
-# Rule for building compute shaders
-spirv/%.spv : shaders/%.comp
-	glslc $< -o $@ --target-env=vulkan1.4
+# ---------------------------------------------------------------------------
+# Programs: every programs/<name>/ holding <name>.zgal. They link no libraries beyond Vulkan, so
+# headless programs don't need GLFW; a program that needs more (-lglfw for a window) opts in with
+# programs/<name>/program.mk setting LIBS_<name>.
+# ---------------------------------------------------------------------------
+PROGRAMS = $(sort $(foreach dir,$(wildcard programs/*/),$(if $(wildcard $(dir)$(notdir $(patsubst %/,%,$(dir))).zgal),$(notdir $(patsubst %/,%,$(dir))))))
 
-_COMPUTE = preprocessSplats assignSplatsToTile single_radixsort rasterizeSplats rasterizeBackwards preprocessBackwards updateModel
-COMPUTE = $(patsubst %,spirv/%.spv,$(_COMPUTE))
+-include $(wildcard programs/*/program.mk)
 
-# Rules for our simple vertex & fragment shader
-spirv/vert.spv : shaders/displayTraining.vert
-	glslc $< -o $@ --target-env=vulkan1.4
+$(foreach p,$(PROGRAMS),$(eval $(call zgal-program,programs/$(p)/$(p).zgal,$(OUT)/$(p),$(p),$(LIBS_$(p)))))
 
-spirv/frag.spv : shaders/displayTraining.frag
-	glslc $< -o $@ --target-env=vulkan1.4
+all: $(foreach p,$(PROGRAMS),$(OUT)/$(p)/$(p))
 
-_GRAPHICS = vert frag
-GRAPHICS = $(patsubst %,spirv/%.spv,$(_GRAPHICS))
+# For the web (WebGPU): the same programs, compiled to TypeScript and WGSL and built to JavaScript
+$(foreach p,$(PROGRAMS),$(eval $(call zgal-web-program,programs/$(p)/$(p).zgal,$(OUT)/web/$(p))))
 
-shaders: $(COMPUTE) $(GRAPHICS)
+web: $(foreach p,$(PROGRAMS),$(OUT)/web/$(p))
 
-# Application Rules
-vk_train_splats: build/vk_train.o 
-	$(CC) $^ -o $@ $(LDFLAGS) $(LDLIBS)
-	install_name_tool -add_rpath /usr/local/lib ./$@
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+# The data tools' tests: test_*.py under tools/ and tests/, in one pytest run, so basenames must be
+# unique (there are no __init__.py files)
+PY_TESTS = $(shell find tools tests -name 'test_*.py' 2>/dev/null)
+
+test-tools:
+ifneq ($(PY_TESTS),)
+	$(PYTHON) -m pytest -q $(PY_TESTS)
+else
+	@echo "test-tools: no test_*.py files"
+endif
+
+# C++ tests: each tests/cpp/<name>.cpp is a program (e.g. doctest's, with its own main) built into
+# build/tests/<name> and run; doctest and the wrapper's headers are on the include path. Nothing is
+# linked, so they test header-only code (the oracles, the wrapper's header-only parts).
+CPP_TESTS = $(patsubst tests/cpp/%.cpp,%,$(wildcard tests/cpp/*.cpp))
+DOCTEST_CFLAGS = -I$(ZGAL_ROOT)/third_party/doctest
+
+$(OUT)/tests/%: tests/cpp/%.cpp $(wildcard tests/cpp/*.h tests/oracle/*.h)
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $< $(CXXFLAGS) $(ZGAL_CFLAGS) $(DOCTEST_CFLAGS) -Itests
+
+test-cpp: $(foreach t,$(CPP_TESTS),$(OUT)/tests/$(t))
+	@set -e; for t in $(CPP_TESTS); do echo "== $$t"; $(OUT)/tests/$$t; done
+
+# Program tests: programs/<name>/test.sh, run from the repository's root as
+# test.sh <binary> <output dir>, runs the program headless with --validation
+TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test.sh),$(p)))
+
+$(foreach p,$(TESTED_PROGRAMS),$(eval test-$(p): $(OUT)/$(p)/$(p) ; programs/$(p)/test.sh $(OUT)/$(p)/$(p) $(OUT)/test/$(p)))
+
+test-programs: $(foreach p,$(TESTED_PROGRAMS),test-$(p))
+
+test: test-tools test-cpp test-programs
+
+# Web tests: programs/<name>/test-web.sh, run as test-web.sh <main.js> <output dir>, under Node
+WEB_TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test-web.sh),$(p)))
+
+$(foreach p,$(WEB_TESTED_PROGRAMS),$(eval test-web-$(p): $(OUT)/web/$(p) ; programs/$(p)/test-web.sh $(OUT)/web/$(p)/$(p).zgal.main.js $(OUT)/test-web/$(p)))
+
+test-web: $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
+
+.PHONY: all web test test-tools test-cpp test-programs test-web clean \
+	$(foreach p,$(TESTED_PROGRAMS),test-$(p)) $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
 
 clean:
-	rm -f vk_train_splats build/* spirv/*
+	rm -rf $(OUT)
