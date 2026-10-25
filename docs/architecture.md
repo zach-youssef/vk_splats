@@ -14,8 +14,9 @@ the M1 and M2 tasks land.
   programs' inputs, and the synthetic scene generator.
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`), Python tests and test
   data.
-- `colmap/`: COLMAP text exports of the real scene; `colmap_exports3` (one SIMPLE_RADIAL camera,
-  46 images, sparse points) is the one the rewrite uses.
+- `colmap/`: the one real scene: `colmap_exports3`, a COLMAP text export (one SIMPLE_RADIAL
+  camera, 46 images, sparse points; CRLF line endings), and its images, `cs5330_dense_resized`
+  (748×748 JPEGs, named as in `images.txt`), committed directly (6.2 MB, no LFS).
 - `external/vulkan_test`: the wrapper and ZGAL.
 
 ## Pipeline
