@@ -2,15 +2,15 @@
 
 ## Layout
 
-The planned layout: `programs/`, `lib/`, `tools/` and `tests/` don't exist yet and are filled in as
-the M1 and M2 tasks land.
+The planned layout: `programs/`, `lib/` and `tests/` don't exist yet and are filled in as the M1
+and M2 tasks land.
 
 - `programs/<name>/`: one ZGAL program each (`<name>.zgal` with a `main`, plus its own `.cpp` and
   `.ts` files, `assets/` and optional `test.sh` / `test-web.sh`). The Makefile finds them; adding
   one needs no Makefile change ([building-and-testing.md](building-and-testing.md)).
 - `lib/`: ZGAL modules the programs share (the splat math, the render graph), imported by relative
   path: `(import "../../lib/<module>.zgal")`.
-- `tools/`: offline Python (numpy, scipy): the converter from COLMAP text and INRIA PLY files to the
+- `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
   programs' inputs, and the synthetic scene generator.
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`), Python tests and test
   data.
@@ -52,7 +52,8 @@ densification and pruning on a fixed capacity, compacted by scan.
 - **Parameters**: position, log-scale, unit quaternion (w first), opacity logit and SH degree 3
   coefficients; the kernels apply the activations (exp, normalize, sigmoid).
 - **Buffers**: std430 arrays of structs, so no kernel binds more than 8 storage buffers (WebGPU's
-  default limit). Struct layouts are listed here as they're added. No single buffer binds more
+  default limit). Struct layouts are listed here as they're added; the input files' `Splat` and `Camera` are in
+  [data-format.md](data-format.md). No single buffer binds more
   than 128 MiB, lavapipe's `maxStorageBufferRange` and WebGPU's default
   `maxStorageBufferBindingSize` (cs5330's 46 images at 748² are about 103 MB); split a larger
   buffer, e.g. the images per batch.

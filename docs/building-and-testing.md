@@ -4,8 +4,8 @@
 
 The wrapper's: the Vulkan SDK (or the system's Vulkan headers and loader), `glslc`, GLFW, GLM,
 Racket 8 and, for the web, Node 24 and npm (`external/vulkan_test/docs/building-and-testing.md`
-has the details and the platform paths). The data tools need Python 3 with pytest, numpy
-and scipy (`tools/requirements.txt`); a virtualenv in `.venv/` is ignored by git, e.g.
+has the details and the platform paths). The data tools need Python 3 with pytest, numpy,
+scipy and Pillow (`tools/requirements.txt`); a virtualenv in `.venv/` is ignored by git, e.g.
 `python3 -m venv .venv && .venv/bin/pip install -r tools/requirements.txt`, then
 `make test PYTHON=.venv/bin/python`. Clone with `--recursive`, or run `git submodule update --init --recursive`.
 
