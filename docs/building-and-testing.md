@@ -56,7 +56,7 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
   - `statuses` posts each commit's `test` status from its job's outcome.
 - `test.yml` runs one job per commit (`test <sha>`) on ubuntu-24.04, set up by the wrapper's
   `setup-zgal` action (native toolchain: lavapipe, the Vulkan SDK with its validation layers,
-  clang through ccache, Racket and Node), plus pytest, numpy and scipy from Ubuntu's archive (7.4, 1.26 and 1.11 on 24.04). It
+  clang through ccache, Racket and Node), plus pytest, numpy, scipy and Pillow from Ubuntu's archive (7.4, 1.26, 1.11 and 10.2 on 24.04). It
   runs `make all web`, then `test-tools`, `test-cpp`, `test-programs` (native, on lavapipe, with
   validation) and `test-web` (Node with Dawn on lavapipe), each running even if an earlier test
   failed, and with `make -k`, so one failing program doesn't stop the others. On failure it uploads `build/test` and `build/test-web`.

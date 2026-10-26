@@ -1,5 +1,5 @@
 # Builds each commit's programs, native and for the web, and runs every test: the data tools'
-# (pytest, with numpy and scipy), the C++ tests and the programs' headless tests natively on
+# (pytest, with numpy, scipy and Pillow), the C++ tests and the programs' headless tests natively on
 # lavapipe with validation (including synchronization validation), and the programs' web tests
 # under Node with Dawn (on lavapipe).
 # Each commit's job runs with a read-only token: ci.yml's pending and statuses jobs post its "test"
@@ -67,10 +67,10 @@ jobs:
           npm-lockfile: external/vulkan_test/web/package-lock.json
 
       # The data tools' Python packages, from Ubuntu's archive (no pip, so nothing outside it runs)
-      - name: Install pytest, numpy and scipy
+      - name: Install pytest, numpy, scipy and Pillow
         run: |
-          sudo apt-get install -y -q --no-install-recommends python3-pytest python3-numpy python3-scipy
-          python3 -c 'import numpy, scipy, pytest; print("numpy", numpy.__version__, "scipy", scipy.__version__, "pytest", pytest.__version__)'
+          sudo apt-get install -y -q --no-install-recommends python3-pytest python3-numpy python3-scipy python3-pil
+          python3 -c 'import numpy, scipy, pytest, PIL; print("numpy", numpy.__version__, "scipy", scipy.__version__, "pytest", pytest.__version__, "Pillow", PIL.__version__)'
 
       - name: Build
         id: build
