@@ -13,6 +13,12 @@ docs/building-and-testing.md describes each scene and what it's for.
       About 2k random Gaussians (SH degree 3) in a unit ball, 24 cameras at 128x128 on a sphere
       around it and one at 160x96; every 8th sphere camera held out, the 160x96 one always
       trains.
+  make_synthetic.py perturb <scene dir> <out dir> [--seed <n>] [--jitter <fraction>]
+      The scene with degraded splats: positions jittered, scales doubled or halved, random colours
+      and opacities.
+  make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f>]
+      The scene with its splats replaced by ones initialized from a random subset of their
+      positions, as the converter initializes from COLMAP points.
 
 Every scene is a pure function of its arguments: the same seed writes the same bytes, with the
 same numpy version on the same platform (docs/building-and-testing.md).
@@ -24,6 +30,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
@@ -299,6 +306,78 @@ def make_s3(out_dir: str, seed: int, count: int) -> dict:
     return write(out_dir, splats, cameras, source, held_out)
 
 
+# --- Degraded starting points ---------------------------------------------------------------------------
+# Both keep the scene's cameras, images and split, copying every file but splats.bin, and record
+# what they did in the manifest's source.
+
+def read_splats(scene_dir: str):
+    with open(os.path.join(scene_dir, "manifest.json")) as f:
+        manifest = json.load(f)
+    with open(os.path.join(scene_dir, manifest["files"]["splats"]), "rb") as f:
+        return manifest, splat_module.from_std430(f.read())
+
+
+def write_degraded(scene_dir: str, out_dir: str, manifest: dict, splats: splat_module.Splats, how: dict) -> dict:
+    scene_dir, out_dir = os.path.realpath(scene_dir), os.path.realpath(out_dir)
+    if os.path.commonpath([scene_dir, out_dir]) == scene_dir:
+        raise ValueError(f"{out_dir}: the output directory can't be the scene's or inside it")
+    if os.path.exists(out_dir) and os.listdir(out_dir):
+        raise ValueError(f"{out_dir}: the output directory isn't empty (its files would mix with the scene's)")
+    shutil.copytree(scene_dir, out_dir, dirs_exist_ok=True)
+    with open(os.path.join(out_dir, manifest["files"]["splats"]), "wb") as f:
+        f.write(splat_module.to_std430(splats))
+    manifest = dict(manifest, splatCount=len(splats), source={**how, "from": manifest.get("source", {})})
+    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+        f.write("\n")
+    return manifest
+
+
+def perturbed(splats: splat_module.Splats, seed: int, jitter: float) -> splat_module.Splats:
+    """A degraded copy: positions plus Gaussian noise of sigma jitter times the RMS distance of the
+    positions from their centroid, every splat's scale doubled or halved (on all axes, at random),
+    DC colours uniform in [0, 1] with the higher SH bands zeroed, opacities uniform in [0.05, 0.95];
+    rotations kept."""
+    rng = np.random.default_rng(seed)
+    n = len(splats)
+    position = splats.position.astype(np.float64)
+    spread = math.sqrt(np.mean(np.sum((position - position.mean(0)) ** 2, axis=1))) if n else 0.0
+    sh = np.zeros((n, splat_module.SH_COEFFICIENTS, 3))
+    sh[:, 0, :] = splat_module.rgb_to_sh_dc(rng.uniform(0.0, 1.0, size=(n, 3)))
+    return splat_module.Splats(
+        position=position + rng.normal(0.0, jitter * spread, size=(n, 3)),
+        log_scale=splats.log_scale + rng.choice([-math.log(2.0), math.log(2.0)], size=(n, 1)),
+        rotation=splats.rotation,
+        opacity_logit=splat_module.logit(rng.uniform(0.05, 0.95, size=n)),
+        sh=sh)
+
+
+def sparse(splats: splat_module.Splats, seed: int, fraction: float) -> splat_module.Splats:
+    """Splats initialized as the converter initializes COLMAP points (splats.from_points) from a
+    random subset of round(fraction·N) positions (at least 4, for the nearest-neighbour scale),
+    kept in their original order, coloured with the splats' DC colours clamped to [0, 1]."""
+    rng = np.random.default_rng(seed)
+    n = len(splats)
+    keep = max(4, int(round(fraction * n)))
+    if keep > n:
+        raise ValueError(f"the scene has {n} splats; a sparse subset needs at least 4")
+    chosen = np.sort(rng.choice(n, size=keep, replace=False))
+    rgb = np.clip(colour_of_dc(splats.sh[chosen, 0, :]), 0.0, 1.0)
+    return splat_module.from_points(splats.position[chosen].astype(np.float64), rgb)
+
+
+def make_perturb(scene_dir: str, out_dir: str, seed: int, jitter: float) -> dict:
+    manifest, splats = read_splats(scene_dir)
+    return write_degraded(scene_dir, out_dir, manifest, perturbed(splats, seed, jitter),
+                          {"generator": GENERATOR, "perturb": {"seed": seed, "jitter": jitter}})
+
+
+def make_sparse(scene_dir: str, out_dir: str, seed: int, fraction: float) -> dict:
+    manifest, splats = read_splats(scene_dir)
+    return write_degraded(scene_dir, out_dir, manifest, sparse(splats, seed, fraction),
+                          {"generator": GENERATOR, "sparse": {"seed": seed, "fraction": fraction}})
+
+
 # --- Command line --------------------------------------------------------------------------------------------
 
 def main(argv=None) -> None:
@@ -321,9 +400,28 @@ def main(argv=None) -> None:
     c.add_argument("--count", type=int, default=2000, help="number of Gaussians (default 2000)")
     c.set_defaults(run=lambda a: make_s3(a.out, a.seed, a.count))
 
+    c = commands.add_parser("perturb", help="a scene with degraded splats, as a training start")
+    c.add_argument("scene")
+    c.add_argument("out")
+    c.add_argument("--seed", type=int, default=0)
+    c.add_argument("--jitter", type=float, default=0.05,
+                   help="position noise, relative to the positions' RMS spread (default 0.05)")
+    c.set_defaults(run=lambda a: make_perturb(a.scene, a.out, a.seed, a.jitter))
+
+    c = commands.add_parser("sparse", help="a scene initialized from a subset of its splats' positions")
+    c.add_argument("scene")
+    c.add_argument("out")
+    c.add_argument("--seed", type=int, default=0)
+    c.add_argument("--fraction", type=float, default=0.1, help="share of positions kept (default 0.1)")
+    c.set_defaults(run=lambda a: make_sparse(a.scene, a.out, a.seed, a.fraction))
+
     args = parser.parse_args(argv)
     if getattr(args, "count", 4) < 4:
         parser.error("--count must be at least 4")
+    if getattr(args, "jitter", 0.0) < 0:
+        parser.error("--jitter must not be negative")
+    if not 0 < getattr(args, "fraction", 1.0) <= 1:
+        parser.error("--fraction must be in (0, 1]")
     args.run(args)
 
 

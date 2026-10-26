@@ -263,3 +263,76 @@ def test_another_seed_other_splats(tmp_path, command):
     ms.main([command, str(tmp_path / "b"), "--seed", "2"] + (["--count", "100"] if command == "s3" else []))
     assert not filecmp.cmp(tmp_path / "a" / "splats.bin", tmp_path / "b" / "splats.bin", shallow=False)
     assert filecmp.cmp(tmp_path / "a" / "cameras.bin", tmp_path / "b" / "cameras.bin", shallow=False)
+
+
+# --- Degraded starting points -----------------------------------------------------------------------
+
+@pytest.fixture
+def small_s3(tmp_path):
+    ms.main(["s3", str(tmp_path / "gt"), "--count", "400"])
+    # A scene with images, so the copy is checked to keep them
+    os.makedirs(tmp_path / "gt" / "images")
+    (tmp_path / "gt" / "images" / "cam_00.png").write_bytes(b"not really a png")
+    return tmp_path / "gt"
+
+
+def test_perturb(small_s3, tmp_path):
+    out = tmp_path / "perturbed"
+    ms.main(["perturb", str(small_s3), str(out), "--seed", "4"])
+    manifest, got, _ = read_scene(out)
+    gt_manifest, gt, _ = read_scene(small_s3)
+    assert filecmp.cmp(small_s3 / "cameras.bin", out / "cameras.bin", shallow=False)
+    assert (out / "images" / "cam_00.png").read_bytes() == b"not really a png"
+    assert manifest["cameras"] == gt_manifest["cameras"] and manifest["test"] == gt_manifest["test"]
+    assert manifest["source"]["perturb"] == {"seed": 4, "jitter": 0.05}
+    assert manifest["source"]["from"] == gt_manifest["source"]
+
+    spread = math.sqrt(np.mean(np.sum((gt.position - gt.position.mean(0)) ** 2, axis=1)))
+    offset = (got.position - gt.position).astype(np.float64)
+    assert np.std(offset) == pytest.approx(0.05 * spread, rel=0.1)
+    ratio = got.log_scale - gt.log_scale
+    np.testing.assert_allclose(np.abs(ratio), math.log(2), atol=1e-5)
+    np.testing.assert_allclose(ratio, ratio[:, :1].repeat(3, 1), atol=1e-5)  # the same on every axis
+    assert 0.3 < np.mean(ratio[:, 0] > 0) < 0.7
+    np.testing.assert_array_equal(got.rotation, gt.rotation)
+    alpha = 1 / (1 + np.exp(-got.opacity_logit.astype(np.float64)))
+    assert alpha.min() >= 0.05 - 1e-6 and alpha.max() <= 0.95 + 1e-6
+    colour = splats.SH_C0 * got.sh[:, 0].astype(np.float64) + 0.5
+    assert colour.min() >= -1e-6 and colour.max() <= 1 + 1e-6
+    assert np.all(got.sh[:, 1:] == 0)
+    # Deterministic
+    ms.main(["perturb", str(small_s3), str(tmp_path / "again"), "--seed", "4"])
+    assert tree_bytes(out) == tree_bytes(tmp_path / "again")
+
+
+def test_sparse(small_s3, tmp_path):
+    out = tmp_path / "sparse"
+    ms.main(["sparse", str(small_s3), str(out), "--seed", "4"])
+    manifest, got, _ = read_scene(out)
+    _, gt, _ = read_scene(small_s3)
+    assert len(got) == 40 and manifest["source"]["sparse"] == {"seed": 4, "fraction": 0.1}
+    # A subset of the positions, in their order, initialized as the converter initializes points
+    index = [int(np.flatnonzero(np.all(gt.position == p, axis=1))[0]) for p in got.position]
+    assert index == sorted(set(index))
+    rgb = np.clip(splats.SH_C0 * gt.sh[index, 0].astype(np.float64) + 0.5, 0, 1)
+    want = splats.from_points(gt.position[index].astype(np.float64), rgb)
+    assert splats.to_std430(want) == splats.to_std430(got)
+    ms.main(["sparse", str(small_s3), str(tmp_path / "again"), "--seed", "4"])
+    assert tree_bytes(out) == tree_bytes(tmp_path / "again")
+
+
+@pytest.mark.parametrize("command", ["perturb", "sparse"])
+def test_degrading_refuses_unsafe_output_dirs(small_s3, tmp_path, command):
+    with pytest.raises(ValueError, match="inside"):
+        ms.main([command, str(small_s3), str(small_s3)])
+    with pytest.raises(ValueError, match="inside"):
+        ms.main([command, str(small_s3), str(small_s3 / "out")])
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    (stale / "images_1.bin").write_bytes(b"from another scene")
+    with pytest.raises(ValueError, match="isn't empty"):
+        ms.main([command, str(small_s3), str(stale)])
+    # An existing empty directory is fine
+    (tmp_path / "empty").mkdir()
+    ms.main([command, str(small_s3), str(tmp_path / "empty")])
+    assert read_scene(tmp_path / "empty")[0]["source"]["from"]["scene"] == "s3"

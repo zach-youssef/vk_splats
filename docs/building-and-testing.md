@@ -103,6 +103,8 @@ promise stable random streams, and float64 maths and BLAS can differ in the last
 tools/make_synthetic.py s1 <out dir> [--variant <name>]
 tools/make_synthetic.py s2 <out dir> [--seed <n>]
 tools/make_synthetic.py s3 <out dir> [--seed <n>] [--count <n>]
+tools/make_synthetic.py perturb <scene dir> <out dir> [--seed <n>] [--jitter <f>]
+tools/make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f>]
 ```
 
 - **S1** (`<out dir>/<variant>/`, no seed): the closed-form oracles' setups, with
@@ -143,6 +145,13 @@ tools/make_synthetic.py s3 <out dir> [--seed <n>] [--count <n>]
   camera (`cam_24_wide`), all with f = 140 so every view holds the whole ball. Every 8th sphere
   camera is held out (0, 8, 16); the 160×96 camera is always a training view, so re-fitting runs
   the backward pass on a non-square image.
+- **perturb** and **sparse** copy a scene (images and all, so run them after its images are
+  rendered) into a new or empty directory outside it, with degraded splats as a training start.
+  perturb jitters positions by Gaussian noise of σ = `--jitter` (0.05) × the positions' RMS distance
+  from their centroid, doubles or halves each splat's scale on all axes, draws DC colours in [0, 1]
+  (higher bands zero) and opacities in [0.05, 0.95], and keeps rotations. sparse keeps a random
+  `--fraction` (0.1, at least 4) of the positions, in order, and initializes splats from them as the
+  converter does from COLMAP points, coloured with the original DC colours clamped to [0, 1].
 
 ## GPU runs
 
