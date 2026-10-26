@@ -1,0 +1,291 @@
+;; The splatting math the kernels share: the scene's structs, the per-splat projection (Kerbl et al.
+;; 2023, Sec. 4 and 6, "Eq. n" below is the paper's equation n), SH colour and the sort keys.
+;; Programs import it, (import "../../lib/splat_math.zgal"), so its declarations land in their
+;; namespace. Every function here uses no textures, images or effects, so ZGAL also compiles it to
+;; C++ (inline, over GLM, in the importing file's header): the host and the CPU tests compute
+;; exactly what the shaders do.
+;;
+;; Conventions (docs/architecture.md): COLMAP's camera, +z forward, +y down, pixel centres at
+;; integer + 0.5; quaternions (w, x, y, z) in a vec4's (.x, .y, .z, .w). A symmetric 2x2 matrix
+;; [[a, b], [b, c]] is a vec3 (a, b, c). Values the paper doesn't give follow its reference code
+;; (graphdeco-inria/gaussian-splatting's diff-gaussian-rasterization, forward.cu): they're marked
+;; "(reference code)", and docs/paper-conformance.md lists them.
+
+;; ---------------------------------------------------------------------------------------------
+;; Structs
+;; ---------------------------------------------------------------------------------------------
+;; The input files' structs, as docs/data-format.md lays them out (tools/splatdata writes them).
+
+;; A splat's parameters, before activation (240 bytes)
+(struct Splat
+  (position vec3)          ; world space
+  (opacity float)          ; logit: alpha = sigmoid(opacity)
+  (logScale vec3)          ; scale = exp(logScale)
+  (rotation vec4)          ; quaternion (w, x, y, z) in (.x, .y, .z, .w), not normalized
+  (sh (array float 48)))   ; coefficient k (0-15) of channel c (RGB) at sh[3k + c]
+
+;; A pinhole camera (112 bytes)
+(struct Camera
+  (worldToCamera mat4)     ; [R t; 0 1], column-major: X_cam = R X + t
+  (intrinsics vec4)        ; (fx, fy, cx, cy) in pixels
+  (center vec3)            ; the camera centre in world space, -R^T t
+  (pixelOffset uint)       ; the image's first pixel in its batch
+  (size uvec2)             ; (width, height) in pixels
+  (imageBatch uint))       ; which images_<k>.bin; 0xFFFFFFFF without an image
+
+;; A splat as one camera sees it: the preprocess's output, which the tile and rasterize passes read
+;; (64 bytes). A culled splat (behind the near plane, degenerate, or off-screen) has tileCount 0.
+(struct Projected
+  (mean vec2)              ; the 2D mean, in pixels
+  (depth float)            ; view-space z, the sort's depth
+  (radius uint)            ; the 3-sigma radius in pixels
+  (conic vec3)             ; the inverse 2D covariance (a, b, c)
+  (opacity float)          ; sigmoid(Splat.opacity)
+  (colour vec3)            ; the SH colour for this camera's view direction
+  (tileCount uint)         ; tiles in the rectangle: (maxX - minX) (maxY - minY)
+  (tiles uvec4))           ; the tile rectangle (minX, minY, maxX, maxY), max exclusive
+
+;; ---------------------------------------------------------------------------------------------
+;; Constants
+;; ---------------------------------------------------------------------------------------------
+;; Tiles are 16x16 pixels (Sec. 6)
+(define tileSize (uint 16))
+;; Added to the 2D covariance's diagonal, in px^2 (reference code: EWA's screen-space low-pass
+;; filter), so every splat covers about a pixel
+(define lowPass 0.3)
+;; The radius's eigenvalue floors its discriminant at this (reference code)
+(define radiusDiscriminantMin 0.1)
+;; The Jacobian is evaluated with x/z and y/z clamped to this many half-image widths around the
+;; image centre (reference code: 1.3 tan(fov / 2)), so splats far off-screen don't blow up
+(define frustumGuard 1.3)
+;; The largest finite float (C's FLT_MAX): a determinant at or above it has overflowed, and is culled
+(define floatMax 3.4028234663852886e38)
+;; Radii are clamped to this many pixels before the cast to uint, which is undefined for a float out
+;; of range; tileRect clamps to the grid anyway, so for a mean within 2^20 px of the image any
+;; larger radius covers the same tiles
+(define radiusMax 1048576.0)
+
+;; The real spherical harmonics' constants for degrees 0-3 (reference code's SH_C0 ... SH_C3)
+(define SH_C0 0.28209479177387814)
+(define SH_C1 0.4886025119029199)
+(define SH_C2_0 1.0925484305920792)
+(define SH_C2_1 -1.0925484305920792)
+(define SH_C2_2 0.31539156525252005)
+(define SH_C2_3 -1.0925484305920792)
+(define SH_C2_4 0.5462742152960396)
+(define SH_C3_0 -0.5900435899266435)
+(define SH_C3_1 2.890611442640554)
+(define SH_C3_2 -0.4570457994644658)
+(define SH_C3_3 0.3731763325901154)
+(define SH_C3_4 -0.4570457994644658)
+(define SH_C3_5 1.445305721320277)
+(define SH_C3_6 -0.5900435899266435)
+
+;; ---------------------------------------------------------------------------------------------
+;; Activations and the 3D covariance
+;; ---------------------------------------------------------------------------------------------
+(define (sigmoid [x : float]) : float
+  (/ 1.0 (+ 1.0 (exp (- x)))))
+
+;; The rotation of a quaternion (w, x, y, z) in (.x, .y, .z, .w), normalized first (Eq. 10). The
+;; columns are R's: a rotation by theta about z, (cos(theta/2), 0, 0, sin(theta/2)), gives
+;; [[cos, -sin, 0], [sin, cos, 0], [0, 0, 1]].
+(define (quatToMatrix [q : vec4]) : mat3
+  (let* ([n (normalize q)]
+         [w n.x]
+         [x n.y]
+         [y n.z]
+         [z n.w])
+    (mat3 (vec3 (- 1.0 (* 2.0 (+ (* y y) (* z z)))) (* 2.0 (+ (* x y) (* w z))) (* 2.0 (- (* x z) (* w y))))
+          (vec3 (* 2.0 (- (* x y) (* w z))) (- 1.0 (* 2.0 (+ (* x x) (* z z)))) (* 2.0 (+ (* y z) (* w x))))
+          (vec3 (* 2.0 (+ (* x z) (* w y))) (* 2.0 (- (* y z) (* w x))) (- 1.0 (* 2.0 (+ (* x x) (* y y))))))))
+
+;; The world-space 3D covariance Sigma = R S S^T R^T = M M^T with M = R S, S = diag(exp(logScale))
+;; (Eq. 6; Appendix A's M)
+(define (covariance3d [logScale : vec3] [rotation : vec4]) : mat3
+  (let* ([s (exp logScale)]
+         [m (* (quatToMatrix rotation) (mat3 (vec3 s.x 0.0 0.0) (vec3 0.0 s.y 0.0) (vec3 0.0 0.0 s.z)))])
+    (* m (transpose m))))
+
+;; ---------------------------------------------------------------------------------------------
+;; Projection (EWA splatting, Sec. 4)
+;; ---------------------------------------------------------------------------------------------
+;; A world-space point in camera space
+(define (toCamera [worldToCamera : mat4] [p : vec3]) : vec3
+  (.xyz (* worldToCamera (vec4 p 1.0))))
+
+;; The 2D mean in pixels of a camera-space point t (z > 0): (fx x / z + cx, fy y / z + cy)
+(define (projectMean [t : vec3] [intrinsics : vec4]) : vec2
+  (+ (* intrinsics.xy (/ t.xy t.z)) intrinsics.zw))
+
+;; The 2D covariance Sigma' = J W Sigma W^T J^T plus the low-pass term on its diagonal (Eq. 5), as
+;; (a, b, c), for a splat with camera-space mean t (z > 0) and world-space covariance sigma, seen
+;; by a camera with world-to-camera rotation w (W = R), intrinsics (fx, fy, cx, cy) and image
+;; size. J is the pinhole projection's Jacobian at t,
+;;   J = [[fx / z, 0, -fx x / z^2], [0, fy / z, -fy y / z^2]],
+;; with x/z and y/z clamped to frustumGuard half-widths around the image centre (reference code).
+;; Its rows through W are the vectors j0 = W^T J[0] and j1 = W^T J[1], so a = j0 . Sigma j0,
+;; b = j0 . Sigma j1 and c = j1 . Sigma j1.
+(define (covariance2d [t : vec3] [sigma : mat3] [w : mat3] [intrinsics : vec4] [size : vec2]) : vec3
+  (let* ([focal intrinsics.xy]
+         [centre intrinsics.zw]
+         ;; The image spans x/z in [-cx / fx, (W - cx) / fx]; the guard extends each side by
+         ;; (frustumGuard - 1) / 2 image widths, which is 1.3 tan(fov / 2) for a centred image
+         [margin (* (* 0.5 (- frustumGuard 1.0)) size)]
+         [lo (/ (- (- centre) margin) focal)]
+         [hi (/ (+ (- size centre) margin) focal)]
+         [uv (clamp (/ t.xy t.z) lo hi)]
+         [iz (/ 1.0 t.z)]
+         [wt (transpose w)]
+         [j0 (* wt (vec3 (* focal.x iz) 0.0 (- (* focal.x uv.x iz))))]
+         [j1 (* wt (vec3 0.0 (* focal.y iz) (- (* focal.y uv.y iz))))]
+         [s0 (* sigma j0)]
+         [s1 (* sigma j1)])
+    (vec3 (+ (dot j0 s0) lowPass) (dot j0 s1) (+ (dot j1 s1) lowPass))))
+
+;; The determinant of a symmetric 2x2 matrix (a, b, c)
+(define (det2 [m : vec3]) : float
+  (- (* m.x m.z) (* m.y m.y)))
+
+;; The conic: the inverse of a positive-definite 2D covariance, (c, -b, a) / det
+(define (conicOf [cov : vec3]) : vec3
+  (/ (vec3 cov.z (- cov.y) cov.x) (det2 cov)))
+
+;; The 3-sigma radius in pixels along the covariance's major axis (Sec. 6's 99% interval):
+;; ceil(3 sqrt(lambda)), lambda = mid + sqrt(max(mid^2 - det, 0.1)), mid = (a + c) / 2 (reference
+;; code; the floor adds up to sqrt(0.1) px^2 for a near-isotropic splat), at most radiusMax. The
+;; covariance must be finite (mid^2 may overflow: the clamp catches the inf).
+(define (radiusPx [cov : vec3]) : uint
+  (let* ([mid (* 0.5 (+ cov.x cov.z))]
+         [lambda (+ mid (sqrt (max (- (* mid mid) (det2 cov)) radiusDiscriminantMin)))])
+    (uint (min (ceil (* 3.0 (sqrt lambda))) radiusMax))))
+
+;; ---------------------------------------------------------------------------------------------
+;; Tiles
+;; ---------------------------------------------------------------------------------------------
+;; The tile grid covering an image: ceil(size / 16)
+(define (tileGrid [size : uvec2]) : uvec2
+  (/ (+ size (- tileSize 1)) tileSize))
+
+;; The tiles a splat's square mean +- radius touches, (minX, minY, maxX, maxY) with max exclusive,
+;; clamped to the grid: tile k spans pixels [16k, 16k + 16), and the rectangle is
+;; [floor((mean - r) / 16), ceil((mean + r) / 16)). That holds every tile with a pixel centre in the
+;; square (and possibly a tile whose edge the square only grazes). Empty (min = max on an axis) for
+;; a square off the image.
+(define (tileRect [mean : vec2] [radius : uint] [grid : uvec2]) : uvec4
+  (let* ([r (float radius)]
+         [g (vec2 grid)]
+         ;; 1/16 is exact, so floor and ceil see the same value on every device
+         [lo (clamp (floor (* (- mean r) 0.0625)) (vec2 0.0) g)]
+         [hi (clamp (ceil (* (+ mean r) 0.0625)) (vec2 0.0) g)])
+    (uvec4 (uvec2 lo) (uvec2 hi))))
+
+;; The number of tiles in a rectangle from tileRect
+(define (tileCountOf [rect : uvec4]) : uint
+  (* (- rect.z rect.x) (- rect.w rect.y)))
+
+;; ---------------------------------------------------------------------------------------------
+;; Spherical harmonics
+;; ---------------------------------------------------------------------------------------------
+;; Coefficient k's RGB
+(define (shCoefficient [sh : (array float 48)] [k : uint]) : vec3
+  (vec3 (at sh (* 3 k)) (at sh (+ (* 3 k) 1)) (at sh (+ (* 3 k) 2))))
+
+;; The colour of SH coefficients of degree 0 to `degree` (at most 3; the higher bands are ignored)
+;; seen from unit direction d, from the camera to the splat: max(sum_k sh_k Y_k(d) + 0.5, 0)
+;; (reference code's computeColorFromSH: the basis and its signs, the +0.5 that centres a zero
+;; coefficient on grey, and the clamp from below only)
+(define (shColour [sh : (array float 48)] [d : vec3] [degree : uint]) : vec3
+  (let* ([x d.x]
+         [y d.y]
+         [z d.z]
+         [xx (* x x)]
+         [yy (* y y)]
+         [zz (* z z)]
+         [r0 (* SH_C0 (shCoefficient sh 0))]
+         [r1 (if (>= degree 1)
+                 (+ r0
+                    (* (* (- SH_C1) y) (shCoefficient sh 1))
+                    (* (* SH_C1 z) (shCoefficient sh 2))
+                    (* (* (- SH_C1) x) (shCoefficient sh 3)))
+                 r0)]
+         [r2 (if (>= degree 2)
+                 (+ r1
+                    (* (* SH_C2_0 (* x y)) (shCoefficient sh 4))
+                    (* (* SH_C2_1 (* y z)) (shCoefficient sh 5))
+                    (* (* SH_C2_2 (- (* 2.0 zz) xx yy)) (shCoefficient sh 6))
+                    (* (* SH_C2_3 (* x z)) (shCoefficient sh 7))
+                    (* (* SH_C2_4 (- xx yy)) (shCoefficient sh 8)))
+                 r1)]
+         [r3 (if (>= degree 3)
+                 (+ r2
+                    (* (* SH_C3_0 y (- (* 3.0 xx) yy)) (shCoefficient sh 9))
+                    (* (* SH_C3_1 x y z) (shCoefficient sh 10))
+                    (* (* SH_C3_2 y (- (* 4.0 zz) xx yy)) (shCoefficient sh 11))
+                    (* (* SH_C3_3 z (- (* 2.0 zz) (* 3.0 xx) (* 3.0 yy))) (shCoefficient sh 12))
+                    (* (* SH_C3_4 x (- (* 4.0 zz) xx yy)) (shCoefficient sh 13))
+                    (* (* SH_C3_5 z (- xx yy)) (shCoefficient sh 14))
+                    (* (* SH_C3_6 x (- xx (* 3.0 yy))) (shCoefficient sh 15)))
+                 r2)])
+    (max (+ r3 0.5) (vec3 0.0))))
+
+;; ---------------------------------------------------------------------------------------------
+;; The whole preprocess of one splat for one camera
+;; ---------------------------------------------------------------------------------------------
+(define culled
+  (Projected (vec2 0.0) 0.0 (uint 0) (vec3 0.0) 0.0 (vec3 0.0) (uint 0) (uvec4 (uint 0))))
+
+;; A splat as cam sees it, or culled (tileCount 0) when its camera-space depth is at most near
+;; (the reference code's 0.2; Sec. 6's near-plane guard), its 2D covariance's determinant isn't
+;; positive and finite (not positive definite; NaN, e.g. from a zero quaternion or a scale whose
+;; exp overflows; or inf, from a huge but finite scale), or its tile rectangle is empty. Colour
+;; uses SH degrees 0 to shDegree.
+(define (projectSplat [s : Splat] [cam : Camera] [near : float] [shDegree : uint]) : Projected
+  (let* ([t (toCamera cam.worldToCamera s.position)])
+    (if (<= t.z near)
+        culled
+        (let* ([cov (covariance2d t (covariance3d s.logScale s.rotation) (mat3 cam.worldToCamera)
+                                  cam.intrinsics (vec2 cam.size))]
+               [det (det2 cov)])
+          (if (not (and (> det 0.0) (< det floatMax)))
+              culled
+              (let* ([mean (projectMean t cam.intrinsics)]
+                     [radius (radiusPx cov)]
+                     [rect (tileRect mean radius (tileGrid cam.size))]
+                     [count (tileCountOf rect)])
+                (if (= count (uint 0))
+                    culled
+                    (Projected mean t.z radius (conicOf cov) (sigmoid s.opacity)
+                               (shColour s.sh (normalize (- s.position cam.center)) shDegree)
+                               count rect))))))))
+
+;; ---------------------------------------------------------------------------------------------
+;; Sort keys (D5a: one 32-bit key, tile then quantized log depth)
+;; ---------------------------------------------------------------------------------------------
+;; The bits a tile index needs for tileCount tiles: ceil(log2(tileCount)), at least 1 and at most
+;; 31, so the depth keeps at least one bit (748x748 has 47x47 = 2209 tiles: 12 bits, leaving 20)
+(define (tileBitsFor [tileCount : uint]) : uint
+  (while ([bits (uint 1)])
+    (and (< bits (uint 31)) (< (shl (uint 1) bits) tileCount))
+    (+ bits (uint 1))))
+
+;; The depth's bits in a key: 32 - tileBitsFor(tileCount)
+(define (depthBitsFor [tileCount : uint]) : uint
+  (- (uint 32) (tileBitsFor tileCount)))
+
+;; The key of a splat's entry in a tile: the tile in the high bits, then the depth in the low
+;; depthBits (1-31) quantized on a log scale between near and far (clamped there), so sorting the
+;; keys groups entries by tile and orders each tile's front to back. Depths quantize to the same
+;; value when they're within a factor (far / near)^(1 / 2^depthBits) of each other, and all depths
+;; beyond far share the largest value: equal keys' order is the sort's to choose.
+;; Requires 0 < near < far and tile < 2^(32 - depthBits); neither is checked.
+(define (depthKey [tile : uint] [depth : float] [depthBits : uint] [near : float] [far : float]) : uint
+  (let* ([maxQ (shr (bitnot (uint 0)) (- (uint 32) depthBits))]
+         [lnNear (log near)]
+         [f (clamp (/ (- (log (max depth near)) lnNear) (- (log far) lnNear)) 0.0 1.0)]
+         [q (min (uint (* f (float maxQ))) maxQ)])
+    (bitor (shl tile depthBits) q)))
+
+;; The tile of a key from depthKey
+(define (keyTile [key : uint] [depthBits : uint]) : uint
+  (shr key depthBits))

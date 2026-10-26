@@ -69,6 +69,11 @@ Rendering, from diff-gaussian-rasterization's `forward.cu` (the closed-form orac
 - SH colour plus 0.5, clamped at 0 from below.
 - The radius ceil(3·√λ), with λ = mid + √max(mid² − det, 0.1): the 0.1 floor makes a
   near-isotropic splat's radius up to a pixel larger than the exact eigenvalue gives.
+- The near plane at z = 0.2 (a parameter of `projectSplat`).
+- The Jacobian evaluated with x/z and y/z clamped to 1.3 tan(fov/2). The reference assumes a
+  centred principal point; `lib/splat_math.zgal` extends the image by 0.15 of its size on each side
+  instead ([(−cx − 0.15 W)/fx, (1.15 W − cx)/fx]), which is the same for a centred one.
+- The SH basis's constants, signs and coefficient order (`computeColorFromSH`).
 
 Training, to be checked against the reference repository when training lands:
 
@@ -92,6 +97,13 @@ Training, to be checked against the reference repository when training lands:
 5. **No whole-tile early exit**: ZGAL barriers can't sit in a loop that depends on shared memory.
    Each pixel still stops blending on its own.
 6. **No low-resolution warm-up.**
+7. **Tile rectangle**: [⌊(m − r)/16⌋, ⌈(m + r)/16⌉) per axis, the tiles meeting the square
+   (m − r, m + r), symmetric and covering every pixel centre in it. The reference's `getRect`, in
+   this repository's +0.5 pixel-centre convention, is [⌊(m − 0.5 − r)/16⌋, ⌊(m − 0.5 + r + 15)/16⌋):
+   it drops tile k when m + r ∈ (16k, 16k + 1.5), though for m + r ≥ 16k + 0.5 that tile holds
+   pixel centre 16k + 0.5 inside the square, and adds tile k − 1 when m − r ∈ [16k, 16k + 0.5).
+   It shows in images: at 3σ, α = opacity·e^−4.5 ≈ 0.011·opacity, above the 1/255 cutoff, so
+   pixels in those tiles blend differently from a reference render.
 
 ## How correctness is checked
 
