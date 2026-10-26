@@ -99,7 +99,9 @@ Finite differences and re-fitting check the code against itself, so they can't c
 pass that is wrong but consistent. Four checks together cover it:
 
 - closed-form single-splat oracles for renders and gradients (`tests/oracle/`);
-- reprojecting every COLMAP point onto its recorded observations (the camera conventions);
+- reprojecting every COLMAP point onto its recorded observations (the camera conventions): the
+  recomputed mean reprojection errors match COLMAP's recorded ones to 1e-6 px
+  (`tools/tests/test_colmap_reprojection.py`);
 - GPU finite differences of the whole forward pass, on tiny synthetic scenes: central differences
   with h = 1e-3 relative (1e-4 absolute floor) on a smooth L2 test loss, passing when
   |analytic − FD| ≤ 2e-2·max(|analytic|, |FD|) + 1e-5, skipping parameters with negligible gradient;

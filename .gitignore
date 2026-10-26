@@ -1,6 +1,7 @@
 # Build outputs (make): programs, tests, web builds
 build/
-# Python caches (the data tools and their tests)
+# Python caches (the data tools and their tests), and a local virtualenv for them
+.venv/
 __pycache__/
 .pytest_cache/
 .DS_Store
