@@ -66,6 +66,27 @@ working branch, each commit beyond `main` (the newest 20); on `main`, the pushed
 - lavapipe's subgroup size is 4, 8 or 16 depending on the runner's CPU, so a kernel that assumes
   one may pass locally and fail here, or the other way round.
 
+## Closed-form oracles
+
+`tests/oracle/closed_form.h` holds hand-derived single-splat renders, the two-splat composite and
+single-splat L2 gradients for one canonical setup (camera at the origin looking down +z, one focal
+length, splats rotated only about z, DC colour), in double; the header documents each formula's
+derivation and paper equation. Kernel tests compare against it; `tests/cpp/closed_form_test.cpp`
+tests it on its own. When using it:
+
+- `render()` has no tile cutoff: compare whole images only for a splat whose 3σ square covers the
+  image (`footprint_covers_image()`), or mask the tiles the splat doesn't touch.
+- The gradients are defined only where no pixel's alpha is clamped at 0.99 (they throw otherwise);
+  pixels below 1/255 contribute nothing.
+- Feed kernels the rotation as `quat_about_z(theta)`. For a camera rotated about z, feed the world
+  splat and compare with the oracle on `world_to_camera_about_z()`'s splat; that guards the
+  covariance's W against Wᵀ.
+- `projected_l2()` gives the gradients of the projected stage (2D mean, Σ′ or the conic, activated
+  opacity, colour) for the backward rasterize; `single_splat_l2()` chains them to the splat's
+  parameters. A symmetric matrix's `b` gradient is for the shared off-diagonal value (both entries).
+  Against the reference: its conic gradient's off-diagonal is half of `conic.b`, its Σ′ gradient
+  equals `cov.b`, and its `dL_dmean2D` is per NDC unit (0.5·W, or 0.5·H for y, times `mean`).
+
 ## GPU runs
 
 Run GPU work (program tests, captures) one at a time on a machine. Locally that's MoltenVK on the

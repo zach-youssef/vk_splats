@@ -62,7 +62,15 @@ every stage. Its camera conventions were found by trial and error ("Fix inverted
 
 ## Values from the reference code
 
-To be checked against the reference repository when training lands:
+Rendering, from diff-gaussian-rasterization's `forward.cu` (the closed-form oracles in
+`tests/oracle/` use them):
+
+- +0.3 on the 2D covariance's diagonal (the low-pass filter).
+- SH colour plus 0.5, clamped at 0 from below.
+- The radius ceil(3·√λ), with λ = mid + √max(mid² − det, 0.1): the 0.1 floor makes a
+  near-isotropic splat's radius up to a pixel larger than the exact eigenvalue gives.
+
+Training, to be checked against the reference repository when training lands:
 
 - Learning rates: position 1.6e-4 decaying to 1.6e-6, scaled by the scene extent; SH DC 2.5e-3,
   the other bands 1/20 of that; opacity 0.05; scale 5e-3; rotation 1e-3.
