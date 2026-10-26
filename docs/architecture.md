@@ -73,7 +73,8 @@ densification and pruning on a fixed capacity, compacted by scan.
 
 `lib/splat_math.zgal` holds what every kernel computes per splat. Its functions use no textures,
 images or effects, so ZGAL also compiles them to inline C++ over GLM: the host and the CPU tests
-compute exactly what the shaders do.
+compute exactly what the shaders do. `tests/cpp/splat_math_test.cpp` checks that C++ against the
+closed-form oracles (`tests/oracle/closed_form.h`) and independent derivations.
 
 - **Preprocess** (`projectSplat`): the camera-space mean `t = R p + t_cam`; Σ = M Mᵀ with
   M = R(q/|q|)·diag(exp(logScale)); Σ' = J W Σ Wᵀ Jᵀ + 0.3 I, with J evaluated at x/z and y/z

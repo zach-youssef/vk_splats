@@ -41,7 +41,11 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
 - **A C++ test**: `tests/cpp/<name>.cpp`, a whole program (doctest with
   `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`, or its own `main`) with `tests/`, doctest and the wrapper's
   headers on the include path, and no library linked, so it tests header-only code (the oracles).
-  It's rebuilt when any header in `tests/cpp/` or `tests/oracle/` changes.
+  It's rebuilt when any header in `tests/cpp/` or `tests/oracle/` changes. To test a ZGAL module's
+  functions, add `tests/cpp/<name>.zgal` beside it (importing the module): the test then includes
+  the generated `<name>.zgal.h` (namespace `<name>`), and the file's shaders are compiled too, so a
+  compute material there that calls the functions has glslc check them
+  (`tests/cpp/splat_math_test.zgal`).
 - **A Python test**: `test_*.py` anywhere under `tools/` or `tests/`. They run in one pytest
   invocation without `__init__.py` files, so each basename must be unique (pytest otherwise fails
   with "import file mismatch").

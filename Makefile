@@ -67,13 +67,21 @@ endif
 
 # C++ tests: each tests/cpp/<name>.cpp is a program (e.g. doctest's, with its own main) built into
 # build/tests/<name> and run; doctest and the wrapper's headers are on the include path. Nothing is
-# linked, so they test header-only code (the oracles, the wrapper's header-only parts).
+# linked, so they test header-only code (the oracles, the wrapper's header-only parts, and the C++
+# that ZGAL generates for functions). A test with a tests/cpp/<name>.zgal beside it (e.g. importing
+# a lib/ module) includes its generated <name>.zgal.h; that file's shaders are compiled too, so
+# glslc checks the functions its materials call.
 CPP_TESTS = $(patsubst tests/cpp/%.cpp,%,$(wildcard tests/cpp/*.cpp))
+CPP_TEST_ZGAL = $(patsubst tests/cpp/%.zgal,%,$(wildcard tests/cpp/*.zgal))
 DOCTEST_CFLAGS = -I$(ZGAL_ROOT)/third_party/doctest
+
+$(foreach t,$(CPP_TEST_ZGAL),$(eval $(call zgal-rule,tests/cpp/$(t).zgal,$(OUT)/tests/gen/$(t),$(OUT)/tests/gen/$(t)/spv)))
+$(foreach t,$(CPP_TEST_ZGAL),$(eval $(OUT)/tests/$(t): $(OUT)/tests/gen/$(t)/$(t).zgal.stamp))
 
 $(OUT)/tests/%: tests/cpp/%.cpp $(wildcard tests/cpp/*.h tests/oracle/*.h)
 	@mkdir -p $(dir $@)
-	$(CXX) -o $@ $< $(CXXFLAGS) $(ZGAL_CFLAGS) $(DOCTEST_CFLAGS) -Itests
+	$(CXX) -o $@ $< $(CXXFLAGS) $(ZGAL_CFLAGS) $(DOCTEST_CFLAGS) -Itests \
+		$(if $(wildcard tests/cpp/$*.zgal),-I$(OUT)/tests/gen/$*)
 
 test-cpp: $(foreach t,$(CPP_TESTS),$(OUT)/tests/$(t))
 	@set -e; for t in $(CPP_TESTS); do echo "== $$t"; $(OUT)/tests/$$t; done

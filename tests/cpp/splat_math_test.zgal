@@ -1,0 +1,24 @@
+;; The splat math for its C++ test (splat_math_test.cpp includes the generated
+;; splat_math_test.zgal.h, whose namespace is this file's name). The probe material calls every
+;; function, so the build also compiles them to GLSL (glslc checks them); the test never runs it.
+(import "../../lib/splat_math.zgal")
+
+(compute-material SplatMathProbe
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat))
+   (cameras (buffer-array Camera))
+   (projected (buffer-array Projected))
+   (keys (buffer-array uint)))
+  (push (count uint) (near float) (far float) (shDegree uint))
+  (compute
+   (let* ([i globalInvocationId.x])
+     (when (< i count)
+       (let* ([cam (at cameras 0)]
+              [p (projectSplat (at splats i) cam near shDegree)]
+              [grid (tileGrid cam.size)]
+              [depthBits (depthBitsFor (* grid.x grid.y))])
+         (write! (at projected i) p)
+         (write! (at keys i)
+                 (keyTile (depthKey (+ (* p.tiles.y grid.x) p.tiles.x) p.depth depthBits near far)
+                          depthBits)))))))

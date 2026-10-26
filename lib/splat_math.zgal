@@ -3,7 +3,8 @@
 ;; Programs import it, (import "../../lib/splat_math.zgal"), so its declarations land in their
 ;; namespace. Every function here uses no textures, images or effects, so ZGAL also compiles it to
 ;; C++ (inline, over GLM, in the importing file's header): the host and the CPU tests compute
-;; exactly what the shaders do.
+;; exactly what the shaders do, and tests/cpp/splat_math_test.cpp checks it against the closed-form
+;; oracles (tests/oracle/closed_form.h) and independent derivations.
 ;;
 ;; Conventions (docs/architecture.md): COLMAP's camera, +z forward, +y down, pixel centres at
 ;; integer + 0.5; quaternions (w, x, y, z) in a vec4's (.x, .y, .z, .w). A symmetric 2x2 matrix
