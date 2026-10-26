@@ -89,6 +89,61 @@ tests it on its own. When using it:
   Against the reference: its conic gradient's off-diagonal is half of `conic.b`, its Σ′ gradient
   equals `cov.b`, and its `dL_dmean2D` is per NDC unit (0.5·W, or 0.5·H for y, times `mean`).
 
+## Synthetic scenes
+
+`tools/make_synthetic.py` writes test scenes in the converter's format (`docs/data-format.md`),
+with cameras and splats but no images; its tests are `tools/tests/test_synthetic.py`. Each scene
+is a pure function of its arguments (the seed defaults to 0), so the same command writes the same
+bytes with the same numpy version on the same platform, and the manifest's `source` records the
+generator and its arguments. Across numpy versions or machines the bytes may differ: numpy doesn't
+promise stable random streams, and float64 maths and BLAS can differ in the last bit. So a golden
+(a capture compared across runs) must commit the scene it was made from, not regenerate it in CI.
+
+```
+tools/make_synthetic.py s1 <out dir> [--variant <name>]
+tools/make_synthetic.py s2 <out dir> [--seed <n>]
+tools/make_synthetic.py s3 <out dir> [--seed <n>] [--count <n>]
+```
+
+- **S1** (`<out dir>/<variant>/`, no seed): the closed-form oracles' setups, with
+  `tests/cpp/closed_form_test.cpp`'s numbers. Cameras sit at the origin, rotated only about z,
+  with fx = fy = f and the principal point at the image centre; the splats have DC colour only and
+  rotation `quat_about_z(theta)`. `source.oracle` holds what a kernel test needs to build the
+  oracle's `Camera` and `Splat`s: `f`, `width`, `height`, `background` (black where the C++ test
+  sets none), `target` (the gradient setup only), `cameraPhi` (camera k is Rz(phi_k); for phi ≠ 0
+  compare with `world_to_camera_about_z(splat, phi)`) and the world-space `splats` (`x`, `y`, `z`,
+  `logScale`, `theta`, `opacityLogit`, `dc`).
+
+  | Variant | Setup (f, size) | What it pins down |
+  |---|---|---|
+  | `isotropic` | 50, 33² | isotropic on the axis, theta 0.3: a = c = (f s / z)² + 0.3, b = 0 |
+  | `anisotropic`, `-rot90`, `-rot45` | 50, 33² | axis-aligned; axes swapped; b ≠ 0 with the same eigenvalues |
+  | `off-axis` | 50, 33² | the Jacobian's off-axis terms (sz matters) |
+  | `one-splat`, `-clamped` | 50, 33² | the per-pixel value over a background; alpha clamped at 0.99 (logit 12) |
+  | `gradient` | 20, 15² | `single_splat_l2()`: footprint covers the image, nothing clamped |
+  | `two-splat` | 50, 33² | the composite in depth order; stored back splat first, so the kernel must sort |
+  | `rotated-camera`, `-aligned` | 50, 33², 3 cameras | W against Wᵀ, with theta 0.7 and 0 |
+
+  The 33-pixel images put a pixel centre on the principal point. The cameras all sit at the
+  origin, so the converter's extent (from camera centres) would be 0; S1 records instead 1.1 times
+  the largest distance from the origin to a splat, so a training run on S1 gets a non-zero
+  position learning rate. Only `gradient`'s footprint
+  covers the image, so compare the others whole-image only where `footprint_covers_image()` says
+  so, or mask by tile.
+- **S2** (seeded): 8 splats, for exact tile ranges and finite differences. Five overlap near the
+  axis at depths 4.00–4.08 (0.5% apart, which the depth key must still order), one has its mean
+  just past the right edge with its footprint reaching in, one is entirely off-screen and one is
+  behind both cameras (`source.cases` names each, as `cam_0` sees it). Positions are fixed; the
+  anisotropic scales, unnormalized random rotations, opacities and all SH bands come from the
+  seed. `cam_0` is 64×64 at the origin (R = I); `cam_1` is 80×48, off the axis, looking at the
+  cluster.
+- **S3** (seeded): `--count` (2000) Gaussians uniform in the unit ball, with anisotropic scales of
+  0.01–0.06, unnormalized random rotations, opacities 0.3–0.95 and SH degree 3, seen by 24 128×128
+  cameras on a Fibonacci sphere of radius 4 looking at the origin (world +z up) and one 160×96
+  camera (`cam_24_wide`), all with f = 140 so every view holds the whole ball. Every 8th sphere
+  camera is held out (0, 8, 16); the 160×96 camera is always a training view, so re-fitting runs
+  the backward pass on a non-square image.
+
 ## GPU runs
 
 Run GPU work (program tests, captures) one at a time on a machine. Locally that's MoltenVK on the
