@@ -47,7 +47,7 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
 ## CI
 
 GitHub Actions (`.github/workflows/`, cloned from ppu's) checks every commit a push brings: on a
-working branch, each commit beyond `main` (the newest 20); on `main`, the pushed range.
+working branch, each commit beyond `main` (the newest 50); on `main`, the pushed range.
 
 - `ci.yml`, on every push:
   - `commits` lists the commits (the wrapper's `commits` action, from the pinned submodule);
