@@ -44,6 +44,28 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   invocation without `__init__.py` files, so each basename must be unique (pytest otherwise fails
   with "import file mismatch").
 
+## CI
+
+GitHub Actions (`.github/workflows/`, cloned from ppu's) checks every commit a push brings: on a
+working branch, each commit beyond `main` (the newest 20); on `main`, the pushed range.
+
+- `ci.yml`, on every push:
+  - `commits` lists the commits (the wrapper's `commits` action, from the pinned submodule);
+  - `pending` marks each commit's `test` status pending;
+  - `test` runs `test.yml` for them (the newest 50 beyond main);
+  - `statuses` posts each commit's `test` status from its job's outcome.
+- `test.yml` runs one job per commit (`test <sha>`) on ubuntu-24.04, set up by the wrapper's
+  `setup-zgal` action (native toolchain: lavapipe, the Vulkan SDK with its validation layers,
+  clang through ccache, Racket and Node), plus pytest, numpy and scipy from Ubuntu's archive (7.4, 1.26 and 1.11 on 24.04). It
+  runs `make all web`, then `test-tools`, `test-cpp`, `test-programs` (native, on lavapipe, with
+  validation) and `test-web` (Node with Dawn on lavapipe), each running even if an earlier test
+  failed, and with `make -k`, so one failing program doesn't stop the others. On failure it uploads `build/test` and `build/test-web`.
+- Permissions: the jobs that run code (the repository's, the wrapper's or third-party actions)
+  have a read-only `contents: read` token and check out without persisting credentials; only
+  `pending` and `statuses`, which check nothing out, can write commit statuses.
+- lavapipe's subgroup size is 4, 8 or 16 depending on the runner's CPU, so a kernel that assumes
+  one may pass locally and fail here, or the other way round.
+
 ## GPU runs
 
 Run GPU work (program tests, captures) one at a time on a machine. Locally that's MoltenVK on the

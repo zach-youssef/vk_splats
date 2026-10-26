@@ -1,0 +1,111 @@
+# Builds each commit's programs, native and for the web, and runs every test: the data tools'
+# (pytest, with numpy and scipy), the C++ tests and the programs' headless tests natively on
+# lavapipe with validation (including synchronization validation), and the programs' web tests
+# under Node with Dawn (on lavapipe).
+# Each commit's job runs with a read-only token: ci.yml's pending and statuses jobs post its "test"
+# commit status from the job's conclusion (the job is named "test <sha>").
+name: test
+on:
+  workflow_call:
+    inputs:
+      commits:
+        description: A JSON array of the commit SHAs to check.
+        required: true
+        type: string
+      wrapper-repository:
+        description: The wrapper's repository (owner/name), whose actions set up the runner.
+        required: true
+        type: string
+      wrapper-sha:
+        description: The wrapper's commit whose actions set up the runner (the pushed commit's pin).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test ${{ matrix.sha }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        sha: ${{ fromJSON(inputs.commits) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+
+      # Over https: the submodule's URL is ssh, which the runner has no key for
+      - name: Check out the wrapper
+        run: |
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          git submodule update --init --recursive
+
+      # The actions come from the wrapper the pushed commit pins, not the checked-out commit's, so
+      # every commit is checked with the same setup (older commits pin wrappers without them)
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.wrapper-repository }}
+          ref: ${{ inputs.wrapper-sha }}
+          path: .ci
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - uses: ./.ci/.github/actions/setup-zgal
+        with:
+          toolchain: native
+          npm-lockfile: external/vulkan_test/web/package-lock.json
+
+      # The data tools' Python packages, from Ubuntu's archive (no pip, so nothing outside it runs)
+      - name: Install pytest, numpy and scipy
+        run: |
+          sudo apt-get install -y -q --no-install-recommends python3-pytest python3-numpy python3-scipy
+          python3 -c 'import numpy, scipy, pytest; print("numpy", numpy.__version__, "scipy", scipy.__version__, "pytest", pytest.__version__)'
+
+      - name: Build
+        id: build
+        run: make -j"$(nproc)" all web
+
+      # The test steps run whatever an earlier one's outcome, once the build has succeeded (the
+      # data tools' tests need no build), and `make -k` keeps going past a failing program, so one
+      # failure doesn't hide another
+      - name: Data tool tests (pytest)
+        if: ${{ !cancelled() }}
+        run: make test-tools
+
+      - name: C++ tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make -j"$(nproc)" test-cpp
+
+      - name: Program tests (native, lavapipe)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make -k test-programs
+
+      - name: Program tests (web, Dawn on lavapipe)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make -k test-web
+
+      # The programs' test outputs (captures, differences), for a failure's review
+      - name: Upload the test outputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-outputs-${{ matrix.sha }}
+          path: |
+            build/test
+            build/test-web
+          if-no-files-found: ignore
+
+      - name: ccache statistics
+        if: always()
+        run: ccache -s

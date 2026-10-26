@@ -1,0 +1,139 @@
+# On every push to a branch: lists the commits it brings (the wrapper's commits action) and checks
+# each one, posting a "test" commit status on each commit.
+#
+# Only the jobs that run no code from the repository's commits, the wrapper or third-party actions
+# can post statuses: the test jobs build and test with a read-only token, while the pending job
+# marks the commits' checks pending first and the statuses job posts the outcome of each commit's
+# job afterwards, from this run's jobs. Neither checks anything out.
+name: ci
+on:
+  push:
+    branches: ["**"]
+
+# A newer push to a working branch supersedes its running checks. Every run on the default branch
+# finishes: each has its own group, since a group holds only one pending run and drops the others.
+concurrency:
+  group: ci-${{ github.ref }}${{ github.ref_name == github.event.repository.default_branch && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  commits:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      commits: ${{ steps.commits.outputs.commits }}
+      wrapper-repository: ${{ steps.wrapper.outputs.repository }}
+      wrapper-sha: ${{ steps.wrapper.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The submodule's URL is ssh, which the runner has no key for: it's fetched over https. The
+      # pushed commit's pin and the wrapper's repository (owner/name, from .gitmodules) give every
+      # commit's check the same actions.
+      - id: wrapper
+        name: Check out the wrapper
+        run: |
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          git submodule update --init --recursive
+          url=$(git config -f .gitmodules submodule.external/vulkan_test.url)
+          repository=${url#git@github.com:}
+          repository=${repository#https://github.com/}
+          echo "repository=${repository%.git}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD:external/vulkan_test)" >> "$GITHUB_OUTPUT"
+
+      - id: commits
+        uses: ./external/vulkan_test/.github/actions/commits
+        # zgal-render stacks a whole milestone, so test more than the action's default 20 commits
+        with:
+          max: "50"
+
+  pending:
+    needs: commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COMMITS: ${{ needs.commits.outputs.commits }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # Each call is tried three times, and a failure doesn't stop the other commits' statuses
+      - name: Mark the commits' checks pending
+        run: |
+          failed=0
+          api() { for try in 1 2 3; do gh api "$@" && return; sleep 5; done; return 1; }
+          for sha in $(jq -r '.[]' <<< "$COMMITS"); do
+            if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then echo "::error::Not a commit SHA: '$sha'"; failed=1; continue; fi
+            api "repos/$GITHUB_REPOSITORY/statuses/$sha" -f state=pending -f context=test \
+              -f target_url="$RUN_URL" -f description="Building and testing" > /dev/null || failed=1
+          done
+          exit "$failed"
+
+  test:
+    needs: commits
+    # A matrix over no commits fails the workflow
+    if: needs.commits.outputs.commits != '[]'
+    uses: ./.github/workflows/test.yml
+    with:
+      commits: ${{ needs.commits.outputs.commits }}
+      wrapper-repository: ${{ needs.commits.outputs.wrapper-repository }}
+      wrapper-sha: ${{ needs.commits.outputs.wrapper-sha }}
+
+  # Posts each commit's test status from the conclusion of its job ("test / test <sha>") in this
+  # run: success and failure as they are, anything else (cancelled, timed out, skipped, never run,
+  # or unreadable) as an error, so no commit stays pending. Each call is tried three times, and a
+  # failure doesn't stop the other commits' statuses.
+  statuses:
+    needs: [commits, pending, test]
+    if: always() && needs.commits.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COMMITS: ${{ needs.commits.outputs.commits }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Post the commits' statuses
+        run: |
+          failed=0 listed=1
+          api() { for try in 1 2 3; do gh api "$@" && return; sleep 5; done; return 1; }
+          # The latest attempt of each of the run's jobs, the test ones named "test / test <sha>"
+          if jobs=$(api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | {name, conclusion, html_url}'); then
+            jobs=$(jq -cs . <<< "$jobs")
+          else
+            echo "::error::Couldn't list the run's jobs"
+            jobs='[]' listed=0 failed=1
+          fi
+          for sha in $(jq -r '.[]' <<< "$COMMITS"); do
+            if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then echo "::error::Not a commit SHA: '$sha'"; failed=1; continue; fi
+            job=$(jq -c --arg name "test / test $sha" 'map(select(.name == $name)) | last // {}' <<< "$jobs")
+            conclusion=$(jq -r '.conclusion // "missing"' <<< "$job")
+            [ "$listed" = 1 ] || conclusion=unreadable
+            url=$(jq -r --arg run "$RUN_URL" '.html_url // $run' <<< "$job")
+            case "$conclusion" in
+              success) state=success description="Built and tested" ;;
+              failure) state=failure description="Failed" ;;
+              cancelled | timed_out) state=error description="Cancelled or timed out" ;;
+              unreadable) state=error description="Couldn't read its job's outcome" ;;
+              *) state=error description="Not run ($conclusion)" ;;
+            esac
+            echo "test $sha: $conclusion -> $state"
+            api "repos/$GITHUB_REPOSITORY/statuses/$sha" -f state=$state -f context=test \
+              -f target_url="$url" -f description="$description" > /dev/null || failed=1
+          done
+          exit "$failed"
