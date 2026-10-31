@@ -84,7 +84,7 @@ def test_s1_writes_every_variant(s1):
 
 # The numbers of tests/cpp/closed_form_test.cpp's setups, written out again so a change on either
 # side shows: (f, width, height, splats as (x, y, z, scales, theta, opacity logit, dc), background,
-# target, camera rotations phi)
+# target, camera rotations phi), and off-centre's, which no C++ test has
 EXPECTED_S1 = {
     "isotropic": (50, 33, 33, [(0, 0, 4, (0.2, 0.2, 0.2), 0.3, 0, (1, 0, -1))], (0, 0, 0), None, [0]),
     "anisotropic": (50, 33, 33, [(0, 0, 4, (0.3, 0.1, 0.5), 0, 0, (1, 0, -1))], (0, 0, 0), None, [0]),
@@ -104,7 +104,11 @@ EXPECTED_S1 = {
                        [0.4, -1.1, 2.5]),
     "rotated-camera-aligned": (50, 33, 33, [(0.3, -0.2, 4, (0.3, 0.08, 0.15), 0, 0, (0, 0, 0))], (0, 0, 0), None,
                                [0.4, -1.1, 2.5]),
+    "off-centre": (50, 48, 32, [(0.3, 0.25, 4, (0.25, 0.08, 0.15), 0.9, 0.5, (1, 0, -1))], (0.1, 0.2, 0.3), None,
+                   [0]),
 }
+# The principal point's offset from the image centre (dcx, dcy); (0, 0) for the others
+PRINCIPAL_OFFSETS = {"off-centre": (-3.0, -3.5)}
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED_S1))
@@ -113,6 +117,8 @@ def test_s1_variant_matches_the_oracle_test_setup(s1, name):
     manifest, got, cameras = read_scene(os.path.join(s1, name))
     oracle = manifest["source"]["oracle"]
     assert (oracle["f"], oracle["width"], oracle["height"]) == (f, width, height)
+    dcx, dcy = PRINCIPAL_OFFSETS.get(name, (0.0, 0.0))
+    assert (oracle["dcx"], oracle["dcy"]) == (dcx, dcy)
     assert oracle["background"] == pytest.approx(background)
     assert oracle.get("target") == (None if target is None else pytest.approx(target))
     assert oracle["cameraPhi"] == pytest.approx(phis)
@@ -134,7 +140,7 @@ def test_s1_variant_matches_the_oracle_test_setup(s1, name):
 
     assert len(cameras) == len(phis)
     for camera, phi in zip(cameras, phis):
-        np.testing.assert_allclose(camera["intrinsics"], [f, f, width / 2, height / 2])
+        np.testing.assert_allclose(camera["intrinsics"], [f, f, width / 2 + dcx, height / 2 + dcy])
         assert list(camera["size"]) == [width, height]
         m = world_to_camera(camera)
         c, s = math.cos(phi), math.sin(phi)

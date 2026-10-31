@@ -13,7 +13,8 @@
 // ---------------------------------------------------------------------------------------------------
 // - Camera: COLMAP's conventions (docs/architecture.md) with R = I and t = 0: the camera sits at the
 //   origin looking down +z, +x right, +y down. Pinhole with one focal length f (fx = fy = f) and the
-//   principal point at the image centre (cx, cy) = (width/2, height/2). Pixel (i, j) (column i,
+//   principal point at the image centre (cx, cy) = (width/2, height/2), or offset from it by
+//   (dcx, dcy) (a kernel test's off-centre camera; nothing else here changes). Pixel (i, j) (column i,
 //   row j) has its centre at (i + 0.5, j + 0.5). The reference rasterizer's convention is the same:
 //   it puts pixel centres at integers but maps to pixels with ndc2Pix = ((ndc + 1) W - 1) / 2, a
 //   -0.5 shift. The oracles are meant for square images; nothing below needs width == height
@@ -75,8 +76,9 @@ inline void require(bool ok, const char* what) {
 struct Camera {
     double f;            // focal length in pixels, fx = fy
     int width, height;   // in pixels
-    double cx() const { return 0.5 * width; }
-    double cy() const { return 0.5 * height; }
+    double dcx = 0.0, dcy = 0.0;  // the principal point's offset from the image centre, in pixels
+    double cx() const { return 0.5 * width + dcx; }
+    double cy() const { return 0.5 * height + dcy; }
 };
 
 struct Splat {

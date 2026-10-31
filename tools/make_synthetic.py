@@ -126,6 +126,9 @@ class S1Variant:
     target: Optional[Sequence[float]] = None  # the gradient tests' constant L2 target
     phis: Sequence[float] = (0.0,)  # one camera per rotation about z
     note: str = ""
+    # The principal point's offset from the image centre (closed_form.h's Camera dcx, dcy); the
+    # C++ test's setups are all centred
+    principal_offset: Sequence[float] = (0.0, 0.0)
 
 
 def on_axis(z, sx, sy, sz, theta=0.0, opacity=0.0, dc=(1.0, 0.0, -1.0)) -> OracleSplat:
@@ -172,6 +175,13 @@ S1_VARIANTS: Dict[str, S1Variant] = {
     "rotated-camera-aligned": S1Variant(50.0, 33, 33,
                                         [OracleSplat(0.3, -0.2, 4.0, (0.3, 0.08, 0.15), dc=(0.0, 0.0, 0.0))],
                                         phis=(0.4, -1.1, 2.5), note="as rotated-camera with theta = 0"),
+    # Not a C++ test's setup: a non-square image (3x2 tiles) with the principal point off its
+    # centre (cx = 21, cy = 12.5) and an off-axis splat, so swapping cx and cy, width and height or
+    # the row stride moves the splat or its pixels
+    "off-centre": S1Variant(50.0, 48, 32,
+                            [OracleSplat(0.3, 0.25, 4.0, (0.25, 0.08, 0.15), theta=0.9, opacity_logit=0.5)],
+                            background=(0.1, 0.2, 0.3), principal_offset=(-3.0, -3.5),
+                            note="non-square, principal point off the centre by (dcx, dcy)"),
 }
 
 
@@ -187,11 +197,13 @@ def s1_scene(name: str):
         rotation=[quat_about_z(s.theta) for s in v.splats],
         opacity_logit=[s.opacity_logit for s in v.splats],
         sh=sh)
-    cameras = [scene.PinholeCamera(f"cam_{k}", v.width, v.height, v.f, v.f, 0.5 * v.width, 0.5 * v.height,
-                                   quaternion.to_matrix(quat_about_z(phi)), np.zeros(3))
+    dcx, dcy = v.principal_offset
+    cameras = [scene.PinholeCamera(f"cam_{k}", v.width, v.height, v.f, v.f, 0.5 * v.width + dcx,
+                                   0.5 * v.height + dcy, quaternion.to_matrix(quat_about_z(phi)), np.zeros(3))
                for k, phi in enumerate(v.phis)]
-    oracle = {"f": v.f, "width": v.width, "height": v.height, "background": list(v.background),
-              "cameraPhi": list(v.phis), "splats": [s.to_json() for s in v.splats], "note": v.note}
+    oracle = {"f": v.f, "width": v.width, "height": v.height, "dcx": dcx, "dcy": dcy,
+              "background": list(v.background), "cameraPhi": list(v.phis),
+              "splats": [s.to_json() for s in v.splats], "note": v.note}
     if v.target is not None:
         oracle["target"] = list(v.target)
     return splats, cameras, {"scene": "s1", "variant": name, "oracle": oracle}

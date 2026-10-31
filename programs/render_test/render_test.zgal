@@ -1,0 +1,140 @@
+;; The rasterizer's test (lib/render_graph.zgal's step 5): it runs the graph for one camera of a
+;; scene with a fixed capacity (so every frame is complete and the same), reads back the tile
+;; pipeline and the rasterizer's outputs, and has C++ (render_test.cpp) check them:
+;;   - `check`: each pixel's colour, final transmittance and last entry against a CPU blend (in
+;;     double) of the GPU's projections over the GPU's tile ranges (tile_test checks those), and,
+;;     with --oracle (S1's scenes), against the closed-form oracle (tests/oracle/closed_form.h);
+;;     no NaNs; it prints a hash of the outputs, which test.sh compares between runs;
+;;   - `sameColours` and `sameEntries`: later frames' outputs bit for bit (the rasterizer is
+;;     deterministic).
+;; It passes once a frame is checked and --repeats more frames' outputs matched it, and fails on a
+;; mismatch, an overflowing frame (raise --capacity) or when the frames run out first.
+
+(import "../../lib/render_graph.zgal")
+
+(app RenderTest
+  (parameter splatFile path)
+  (parameter cameraFile path)
+  (parameter splatCount uint)
+  (parameter cameraIndex uint)
+  (parameter width uint)
+  (parameter height uint)
+  (parameter shDegree uint)
+  (parameter near float)
+  (parameter far float)
+  (parameter capacity uint)
+  (parameter maxGroups uint)
+  (parameter backgroundR float)
+  (parameter backgroundG float)
+  (parameter backgroundB float)
+  (parameter oracle bool)
+  (parameter repeats uint)
+  ;; Checks one frame's readbacks (false when they haven't all arrived yet); exits the program on
+  ;; a mismatch
+  (extern (check [splats : (data Splat)] [cameras : (data Camera)] [counts : (data uint)]
+                 [projected : (data Projected)] [entrySplats : (data uint)] [ranges : (data uvec2)]
+                 [colours : (data vec4)] [lastEntries : (data uint)] [cameraIndex : uint]
+                 [background : vec3] [oracle : bool]) : bool)
+  ;; Whether two frames' outputs are the same, bit for bit
+  (extern (sameColours [a : (data vec4)] [b : (data vec4)]) : bool)
+  (extern (sameEntries [a : (data uint)] [b : (data uint)]) : bool)
+  ;; Exits the program with status 1
+  (extern (fail) : void)
+  (state
+   (splats (data Splat) (empty-data Splat))
+   (cameras (data Camera) (empty-data Camera))
+   (counts (data uint) (empty-data uint))
+   (projected (data Projected) (empty-data Projected))
+   (entrySplats (data uint) (empty-data uint))
+   (ranges (data uvec2) (empty-data uvec2))
+   (colours (data vec4) (empty-data vec4))
+   (lastEntries (data uint) (empty-data uint))
+   (checked bool #f)
+   ;; Frames whose outputs matched the previous ones, after the check
+   (colourRepeats uint 0)
+   (entryRepeats uint 0))
+  (on (read readSplats d) (with state #:splats d))
+  (on (read readCameras d) (with state #:cameras d))
+  (on (read readProjected d) (with state #:projected d))
+  (on (read readEntrySplats d) (with state #:entrySplats d))
+  (on (read readRanges d) (with state #:ranges d))
+  (on (read readCounts d)
+    (begin
+      (when (> (at d countTotal) capacity)
+        (print! "render_test: FAILED, a frame has " (at d countTotal) " tile entries, more than --capacity "
+                capacity)
+        (fail))
+      (with state #:counts d)))
+  (on (read readColours d)
+    (if (and state.checked (> (count state.colours) 0))
+        (if (sameColours state.colours d)
+            (with state #:colours d #:colourRepeats (+ state.colourRepeats 1))
+            (begin
+              (print! "render_test: FAILED, frame " frameNumber "'s colours differ from the frame before")
+              (fail)
+              state))
+        (with state #:colours d)))
+  (on (read readLastEntries d)
+    (if (and state.checked (> (count state.lastEntries) 0))
+        (if (sameEntries state.lastEntries d)
+            (with state #:lastEntries d #:entryRepeats (+ state.entryRepeats 1))
+            (begin
+              (print! "render_test: FAILED, frame " frameNumber "'s last entries differ from the frame before")
+              (fail)
+              state))
+        (with state #:lastEntries d)))
+  (on (frame dt)
+    (cond
+      [(and state.checked (>= state.colourRepeats repeats) (>= state.entryRepeats repeats))
+       (begin
+         (print! "render_test: " repeats " more frames gave the same outputs")
+         (quit!)
+         state)]
+      [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
+       (begin
+         (print! "render_test: FAILED, " frameLimit " frames weren't enough to check a frame and see "
+                 repeats " more (" state.colourRepeats " and " state.entryRepeats ")")
+         (fail)
+         state)]
+      [state.checked state]
+      [(and (> (count state.splats) 0) (> (count state.cameras) 0) (> (count state.counts) 0)
+            (> (count state.projected) 0) (> (count state.entrySplats) 0) (> (count state.ranges) 0)
+            (> (count state.colours) 0) (> (count state.lastEntries) 0))
+       (with state #:checked
+             (check state.splats state.cameras state.counts state.projected state.entrySplats state.ranges
+                    state.colours state.lastEntries cameraIndex
+                    (vec3 backgroundR backgroundG backgroundB) oracle))]
+      [else state]))
+  (run SplatGraph (splatFile splatFile) (cameraFile cameraFile) (splatCount splatCount)
+       (cameraIndex cameraIndex) (width width) (height height) (shDegree shDegree) (near near)
+       (far far) (maxGroups maxGroups) (inspect #t) (capacity capacity)
+       (background (vec3 backgroundR backgroundG backgroundB)) (window #f) (capture #f)
+       (presentScale (vec2 1.0))))
+
+(main RenderTest
+  (about "Checks the rasterizer's outputs for one camera against a CPU blend and the closed-form oracle")
+  (timestep #:max 0.1 #:fixed 0.016)
+  (option splatFile "--splats" "the scene's splats.bin" #:default "splats.bin")
+  (option cameraFile "--cameras" "the scene's cameras.bin" #:default "cameras.bin")
+  (option splatCount "--splat-count" "the splats in it (the manifest's splatCount)" #:default 1
+          #:range (1 16777216))
+  (option cameraIndex "--camera" "the camera to render" #:default 0)
+  ;; At most 2896 a side: the graph's colours (16 bytes a pixel) must stay within one binding's
+  ;; 128 MiB (docs/architecture.md's budgets); ZGAL can't check the product of two options
+  (option width "--width" "the camera's image width (at most 2896: the 128 MiB binding budget)" #:default 64
+          #:range (1 2896))
+  (option height "--height" "the camera's image height (at most 2896: the 128 MiB binding budget)" #:default 64
+          #:range (1 2896))
+  (option shDegree "--sh-degree" "the SH bands to evaluate" #:default 3 #:range (0 3))
+  (option near "--near" "the near plane" #:default 0.2)
+  (option far "--far" "the depth keys' far depth" #:default 1000.0)
+  (option capacity "--capacity" "the tile entries' capacity (fixed; a frame needing more fails)"
+          #:default 262144 #:range (1 33554432))
+  (option maxGroups "--max-groups" "the most workgroups a dispatch has (groupLimit, 65535, or less to test the grid-stride loops)"
+          #:default 65535 #:range (1 65535))
+  (option backgroundR "--background-r" "the background's red" #:default 0.0)
+  (option backgroundG "--background-g" "the background's green" #:default 0.0)
+  (option backgroundB "--background-b" "the background's blue" #:default 0.0)
+  (flag oracle "--oracle" "also compare with the closed-form oracle (an S1 scene: cameras rotated about z at the origin)")
+  (option repeats "--repeats" "how many frames after the checked one must give the same outputs"
+          #:default 3 #:range (1 64)))

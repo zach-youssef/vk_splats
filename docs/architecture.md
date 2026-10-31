@@ -7,13 +7,16 @@ The planned layout, filled in as the M1 and M2 tasks land.
 - `programs/<name>/`: one ZGAL program each (`<name>.zgal` with a `main`, plus its own `.cpp` and
   `.ts` files, `assets/` and optional `test.sh` / `test-web.sh`). The Makefile finds them; adding
   one needs no Makefile change ([building-and-testing.md](building-and-testing.md)).
+  - `tile_test` and `render_test`: the render graph's GPU tests against the CPU and the
+    closed-form oracles ([below](#render-graph)).
 - `lib/`: ZGAL modules the programs share, imported by relative path:
   `(import "../../lib/<module>.zgal")`. A module's name is a C++ namespace (ZGAL compiles its
   functions to C++ too), so it uses underscores, not hyphens.
   - `splat_math.zgal`: the structs, the per-splat preprocess (covariance, EWA projection, conic,
     radius, tile rectangle, SH colour) and the sort keys ([below](#splat-math)).
-  - `render_graph.zgal`: `SplatGraph`, the render graph's preprocess, tile entries, sort and
-    tile ranges ([below](#render-graph)); it imports `splat_math.zgal`.
+  - `render_graph.zgal`: `SplatGraph`, the render graph's preprocess, tile entries, sort, tile
+    ranges and rasterizer, and the window's present ([below](#render-graph)); it imports
+    `splat_math.zgal`.
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
   programs' inputs, and the synthetic scene generator.
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`), Python tests and test
@@ -25,8 +28,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
 
 ## Pipeline
 
-The planned pipeline (M1 renders, M2 trains). Steps 1 to 4 are `lib/render_graph.zgal`
-([below](#render-graph)); the rasterizer and training are to come.
+The planned pipeline (M1 renders, M2 trains). Steps 1 to 5 are `lib/render_graph.zgal`
+([below](#render-graph)); training is to come.
 
 Data is converted offline: the programs read std430 `buffer-file` data and a `manifest.json`, the
 same on native and the web, so no image or COLMAP parsing library is linked. The training images
@@ -34,7 +37,7 @@ are undistorted and packed by the converter into an RGBA8 buffer-file (one `uint
 bound as images: ZGAL binds only fixed `image-file` lists as arrays, and `import-images` is native
 only.
 
-Per frame, rendering will follow the paper's tile-based rasterizer:
+Per frame, rendering follows the paper's tile-based rasterizer:
 
 1. **Preprocess** (per splat): 3D covariance from scale and rotation, EWA projection to a 2D conic
    (plus 0.3 on the diagonal), a 3σ radius, near-plane and off-screen culling, the tile rectangle,
@@ -45,7 +48,7 @@ Per frame, rendering will follow the paper's tile-based rasterizer:
 4. **Tile ranges**: each tile's range of entries, from comparing neighbouring keys.
 5. **Rasterize**: one 16×16 workgroup per tile blends its range front to back, in shared-memory
    batches, writing the colour, the final transmittance and the last contributor (kept for the
-   backward pass).
+   backward pass), and an RGBA8 image.
 
 Training will add the backward pass (the reverse traversal, then the preprocess chain), Adam, and
 densification and pruning on a fixed capacity, compacted by scan.
@@ -61,7 +64,10 @@ densification and pruning on a fixed capacity, compacted by scan.
   `Camera` are in [data-format.md](data-format.md). No single buffer binds more
   than 128 MiB, lavapipe's `maxStorageBufferRange` and WebGPU's default
   `maxStorageBufferBindingSize` (cs5330's 46 images at 748² are about 103 MB); split a larger
-  buffer, e.g. the images per batch.
+  buffer, e.g. the images per batch. The rasterizer's `colours` (16 bytes a pixel) limits an
+  image to 2²³ pixels; ZGAL can't check the product of two options, so the programs cap each side
+  at 2896 (`--width`, `--height`), which also rejects some sizes within the budget, such as
+  3840×2160 (8.3 Mpx).
 - **Subgroups**: never assume a size. lavapipe's is 4, 8 or 16 depending on the CPU and MoltenVK's
   is 32 (the old sort broke on exactly this), so sorts and scans use ZGAL's `sort` and `scan`, and
   no kernel hard-codes 32 or 64.
@@ -109,8 +115,8 @@ closed-form oracles (`tests/oracle/closed_form.h`) and independent derivations.
 
 ## Render graph
 
-`lib/render_graph.zgal`'s `SplatGraph` runs pipeline steps 1 to 4 for one camera per frame; the
-rasterizer (to come) reads its `ranges`, `entrySplats` and `projected`.
+`lib/render_graph.zgal`'s `SplatGraph` runs pipeline steps 1 to 5 for one camera per frame and,
+with a window, draws the image on the surface.
 
 1. `Preprocess`: `projectSplat` per splat into `projected`, and its tile count into `tileCounts`
    (0 when culled).
@@ -124,10 +130,45 @@ rasterizer (to come) reads its `ranges`, `entrySplats` and `projected`.
 4. A `sort` of the keys with the splat indices as values, over the entries held; a `clear` of
    `ranges`; `TileRanges` (the same indirect dispatch) writes each tile's [start, end) where
    neighbouring keys' tiles differ. Tiles without entries keep (0, 0).
+5. `Rasterize`: one 16×16 workgroup per tile (a 2D dispatch of the tile grid, at most 181² tiles
+   for the programs' 2896² pixels, so no grid-stride loop and no `maxGroups`), one invocation per
+   pixel. The workgroup walks the
+   tile's range in batches of `rasterBatch` = 256 entries: each invocation loads one entry's
+   splat (mean, conic and opacity, colour) into shared memory (10 KB of the 16 KB budget), a
+   barrier, each pixel blends the batch front to back (Eq. 3 with Appendix C's thresholds, in the
+   reference code's order: power = −½(a dx² + c dy²) − b dx dy with d = mean − pixel centre,
+   skipped when positive; α = min(0.99, opacity·e^power), skipped below 1/255; the splat that
+   would take T below 1e-4 isn't blended, and the pixel stops), then a barrier before the next
+   batch overwrites it. The batch loop always covers the whole range (a barrier can't sit in a
+   loop whose end depends on shared memory: [paper-conformance.md](paper-conformance.md#departures),
+   5); a stopped pixel only helps load. Each pixel in the image writes:
+   - `colours` (vec4 per pixel, row by row): C + T·bg, and T;
+   - `lastEntries` (uint): the entry after the last one it blended, or the tile's start when none
+     was, so the backward pass walks [start, last) back to front;
+   - `rendered` (rgba8 storage image): C + T·bg clamped to [0, 1], alpha 1. Its values are
+     the image's stored (sRGB-encoded) values, as the training images are, so no transfer
+     function is applied.
+   Pixels past the image's edge (in edge tiles) only help load batches, and every pixel inside
+   writes all three, so nothing reads an unwritten value.
+6. `present` (only with the `window` parameter): `Present` draws `rendered` on the surface as a
+   quad, with nearest sampling, letterboxed by `presentScale` (`letterbox`, from the surface's
+   size, so the image keeps its aspect ratio). The fragment shader decodes the colours
+   (`srgbDecode`) so that an sRGB surface's encode gives back the captured values. **Known
+   limitation:** this assumes the surface is sRGB. The web draws through an sRGB view and native
+   Vulkan picks `B8G8R8A8_SRGB` when offered (MoltenVK does), but otherwise takes the surface's
+   first format, and on a UNORM one the window shows the image darker, with no warning (ZGAL
+   doesn't give a shader the surface's format). Captures are unaffected.
 
 `counts` holds (entries, total, capacity, depth bits, depth shift) and is read back every frame.
 
-- **Dispatch sizes**: a dispatch has at most `maxGroups` workgroups (a required graph parameter):
+The graph's inputs besides the scene: `background` (a per-frame vec3: a graph parameter can't be
+a vec3), `window` and `capture` (whether to draw on the surface, and to read `rendered` back for
+a PNG), `presentScale`, and `inspect` (read back every stage and the rasterizer's outputs, for the
+tests). ZGAL has no graph composition, so the present pass lives in the graph behind `window`
+rather than in the program.
+
+- **Dispatch sizes**: a 1D dispatch has at most `maxGroups` workgroups (a required graph parameter;
+  Rasterize's 2D tile grid is the exception, bounded by the image size: item 5):
   `groupLimit`, 65535, is what every device allows in X (Vulkan's guaranteed
   `maxComputeWorkGroupCount[0]`, lavapipe's, WebGPU's default `maxComputeWorkgroupsPerDimension`),
   and ZGAL can't query the device's own. Preprocess (64-wide), EmitEntries and TileRanges
@@ -159,10 +200,31 @@ rasterizer (to come) reads its `ranges`, `entrySplats` and `projected`.
   since the GPU's `exp`, `sqrt` and division needn't round as C++'s do. Degenerate splats (a zero
   quaternion, logScale 100 and 30, appended by `scenes.py`; `--culled-tail`) must be culled on both;
   the `!(det > 0)` NaN guard holds on MoltenVK.
+- **Rasterizer against C++** (`programs/render_test`): with a fixed `--capacity` (a frame needing
+  more fails), every frame is complete and the same, so readbacks of different frames can be
+  checked together. Every pixel's colour and T are compared within 1e-4 with a CPU blend in
+  double of the GPU's projections over the GPU's tile ranges (checked by tile_test), and its last
+  entry exactly; with `--oracle` (each S1 variant, every camera of the rotated ones), within 1e-3
+  with the closed-form oracle (`tests/oracle/closed_form.h`), recomputed from the splat's
+  parameters and the camera's rotation about z, each splat blended only into its tile rectangle
+  (which must equal the GPU's). A pixel with a threshold decision within rounding of its bound
+  (α near 1/255, T near 1e-4, a nonzero exponent near 0) can go either way: it's borderline, and
+  compared with the tolerance widened by what one flip changes (α·T, or T for the stop, times twice
+  the largest colour) and its last entry only within the tile's range; at most 1% may be (0–3
+  pixels are). The oracle takes the camera's principal point, so the S1 `off-centre` variant
+  (48×32, (cx, cy) = (21, 12.5)) checks the non-square and principal-point conventions
+  independently of the kernels' own projection (a width/height swap in Rasterize's row stride or
+  the tile grid shows; one in covariance2d's frustum guard doesn't, as the clamp is never engaged
+  and the oracle doesn't model it). Outputs must be finite and the same bit for bit
+  over the next frames, and `test.sh` runs S2's cameras (cam_1 80×48, non-square) twice and
+  compares the outputs' hashes.
+  S3's cameras 0 and 24 (160×96) have tiles of up to about 480 entries (two batches) and pixels
+  stopped by T < 1e-4. Observed differences are below 3e-7.
 - **Test inputs**: ZGAL has no expression for a `buffer-file`'s element count and no path
-  joining, so tile_test takes the files, splat count and camera size as options; its `test.sh`
-  reads them from the scene's `manifest.json` (`scenes.py`), and the check verifies them against
-  the readbacks.
+  joining, so tile_test and render_test take the files, splat count and camera size as options;
+  their `test.sh` reads them from the scene's `manifest.json` (`scenes.py`), and the checks verify
+  them against the readbacks.
+
 
 ### Structs
 

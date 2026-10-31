@@ -112,12 +112,13 @@ tools/make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f
 ```
 
 - **S1** (`<out dir>/<variant>/`, no seed): the closed-form oracles' setups, with
-  `tests/cpp/closed_form_test.cpp`'s numbers. Cameras sit at the origin, rotated only about z,
-  with fx = fy = f and the principal point at the image centre; the splats have DC colour only and
+  `tests/cpp/closed_form_test.cpp`'s numbers (and `off-centre`, which no C++ test has). Cameras
+  sit at the origin, rotated only about z, with fx = fy = f and the principal point at the image
+  centre (offset by (`dcx`, `dcy`) for `off-centre`); the splats have DC colour only and
   rotation `quat_about_z(theta)`. `source.oracle` holds what a kernel test needs to build the
-  oracle's `Camera` and `Splat`s: `f`, `width`, `height`, `background` (black where the C++ test
-  sets none), `target` (the gradient setup only), `cameraPhi` (camera k is Rz(phi_k); for phi ≠ 0
-  compare with `world_to_camera_about_z(splat, phi)`) and the world-space `splats` (`x`, `y`, `z`,
+  oracle's `Camera` and `Splat`s: `f`, `width`, `height`, `dcx` and `dcy` (the principal point's
+  offset), `background` (black where the C++ test sets none), `target` (the gradient setup only),
+  `cameraPhi` (camera k is Rz(phi_k); for phi ≠ 0 compare with `world_to_camera_about_z(splat, phi)`) and the world-space `splats` (`x`, `y`, `z`,
   `logScale`, `theta`, `opacityLogit`, `dc`).
 
   | Variant | Setup (f, size) | What it pins down |
@@ -129,6 +130,7 @@ tools/make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f
   | `gradient` | 20, 15² | `single_splat_l2()`: footprint covers the image, nothing clamped |
   | `two-splat` | 50, 33² | the composite in depth order; stored back splat first, so the kernel must sort |
   | `rotated-camera`, `-aligned` | 50, 33², 3 cameras | W against Wᵀ, with theta 0.7 and 0 |
+  | `off-centre` | 50, 48×32, (cx, cy) = (21, 12.5) | non-square and an off-centre principal point: swapped cx and cy, or width and height in the tile grid or the row stride, move the splat (the frustum guard's use of the size is not engaged, so it is not checked) |
 
   The 33-pixel images put a pixel centre on the principal point. The cameras all sit at the
   origin, so the converter's extent (from camera centres) would be 0; S1 records instead 1.1 times

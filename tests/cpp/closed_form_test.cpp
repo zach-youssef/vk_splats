@@ -214,6 +214,16 @@ TEST_CASE("mean projection follows COLMAP's pinhole") {
     CHECK(mean2d(cam, s).y == doctest::Approx(44.0));
     s.z = -1.0;
     CHECK_THROWS_AS(mean2d(cam, s), std::invalid_argument);
+
+    // An off-centre principal point shifts the mean and nothing else
+    const Camera off{100.0, 64, 48, -3.0, 2.5};
+    s.z = 5.0;
+    CHECK(mean2d(off, s).x == doctest::Approx(39.0));
+    CHECK(mean2d(off, s).y == doctest::Approx(46.5));
+    const Sym2 a = cov2d(cam, s), b = cov2d(off, s);
+    CHECK(a.a == b.a);
+    CHECK(a.b == b.b);
+    CHECK(a.c == b.c);
 }
 
 TEST_CASE("one splat: per-pixel value") {

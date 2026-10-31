@@ -5,7 +5,10 @@
 ;;   3. tile entries, as many as the GPU's total says (an indirect dispatch the plan kernel sizes):
 ;;      a sort key (tile, then depth) and the splat's index per tile a splat touches;
 ;;   4. a sort of the keys, moving the splat indices with them, then each tile's range of entries.
-;; The rasterizer (to come) reads `ranges`, `entrySplats` and `projected`. Programs import it,
+;;   5. rasterize: one 16x16 workgroup per tile blends the tile's entries front to back (Eq. 3) over
+;;      a background, in batches loaded into shared memory, into each pixel's colour, final
+;;      transmittance and last contributor, and an RGBA8 image;
+;; and, with a window, a draw showing the image on the surface. Programs import it,
 ;; (import "../../lib/render_graph.zgal"), which imports the splat math too.
 ;;
 ;; The entries' capacity is the app's, a per-frame input: when a frame has more entries than it
@@ -13,11 +16,15 @@
 ;; is incomplete, and `counts` (read back each frame) tells the app, which grows the capacity
 ;; (grownCapacity) for the frames after. The tile counts' total must stay below 2^32 (it's a
 ;; uint): past that the entries are wrong, but every kernel still stays in its buffers' bounds.
-;; Every kernel loops over its elements by grid stride, so its dispatches stay within maxGroups
-;; workgroups (a graph parameter: groupLimit, or less to test the loops).
+;; Every 1D kernel (preprocess, plan, entries, ranges) loops over its elements by grid stride, so
+;; its dispatches stay within maxGroups workgroups (a graph parameter: groupLimit, or less to test
+;; the loops). Rasterize is the exception: a 2D dispatch of the tile grid, which maxGroups doesn't
+;; cap; the programs' image sides are at most 2896 (the colours' 128 MiB budget), so it's at most
+;; 181x181 workgroups, within every device's 65535 a dimension.
 ;; docs/architecture.md has the stages' contracts.
 
 (import indirect)
+(import color)
 (import "splat_math.zgal")
 
 ;; ---------------------------------------------------------------------------------------------
@@ -153,6 +160,109 @@
            (when (if (= (+ e (uint 1)) n) #t (not= tile (keyTile (at entryKeys (+ e (uint 1))) bits)))
              (write! (at (at ranges tile) 1) (+ e (uint 1))))))))))
 
+;; 5. Each tile's pixels, one invocation each in a 16x16 workgroup per tile (Sec. 6): the
+;; workgroup loads the tile's entries in batches of rasterBatch splats into shared memory (one entry
+;; per invocation), then each pixel blends the batch front to back (Eq. 3), with Appendix C's
+;; thresholds as the reference code applies them: a splat whose alpha (opacity times the Gaussian,
+;; at most alphaMax) is below alphaMin is skipped, and the splat that would take the transmittance
+;; below transmittanceMin isn't blended, nor is any after it. The batch loop goes over the whole
+;; range even when every pixel has stopped (a barrier can't sit in a loop whose end depends on
+;; shared memory, so there's no whole-tile early exit); a stopped pixel skips its blending.
+;; Each pixel in the image writes C + T bg and T (colours), the entry after the last one it blended
+;; (lastEntries: the tile's start when none was, so the backward pass walks [start, last) back), and
+;; C + T bg clamped to [0, 1] into `rendered`. Pixels past the image's edge (in edge tiles) only
+;; help load batches.
+(define rasterBatch (uint 256))  ; = the workgroup's invocations; the shared arrays say 256 too
+(define alphaMin (/ 1.0 255.0))
+(define alphaMax 0.99)
+(define transmittanceMin 0.0001)
+
+(compute-material Rasterize
+  (workgroup 16 16)
+  (bindings
+   (projected (buffer-array Projected read))
+   (entrySplats (buffer-array uint read))
+   (ranges (buffer-array uvec2 read))
+   (colours (buffer-array vec4 write))
+   (lastEntries (buffer-array uint write))
+   (rendered (storage-image write)))
+  (push (width uint) (height uint) (background vec3))
+  ;; 256 x (8 + 16 + 16) bytes = 10 KB (at most 16 KB: docs/architecture.md)
+  (shared
+   (batchMeans (array vec2 256))
+   (batchConicOpacities (array vec4 256))  ; the conic (a, b, c) and the opacity
+   (batchColours (array vec4 256)))        ; the colour (vec4: vec3 arrays pad to 16 bytes anyway)
+  (compute
+   (let* ([tileRange (at ranges (+ (* workgroupId.y workgroupCount.x) workgroupId.x))]
+          [lane (+ (* localInvocationId.y tileSize) localInvocationId.x)]
+          [pixel globalInvocationId.xy]
+          [inside (and (< pixel.x width) (< pixel.y height))]
+          [centre (+ (vec2 pixel) 0.5)]
+          [(t colour last done)
+           (fold ([t 1.0] [colour (vec3 0.0)] [last tileRange.x] [done (not inside)])
+                 ([start (range tileRange.x tileRange.y rasterBatch)])
+             (let* ([e (+ start lane)])
+               (when (< e tileRange.y)
+                 (let* ([p (at projected (at entrySplats e))])
+                   (write! (at batchMeans lane) p.mean)
+                   (write! (at batchConicOpacities lane) (vec4 p.conic p.opacity))
+                   (write! (at batchColours lane) (vec4 p.colour 0.0))))
+               (barrier!)
+               (let* ([n (min rasterBatch (- tileRange.y start))]
+                      [(k t colour last done)
+                       (while ([k (uint 0)] [t t] [colour colour] [last last] [done done])
+                         (and (not done) (< k n))
+                         (let* ([co (at batchConicOpacities k)]
+                                [d (- (at batchMeans k) centre)]
+                                [power (- (* -0.5 (+ (* co.x d.x d.x) (* co.z d.y d.y))) (* co.y d.x d.y))]
+                                [alpha (min alphaMax (* co.w (exp power)))]
+                                ;; power > 0 only from rounding (the conic is positive definite):
+                                ;; skipped, as in the reference code
+                                [skip (or (> power 0.0) (< alpha alphaMin))]
+                                [nextT (* t (- 1.0 alpha))]
+                                [stop (and (not skip) (< nextT transmittanceMin))])
+                           (if (or skip stop)
+                               (values (+ k (uint 1)) t colour last stop)
+                               (values (+ k (uint 1)) nextT
+                                       (+ colour (* (.rgb (at batchColours k)) (* alpha t)))
+                                       (+ start k (uint 1)) #f))))])
+                 ;; Every pixel is done with the batch before the next one overwrites it
+                 (barrier!)
+                 (values t colour last done))))]
+          [value (+ colour (* t background))])
+     (when inside
+       (let* ([index (+ (* pixel.y width) pixel.x)])
+         (write! (at colours index) (vec4 value t))
+         (write! (at lastEntries index) last)
+         (store! rendered (ivec2 pixel) (vec4 (clamp value (vec3 0.0) (vec3 1.0)) 1.0)))))))
+
+;; With a window: the rendered image on the surface, letterboxed (scale: the image's half extents
+;; in clip space, at most 1, so its aspect ratio is kept), as two triangles. The image holds the
+;; colours the capture writes, which are sRGB-encoded as the training images are. The colours are
+;; decoded first, assuming an sRGB surface whose hardware encode gives them back: the web draws
+;; through an sRGB view, and native Vulkan picks B8G8R8A8_SRGB when the surface offers it (MoltenVK
+;; does), but otherwise the first format, and on a UNORM one the window shows the image darker
+;; (docs/architecture.md, a known limitation; ZGAL doesn't tell a shader the surface's format).
+(graphics-material Present
+  (bindings
+   (picture texture)
+   (pictureSampler sampler))
+  (push (scale vec2))
+  (varyings (uv vec2))
+  (outputs (color vec4))
+  (vertex
+   (let* ([corner (at (array vec2 (vec2 0.0 0.0) (vec2 1.0 0.0) (vec2 0.0 1.0)
+                             (vec2 0.0 1.0) (vec2 1.0 0.0) (vec2 1.0 1.0))
+                      vertexIndex)])
+     (results #:position (vec4 (* (- (* corner 2.0) 1.0) scale) 0.0 1.0) #:uv corner)))
+  (fragment
+   (vec4 (srgbDecode (.rgb (sample picture pictureSampler uv))) 1.0)))
+
+;; The scale Present needs to letterbox a width x height image on a surface of surfaceSize
+(define (letterbox [surfaceSize : vec2] [width : uint] [height : uint]) : vec2
+  (let* ([ratio (/ (* (float width) surfaceSize.y) (* (float height) (max surfaceSize.x 1.0)))])
+    (if (> ratio 1.0) (vec2 1.0 (/ 1.0 ratio)) (vec2 ratio 1.0))))
+
 ;; ---------------------------------------------------------------------------------------------
 ;; The graph
 ;; ---------------------------------------------------------------------------------------------
@@ -176,6 +286,13 @@
   (parameter inspect bool)
   ;; The entries' capacity this frame (at least 1; grownCapacity)
   (input capacity (per-frame uint))
+  ;; The colour behind the splats (per frame: a graph parameter can't be a vec3)
+  (input background (per-frame vec3))
+  ;; Whether the graph draws the image on the surface (a program with a window, not headless),
+  ;; letterboxed by presentScale (letterbox), and whether it reads the image back (a capture)
+  (parameter window bool)
+  (parameter capture bool)
+  (input presentScale (per-frame vec2))
 
   (constant gridWidth (/ (+ width 15) 16))
   (constant gridHeight (/ (+ height 15) 16))
@@ -191,6 +308,13 @@
   (buffer entryKeys uint capacity #:frames per-frame)
   (buffer entrySplats uint capacity #:frames per-frame)
   (buffer ranges uvec2 tileCount #:frames per-frame)
+  ;; The rasterizer's outputs, per pixel (row by row): the colour and the final transmittance, and
+  ;; the entry after the last one blended
+  (buffer colours vec4 (* width height) #:frames per-frame)
+  (buffer lastEntries uint (* width height) #:frames per-frame)
+  (image rendered rgba8 (fixed width height) #:frames per-frame)
+  (sampler nearest #:filter nearest #:address clamp-to-edge)
+  (target screen (surface #:clear (0.0 0.0 0.0 1.0) #:depth none) #:when window)
 
   (material preprocessing Preprocess splats cameras projected tileCounts
             #:push ((splatCount splatCount) (cameraIndex cameraIndex) (near near) (shDegree shDegree))
@@ -202,6 +326,11 @@
   (material emitting EmitEntries projected offsets counts entryKeys entrySplats
             #:push ((splatCount splatCount) (gridWidth gridWidth) (near near) (far far)))
   (material ranging TileRanges entryKeys counts ranges #:push ((tileCount tileCount)))
+  (material rasterizing Rasterize projected entrySplats ranges colours lastEntries rendered
+            #:push ((width width) (height height) (background background))
+            #:invocations ((* gridWidth 16) (* gridHeight 16)))  ; 16: tileSize, a workgroup a tile
+  (material presenting Present (picture rendered) (pictureSampler nearest)
+            #:push ((scale presentScale)) #:when window)
 
   (dispatch preprocess preprocessing)
   (exclusive-scan scanTileCounts tileCounts offsets #:op add #:count splatCount)
@@ -211,6 +340,8 @@
   (sort sortEntries entryKeys #:values entrySplats #:count (at counts 0))
   (clear clearRanges ranges)
   (dispatch findRanges ranging #:indirect (at commands 0))
+  (dispatch rasterize rasterizing)
+  (draw present screen presenting 6 #:when window)
 
   ;; The sizes, each frame, for the app's capacity
   (readback readCounts counts)
@@ -220,4 +351,8 @@
   (readback readProjected projected #:when inspect)
   (readback readEntryKeys entryKeys #:when inspect)
   (readback readEntrySplats entrySplats #:when inspect)
-  (readback readRanges ranges #:when inspect))
+  (readback readRanges ranges #:when inspect)
+  (readback readColours colours #:when inspect)
+  (readback readLastEntries lastEntries #:when inspect)
+  ;; The image, for a capture
+  (readback readRendered rendered #:when capture))
