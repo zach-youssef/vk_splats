@@ -90,15 +90,19 @@ closed-form oracles (`tests/oracle/closed_form.h`) and independent derivations.
   mean in both axes. This departs from the reference code
   ([paper-conformance.md](paper-conformance.md), departure 7).
 - **Sort keys** (departure 1 in [paper-conformance.md](paper-conformance.md)): one 32-bit key per
-  tile entry, the tile index in the high `tileBits` = ⌈log₂ tileCount⌉ (1 to 31) bits and the
-  depth in the low `depthBits` = 32 − tileBits, quantized linearly in log z between `near` and
-  `far` and clamped there. 748×748 has 2209 tiles: 12 tile bits, 20 depth bits. `depthKey`
-  requires 0 < near < far and tile < 2^tileBits, unchecked. Keys tie for depths within one
-  quantization step and for all depths ≥ far, so their order within a tile is the sort's choice:
-  the tile-entry pass must not rely on the sort's stability for determinism. It writes each
-  splat's entries at its scan offset (positions fixed by splat index, not by thread timing), and
-  either the sort is stable or it orders ties by the entry's value (the splat index), so the
-  blend order is the same on every run.
+  tile entry, the tile index in the high `tileBits` = ⌈log₂ tileCount⌉ (1 to 31) bits and the depth
+  in the low `depthBits` = 32 − tileBits. 748×748 has 2209 tiles: 12 tile bits, 20 depth bits. The
+  depth, clamped to [`near`, `far`], is quantized by its float bits: a positive float's bits grow
+  with its value, 2²³ steps per octave (exponent plus mantissa is log₂ to within 0.09 of an octave),
+  so `bits(depth) − bits(near)`, shifted right by the least shift that fits `bits(far) − bits(near)`
+  in depthBits, is close to log spaced. It uses integer operations only, so the GPU and the C++
+  agree exactly; a log-based key wouldn't: a GPU's `log` needn't round as C++'s does, and an ulp can
+  move a key across a step. With near 0.2 and far 1000, 20 depth bits give steps of at most 2⁻¹⁶ of
+  the depth. The shift depends only on near, far and depthBits, so kernels keying many entries
+  compute it once (`depthShift`, `depthKeyShifted`). The quantized depth is clamped to depthBits
+  too, so not even a NaN depth reaches the tile bits. `depthKey` requires 0 < near < far and
+  tile < 2^tileBits, unchecked. Keys tie for depths within one step and for all depths ≥ far, so
+  ties need a rule for determinism, which the tile pipeline (to come) sets.
 
 ### Structs
 

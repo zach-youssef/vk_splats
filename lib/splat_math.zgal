@@ -261,7 +261,7 @@
                                count rect))))))))
 
 ;; ---------------------------------------------------------------------------------------------
-;; Sort keys (D5a: one 32-bit key, tile then quantized log depth)
+;; Sort keys (D5a: one 32-bit key, tile then depth quantized by its float bits)
 ;; ---------------------------------------------------------------------------------------------
 ;; The bits a tile index needs for tileCount tiles: ceil(log2(tileCount)), at least 1 and at most
 ;; 31, so the depth keeps at least one bit (748x748 has 47x47 = 2209 tiles: 12 bits, leaving 20)
@@ -274,18 +274,32 @@
 (define (depthBitsFor [tileCount : uint]) : uint
   (- (uint 32) (tileBitsFor tileCount)))
 
+;; depthKey's shift: the least that fits far's bits above near's in depthBits. It depends on the
+;; frame's constants only, so kernels keying many entries compute it once (depthKeyShifted).
+(define (depthShift [depthBits : uint] [near : float] [far : float]) : uint
+  (let* ([maxQ (shr (bitnot (uint 0)) (- (uint 32) depthBits))]
+         [span (- (floatBitsToUint far) (floatBitsToUint near))])
+    (while ([s (uint 0)]) (> (shr span s) maxQ) (+ s (uint 1)))))
+
+;; depthKey (below) with its shift given: depthShift(depthBits, near, far)
+(define (depthKeyShifted [tile : uint] [depth : float] [depthBits : uint] [near : float] [far : float]
+                         [shift : uint]) : uint
+  (let* ([maxQ (shr (bitnot (uint 0)) (- (uint 32) depthBits))]
+         [q (shr (- (floatBitsToUint (clamp depth near far)) (floatBitsToUint near)) shift)])
+    (bitor (shl tile depthBits) (min q maxQ))))
+
 ;; The key of a splat's entry in a tile: the tile in the high bits, then the depth in the low
-;; depthBits (1-31) quantized on a log scale between near and far (clamped there), so sorting the
-;; keys groups entries by tile and orders each tile's front to back. Depths quantize to the same
-;; value when they're within a factor (far / near)^(1 / 2^depthBits) of each other, and all depths
-;; beyond far share the largest value: equal keys' order is the sort's to choose.
+;; depthBits (1-31), so sorting the keys groups entries by tile and orders each tile's front to
+;; back. The depth, clamped to [near, far], is quantized by its float bits: a positive float's
+;; bits grow with its value, 2^23 steps per octave (exponent + mantissa is log2 to within 0.09),
+;; so the bits above near's, shifted right until far's fit in depthBits (depthShift), are close to
+;; log spaced, and exact on every device: integer operations only (a GPU's log can differ from
+;; C++'s by an ulp, moving a key by a step; docs/architecture.md). Depths beyond far share the
+;; largest value; equal keys' order is the sort's to choose. The quantized depth is clamped to
+;; depthBits too, so even a NaN depth (projectSplat culls those) can't change the tile.
 ;; Requires 0 < near < far and tile < 2^(32 - depthBits); neither is checked.
 (define (depthKey [tile : uint] [depth : float] [depthBits : uint] [near : float] [far : float]) : uint
-  (let* ([maxQ (shr (bitnot (uint 0)) (- (uint 32) depthBits))]
-         [lnNear (log near)]
-         [f (clamp (/ (- (log (max depth near)) lnNear) (- (log far) lnNear)) 0.0 1.0)]
-         [q (min (uint (* f (float maxQ))) maxQ)])
-    (bitor (shl tile depthBits) q)))
+  (depthKeyShifted tile depth depthBits near far (depthShift depthBits near far)))
 
 ;; The tile of a key from depthKey
 (define (keyTile [key : uint] [depthBits : uint]) : uint

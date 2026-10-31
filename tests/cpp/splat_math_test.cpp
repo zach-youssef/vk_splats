@@ -14,10 +14,13 @@
 #include "oracle/closed_form.h"
 #include "splat_math_test.zgal.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace sm = splat_math_test;
@@ -757,7 +760,23 @@ TEST_CASE("tileBitsFor and depthBitsFor") {
     }
 }
 
-TEST_CASE("depthKey: tile in the high bits, log depth below, monotonic and clamped") {
+// depthKey's quantization, independently: the depth's float bits above near's, shifted right by
+// the least shift that fits far's in depthBits
+static uint32_t floatBits(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    return u;
+}
+
+static uint32_t referenceDepthQ(float depth, uint32_t bits, float near, float far) {
+    const uint64_t maxQ = (uint64_t(1) << bits) - 1;
+    const uint32_t span = floatBits(far) - floatBits(near);
+    uint32_t shift = 0;
+    while ((span >> shift) > maxQ) ++shift;
+    return (floatBits(std::clamp(depth, near, far)) - floatBits(near)) >> shift;
+}
+
+TEST_CASE("depthKey: tile in the high bits, depth by its float bits below, monotonic and clamped") {
     const float near = 0.2f, far = 100.0f;
     for (uint32_t tileCount : {1u, 2209u, 1u << 20}) {
         const uint32_t bits = sm::depthBitsFor(tileCount);
@@ -768,18 +787,23 @@ TEST_CASE("depthKey: tile in the high bits, log depth below, monotonic and clamp
             // Clamped at both ends
             CHECK((sm::depthKey(tile, near, bits, near, far) & maxQ) == 0);
             CHECK((sm::depthKey(tile, 0.01f, bits, near, far) & maxQ) == 0);
-            CHECK((sm::depthKey(tile, far, bits, near, far) & maxQ) == maxQ);
-            CHECK((sm::depthKey(tile, 1e6f, bits, near, far) & maxQ) == maxQ);
-            // Log scale: the midpoint of the logs quantizes to half the range
+            CHECK((sm::depthKey(tile, far, bits, near, far) & maxQ) <= maxQ);
+            CHECK(sm::depthKey(tile, 1e6f, bits, near, far) == sm::depthKey(tile, far, bits, near, far));
+            // Close to log scale (float bits are log2 to within 0.09 of an octave, of the 9 here):
+            // far quantizes to the top half of the depth bits (or to the span of the bits, when
+            // they all fit), and the midpoint of the logs to about half of far's
+            const double top = sm::depthKey(tile, far, bits, near, far) & maxQ;
+            CHECK(top >= std::min(maxQ / 2.0, double(floatBits(far) - floatBits(near))));
             const float mid = std::sqrt(near * far);
             const double q = sm::depthKey(tile, mid, bits, near, far) & maxQ;
-            CHECK(std::abs(q / maxQ - 0.5) <= std::max(1e-5, 2.0 / maxQ));
+            CHECK(std::abs(q / top - 0.5) <= 0.01);
             // Front to back within a tile
             uint32_t previous = 0;
             for (int i = 0; i <= 200; ++i) {
                 const float depth = near * std::pow(far / near, i / 200.0f);
                 const uint32_t key = sm::depthKey(tile, depth, bits, near, far);
                 CHECK(sm::keyTile(key, bits) == tile);
+                CHECK((key & maxQ) == referenceDepthQ(depth, bits, near, far));
                 if (i > 0) CHECK(key >= previous);
                 previous = key;
             }
@@ -792,4 +816,27 @@ TEST_CASE("depthKey: tile in the high bits, log depth below, monotonic and clamp
     const uint32_t bits = sm::depthBitsFor(2209);
     CHECK(bits == 20);
     CHECK(sm::depthKey(7, 5.0f, bits, near, far) < sm::depthKey(7, 5.005f, bits, near, far));
+}
+
+TEST_CASE("depthShift and depthKeyShifted: depthKey with its shift computed once") {
+    for (auto [near, far] : {std::pair{0.2f, 100.0f}, {0.2f, 1000.0f}, {0.01f, 1e6f}, {1.0f, 1.0001f}}) {
+        for (uint32_t tileCount : {1u, 2209u, 1u << 20, 1u << 31}) {
+            const uint32_t bits = sm::depthBitsFor(tileCount);
+            const uint32_t shift = sm::depthShift(bits, near, far);
+            const uint64_t maxQ = (uint64_t(1) << bits) - 1;
+            const uint32_t span = floatBits(far) - floatBits(near);
+            INFO("near " << near << ", far " << far << ", depth bits " << bits << ", shift " << shift);
+            // The least shift that fits the span
+            CHECK((span >> shift) <= maxQ);
+            if (shift > 0) CHECK((span >> (shift - 1)) > maxQ);
+            for (float depth : {near * 0.5f, near, std::sqrt(near * far), far, far * 2.0f}) {
+                CHECK(sm::depthKeyShifted(3, depth, bits, near, far, shift) == sm::depthKey(3, depth, bits, near, far));
+            }
+            // A NaN depth (projectSplat culls it) can't reach the tile bits, whatever clamp gives
+            const uint32_t nanKey = sm::depthKey(1, std::nanf(""), bits, near, far);
+            CHECK(sm::keyTile(nanKey, bits) == 1);
+        }
+    }
+    // 0.2 to 1000 with 20 depth bits: a shift of 7, steps of 128 of 2^23 per octave (at most 2^-16)
+    CHECK(sm::depthShift(20, 0.2f, 1000.0f) == 7);
 }
