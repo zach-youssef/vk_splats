@@ -12,7 +12,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
   functions to C++ too), so it uses underscores, not hyphens.
   - `splat_math.zgal`: the structs, the per-splat preprocess (covariance, EWA projection, conic,
     radius, tile rectangle, SH colour) and the sort keys ([below](#splat-math)).
-  - the render graph (to come).
+  - `render_graph.zgal`: `SplatGraph`, the render graph's preprocess, tile entries, sort and
+    tile ranges ([below](#render-graph)); it imports `splat_math.zgal`.
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
   programs' inputs, and the synthetic scene generator.
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`), Python tests and test
@@ -24,7 +25,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
 
 ## Pipeline
 
-The planned pipeline (M1 renders, M2 trains); nothing of it is implemented yet.
+The planned pipeline (M1 renders, M2 trains). Steps 1 to 4 are `lib/render_graph.zgal`
+([below](#render-graph)); the rasterizer and training are to come.
 
 Data is converted offline: the programs read std430 `buffer-file` data and a `manifest.json`, the
 same on native and the web, so no image or COLMAP parsing library is linked. The training images
@@ -67,7 +69,8 @@ densification and pruning on a fixed capacity, compacted by scan.
   forward and 128 backward.
 - **Capacity**: the splat count is bounded by a required `--max-splats`. ZGAL recreates a buffer,
   losing its contents, when its per-frame size changes, so only scratch buffers (tile entries)
-  grow.
+  grow: the tile entries' capacity is a per-frame input the app grows after an overflow
+  ([below](#render-graph)).
 
 ## Splat math
 
@@ -102,7 +105,65 @@ closed-form oracles (`tests/oracle/closed_form.h`) and independent derivations.
   compute it once (`depthShift`, `depthKeyShifted`). The quantized depth is clamped to depthBits
   too, so not even a NaN depth reaches the tile bits. `depthKey` requires 0 < near < far and
   tile < 2^tileBits, unchecked. Keys tie for depths within one step and for all depths ≥ far, so
-  ties need a rule for determinism, which the tile pipeline (to come) sets.
+  ties need a rule for determinism: the render graph's ([below](#render-graph)).
+
+## Render graph
+
+`lib/render_graph.zgal`'s `SplatGraph` runs pipeline steps 1 to 4 for one camera per frame; the
+rasterizer (to come) reads its `ranges`, `entrySplats` and `projected`.
+
+1. `Preprocess`: `projectSplat` per splat into `projected`, and its tile count into `tileCounts`
+   (0 when culled).
+2. An `exclusive-scan` of `tileCounts` into `offsets` (each splat's first entry), and a `reduce`
+   of their total into `counts`.
+3. `PlanEntries` (one invocation): the entries this frame holds, min(total, capacity), the depth
+   bits and shift (`depthShift`, so no entry recomputes it), and the indirect `DispatchCommand` for
+   the entry kernels; `EmitEntries` then runs one invocation per entry, not per splat: entry e
+   binary-searches `offsets` for its splat (the last whose offset is ≤ e), takes tile e − offset of
+   the splat's rectangle (row by row), and writes its key and splat index.
+4. A `sort` of the keys with the splat indices as values, over the entries held; a `clear` of
+   `ranges`; `TileRanges` (the same indirect dispatch) writes each tile's [start, end) where
+   neighbouring keys' tiles differ. Tiles without entries keep (0, 0).
+
+`counts` holds (entries, total, capacity, depth bits, depth shift) and is read back every frame.
+
+- **Dispatch sizes**: a dispatch has at most `maxGroups` workgroups (a required graph parameter):
+  `groupLimit`, 65535, is what every device allows in X (Vulkan's guaranteed
+  `maxComputeWorkGroupCount[0]`, lavapipe's, WebGPU's default `maxComputeWorkgroupsPerDimension`),
+  and ZGAL can't query the device's own. Preprocess (64-wide), EmitEntries and TileRanges
+  (256-wide) loop over their elements by grid stride, so 2²⁴ splats or 2²⁵ entries need no more
+  groups. `PlanEntries` sizes the indirect dispatch with `groupsFor`; tests pass a smaller
+  `maxGroups` (tile_test's `--max-groups`) so the loops go round.
+- **Total**: the tile counts and their scan and total are `uint`, so the total must stay below
+  2³² (e.g. 2M splats each covering all of a 748² view would wrap it). Past that the offsets
+  aren't ascending and the frame's entries are wrong, but the kernels stay in bounds: an entry
+  outside its splat's run gets key 0xFFFFFFFF and TileRanges writes no tile beyond the grid.
+- **Capacity**: the entry buffers' size is a per-frame input (`capacity`), not a compile-time
+  constant: a view's entry count isn't known before the preprocess. When a frame needs more, it
+  keeps the first `capacity` entries (whole splats in index order, then part of one), so its
+  image is incomplete, and the app, reading `counts`, grows the capacity with `grownCapacity`
+  (the total plus 25%, so a slowly growing view doesn't regrow every frame) for the next frames.
+  It never shrinks, and is at most 2²⁵ entries (128 MiB of keys, the binding limit above): a view
+  needing more stays incomplete every frame, which `counts` (total > capacity) is the only sign
+  of. ZGAL recreates the buffers when it changes, which is fine for scratch.
+- **Determinism**: entries are written at fixed positions (offset + index in the splat's run), so
+  before the sort they're in splat-index order, and ZGAL's `sort` is stable, so keys that tie
+  stay in splat-index order. The blend order is the same on every run and every device.
+- **GPU against C++** (`programs/tile_test`): the test recomputes stages 2 to 4 on the CPU from the
+  GPU's own projections (means, radii, depths), so it compares the tile rectangles (`tileRect`'s
+  floor and ceil), every key and splat position for position, and every range exactly. It checks a
+  frame that overflowed its starting capacity of 16 (the first 16 entries in splat order, sorted,
+  and their ranges), that the capacity grew, then a complete frame, some runs with `--max-groups` 1
+  or 3. `tests/cpp/render_graph_test.cpp` checks `groupsFor` and `grownCapacity` on the CPU. The
+  preprocess itself is compared to float precision (mean 1e-4 relative, depth 1e-5, radius ±1),
+  since the GPU's `exp`, `sqrt` and division needn't round as C++'s do. Degenerate splats (a zero
+  quaternion, logScale 100 and 30, appended by `scenes.py`; `--culled-tail`) must be culled on both;
+  the `!(det > 0)` NaN guard holds on MoltenVK.
+- **Test inputs**: ZGAL has no expression for a `buffer-file`'s element count and no path
+  joining, so tile_test takes the files, splat count and camera size as options; its `test.sh`
+  reads them from the scene's `manifest.json` (`scenes.py`), and the check verifies them against
+  the readbacks. The test also runs with `--timings` (a frame waits for the GPU) so that each
+  frame's readbacks arrive: a vulkan_test gap, to remove after its readback-delivery fix lands.
 
 ### Structs
 

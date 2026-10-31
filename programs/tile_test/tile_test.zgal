@@ -1,0 +1,122 @@
+;; The tile pipeline's test (lib/render_graph.zgal): it runs the graph for one camera of a scene,
+;; reads back every stage, and has C++ (tile_test.cpp, `check`) compare the tile entries and each
+;; tile's range exactly with a CPU loop over the splat math's C++ (tileRect, depthKey) on the GPU's
+;; projections. The entries' capacity starts at --initial-entries, so a small one makes the first
+;; frames overflow and the app grow it (grownCapacity). test.sh runs it on S2, S3 and degenerate
+;; splats, some with a small --max-groups so the kernels' grid-stride loops run. It passes once a
+;; complete frame's readbacks check, after an overflowing frame's did too when the capacity
+;; started below the total (so it grew), and fails on a mismatch or when the frames run out first.
+
+(import "../../lib/render_graph.zgal")
+
+;; What check() checked: nothing (the readbacks aren't of one frame yet), a frame that overflowed
+;; its capacity, or a complete frame
+(define checkedNothing (uint 0))
+(define checkedOverflowing (uint 1))
+(define checkedComplete (uint 2))
+
+(app TileTest
+  (parameter splatFile path)
+  (parameter cameraFile path)
+  (parameter splatCount uint)
+  (parameter cameraIndex uint)
+  (parameter width uint)
+  (parameter height uint)
+  (parameter shDegree uint)
+  (parameter near float)
+  (parameter far float)
+  (parameter initialEntries uint)
+  (parameter maxGroups uint)
+  (parameter culledTail uint)
+  ;; Checks a frame's readbacks (checkedNothing when they aren't all of one frame yet); exits the
+  ;; program on a mismatch
+  (extern (check [splats : (data Splat)] [cameras : (data Camera)] [counts : (data uint)]
+                 [projected : (data Projected)] [entryKeys : (data uint)] [entrySplats : (data uint)]
+                 [ranges : (data uvec2)] [cameraIndex : uint] [shDegree : uint] [near : float]
+                 [far : float] [culledTail : uint]) : uint)
+  ;; Exits the program with status 1
+  (extern (fail) : void)
+  (state
+   (capacity uint (grownCapacity initialEntries 0))
+   (grew uint 0)
+   (splats (data Splat) (empty-data Splat))
+   (cameras (data Camera) (empty-data Camera))
+   (counts (data uint) (empty-data uint))
+   (projected (data Projected) (empty-data Projected))
+   (entryKeys (data uint) (empty-data uint))
+   (entrySplats (data uint) (empty-data uint))
+   (ranges (data uvec2) (empty-data uvec2))
+   (checkedOverflow bool #f)
+   (checked bool #f))
+  (on (read readSplats d) (with state #:splats d))
+  (on (read readCameras d) (with state #:cameras d))
+  (on (read readProjected d) (with state #:projected d))
+  (on (read readEntryKeys d) (with state #:entryKeys d))
+  (on (read readEntrySplats d) (with state #:entrySplats d))
+  (on (read readRanges d) (with state #:ranges d))
+  (on (read readCounts d)
+    (let* ([grown (grownCapacity state.capacity (at d countTotal))])
+      (when (not= grown state.capacity)
+        (print! "tile_test: " (at d countTotal) " entries overflowed a capacity of " state.capacity
+                ", growing it to " grown))
+      (with state #:counts d #:capacity grown #:grew (if (not= grown state.capacity) (+ state.grew 1) state.grew))))
+  (on (frame dt)
+    (let* ([ready (and (not state.checked) (> (count state.counts) 0) (> (count state.ranges) 0)
+                       (> (count state.splats) 0) (> (count state.cameras) 0))]
+           [result (if ready
+                       (check state.splats state.cameras state.counts state.projected state.entryKeys
+                              state.entrySplats state.ranges cameraIndex shDegree near far culledTail)
+                       checkedNothing)]
+           [overflowChecked (or state.checkedOverflow (= result checkedOverflowing))]
+           ;; A capacity below the total must have overflowed (checked) and grown
+           [needsOverflow (and (= result checkedComplete) (< initialEntries (at state.counts countTotal)))])
+      (cond
+        [state.checked state]
+        [(and needsOverflow (or (not overflowChecked) (= state.grew 0)))
+         (begin
+           (print! "tile_test: FAILED, the capacity started at " initialEntries " of "
+                   (at state.counts countTotal) " entries, but no overflowing frame was checked or it grew "
+                   state.grew " times")
+           (fail)
+           state)]
+        [(= result checkedComplete)
+         (begin
+           (when overflowChecked (print! "tile_test: an overflowing frame checked"))
+           (print! "tile_test: frame " frameNumber " checked, after growing the capacity " state.grew
+                   " times")
+           (quit!)
+           (with state #:checked #t #:checkedOverflow overflowChecked))]
+        [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
+         (begin
+           (print! "tile_test: FAILED, no complete frame was read back in " frameLimit " frames")
+           (fail)
+           state)]
+        ;; An overflowing frame was checked: drop its readbacks, so the next check pairs a fresh
+        ;; set (a dropped readback would otherwise leave this frame's stale ranges)
+        [(= result checkedOverflowing)
+         (with state #:checkedOverflow overflowChecked #:counts (empty-data uint)
+               #:projected (empty-data Projected) #:entryKeys (empty-data uint)
+               #:entrySplats (empty-data uint) #:ranges (empty-data uvec2))]
+        [else (with state #:checkedOverflow overflowChecked)])))
+  (run SplatGraph (splatFile splatFile) (cameraFile cameraFile) (splatCount splatCount)
+       (cameraIndex cameraIndex) (width width) (height height) (shDegree shDegree) (near near)
+       (far far) (maxGroups maxGroups) (inspect #t) (capacity state.capacity)))
+
+(main TileTest
+  (about "Checks the tile pipeline's entries and ranges for one camera against the CPU")
+  (timestep #:max 0.1 #:fixed 0.016)
+  (option splatFile "--splats" "the scene's splats.bin" #:default "splats.bin")
+  (option cameraFile "--cameras" "the scene's cameras.bin" #:default "cameras.bin")
+  (option splatCount "--splat-count" "the splats in it (the manifest's splatCount)" #:default 1
+          #:range (1 16777216))
+  (option cameraIndex "--camera" "the camera to project for" #:default 0)
+  (option width "--width" "the camera's image width" #:default 64 #:range (1 16384))
+  (option height "--height" "the camera's image height" #:default 64 #:range (1 16384))
+  (option shDegree "--sh-degree" "the SH bands to evaluate" #:default 3 #:range (0 3))
+  (option near "--near" "the near plane" #:default 0.2)
+  (option far "--far" "the depth keys' far depth" #:default 1000.0)
+  (option initialEntries "--initial-entries" "the entries' first capacity" #:default 16
+          #:range (1 33554432))
+  (option maxGroups "--max-groups" "the most workgroups a dispatch has (groupLimit, 65535, or less to test the grid-stride loops)"
+          #:default 65535 #:range (1 65535))
+  (option culledTail "--culled-tail" "how many of the last splats are degenerate, so must be culled" #:default 0))

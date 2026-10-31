@@ -1,0 +1,5 @@
+;; The render graph's functions for their C++ test (render_graph_test.cpp includes the generated
+;; render_graph_test.zgal.h, whose namespace is this file's name): the dispatch sizing and the
+;; capacity's growth. (The module's functions only become C++ through a .zgal file that imports
+;; it, as ZGAL can't generate them from a library alone.)
+(import "../../lib/render_graph.zgal")

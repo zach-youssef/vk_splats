@@ -85,7 +85,7 @@ Training, to be checked against the reference repository when training lands:
 ## Departures
 
 1. **Sort key**: 32 bits (tile, then the depth quantized by its float bits, close to log spaced:
-   [architecture.md](architecture.md#splat-math)) instead of 64.
+   [architecture.md](architecture.md#splat-math)) instead of 64, with ties in splat-index order.
    Fallback if depth quantization shows: two sorts.
 2. **Capacity**: a fixed splat capacity (the required `--max-splats`), compacted by scan, where the
    paper's count is unbounded. ZGAL recreates a buffer, losing its contents, when its per-frame

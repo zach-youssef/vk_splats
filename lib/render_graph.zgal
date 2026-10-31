@@ -1,0 +1,223 @@
+;; The render graph: per frame, every splat projected for one camera, then each tile's splats front
+;; to back (Kerbl et al. 2023, Sec. 6), in four stages:
+;;   1. preprocess: projectSplat (lib/splat_math.zgal) per splat, and its tile count;
+;;   2. an exclusive scan of the tile counts (each splat's first entry) and their total;
+;;   3. tile entries, as many as the GPU's total says (an indirect dispatch the plan kernel sizes):
+;;      a sort key (tile, then depth) and the splat's index per tile a splat touches;
+;;   4. a sort of the keys, moving the splat indices with them, then each tile's range of entries.
+;; The rasterizer (to come) reads `ranges`, `entrySplats` and `projected`. Programs import it,
+;; (import "../../lib/render_graph.zgal"), which imports the splat math too.
+;;
+;; The entries' capacity is the app's, a per-frame input: when a frame has more entries than it
+;; holds, the frame keeps the first `capacity` (whole splats in index order, then part of one) and
+;; is incomplete, and `counts` (read back each frame) tells the app, which grows the capacity
+;; (grownCapacity) for the frames after. The tile counts' total must stay below 2^32 (it's a
+;; uint): past that the entries are wrong, but every kernel still stays in its buffers' bounds.
+;; Every kernel loops over its elements by grid stride, so its dispatches stay within maxGroups
+;; workgroups (a graph parameter: groupLimit, or less to test the loops).
+;; docs/architecture.md has the stages' contracts.
+
+(import indirect)
+(import "splat_math.zgal")
+
+;; ---------------------------------------------------------------------------------------------
+;; Constants and the capacity
+;; ---------------------------------------------------------------------------------------------
+;; The tile entry kernels' workgroup size (their `workgroup` clauses say 256 too); the plan kernel
+;; sizes their indirect dispatch in these
+(define entryGroupSize (uint 256))
+
+;; The preprocess's workgroup size (its `workgroup` clause says 64 too)
+(define splatGroupSize (uint 64))
+
+;; The most workgroups a dispatch may have in X on every device: Vulkan's guaranteed
+;; maxComputeWorkGroupCount[0], lavapipe's, and WebGPU's default maxComputeWorkgroupsPerDimension.
+;; The graph's maxGroups; ZGAL can't query the device's own limit.
+(define groupLimit (uint 65535))
+
+;; The workgroups of `size` invocations covering `count` elements, at most maxGroups (at least 1):
+;; kernels loop by grid stride over what more would have covered. count + size - 1 mustn't wrap.
+(define (groupsFor [count : uint] [size : uint] [maxGroups : uint]) : uint
+  (min (/ (+ count (- size (uint 1))) size) (max maxGroups (uint 1))))
+
+;; The most tile entries a frame holds: 2^25, so a buffer of their uint keys is 128 MiB, the most
+;; any one binding may be (lavapipe's maxStorageBufferRange, WebGPU's default
+;; maxStorageBufferBindingSize; docs/architecture.md)
+(define entryCapacityMax (uint 33554432))
+
+;; The capacity after a frame that needed `total` entries: the same when they fit, otherwise
+;; total + 25% (so a view needing a few more entries each frame doesn't grow it every frame), at
+;; most entryCapacityMax. Never smaller, and at least 1 (a buffer can't hold nothing).
+(define (grownCapacity [capacity : uint] [total : uint]) : uint
+  (cond
+    [(<= total capacity) (max capacity (uint 1))]
+    [(>= total (- entryCapacityMax (/ entryCapacityMax (uint 4)))) entryCapacityMax]
+    [else (+ total (/ total (uint 4)))]))
+
+;; `counts`, the graph's GPU-side sizes (read back as readCounts), element by element
+(define countEntries (uint 0))    ; the entries this frame holds: min(total, capacity), the sort's count
+(define countTotal (uint 1))      ; the entries the splats need: the tile counts' sum
+(define countCapacity (uint 2))   ; the capacity this frame had
+(define countDepthBits (uint 3))  ; depthBitsFor(the tile count): the keys' depth bits
+(define countDepthShift (uint 4)) ; depthShift(depth bits, near, far): the keys' depth shift
+(define countSize (uint 5))      ; the elements (SplatGraph says 5: it can't use this)
+
+;; ---------------------------------------------------------------------------------------------
+;; Kernels
+;; ---------------------------------------------------------------------------------------------
+;; 1. Each splat as the camera sees it, and how many tiles it touches (0 when culled)
+(compute-material Preprocess
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat read))
+   (cameras (buffer-array Camera read))
+   (projected (buffer-array Projected write))
+   (tileCounts (buffer-array uint write)))
+  (push (splatCount uint) (cameraIndex uint) (near float) (shDegree uint))
+  (compute
+   (for ([i (range globalInvocationId.x splatCount (* splatGroupSize workgroupCount.x))])
+     (let* ([p (projectSplat (at splats i) (at cameras cameraIndex) near shDegree)])
+       (write! (at projected i) p)
+       (write! (at tileCounts i) p.tileCount)))))
+
+;; 3a. From the total (reduced into counts), how many entries this frame holds, the keys' depth
+;; bits and shift, and the entry kernels' indirect dispatch (at most maxGroups): one invocation
+(compute-material PlanEntries
+  (workgroup 1)
+  (bindings
+   (counts (buffer-array uint read-write))
+   (commands (buffer-array DispatchCommand write)))
+  (push (capacity uint) (tileCount uint) (near float) (far float) (maxGroups uint))
+  (compute
+   (let* ([entries (min (at counts countTotal) capacity)]
+          [depthBits (depthBitsFor tileCount)])
+     (write! (at counts countEntries) entries)
+     (write! (at counts countCapacity) capacity)
+     (write! (at counts countDepthBits) depthBits)
+     (write! (at counts countDepthShift) (depthShift depthBits near far))
+     (write! (at commands 0) (DispatchCommand (groupsFor entries entryGroupSize maxGroups) 1 1)))))
+
+;; 3b. Entry e: the splat whose run of entries holds it (the last whose offset is at most e; culled
+;; splats' runs are empty), the tile it is of that splat's rectangle (row by row), and its key.
+;; Entries sit at fixed positions (offset + index in the run), so they're the same every run.
+;; An entry outside its splat's run (only when the total wrapped past 2^32, so the offsets aren't
+;; ascending) gets key 0xFFFFFFFF: wrong, but within every buffer's bounds.
+(compute-material EmitEntries
+  (workgroup 256)
+  (bindings
+   (projected (buffer-array Projected read))
+   (offsets (buffer-array uint read))
+   (counts (buffer-array uint read))
+   (entryKeys (buffer-array uint write))
+   (entrySplats (buffer-array uint write)))
+  (push (splatCount uint) (gridWidth uint) (near float) (far float))
+  (compute
+   (let* ([entries (at counts countEntries)]
+          [depthBits (at counts countDepthBits)]
+          [shift (at counts countDepthShift)])
+     (for ([e (range globalInvocationId.x entries (* entryGroupSize workgroupCount.x))])
+       (let* ([(lo hi) (while ([lo (uint 0)] [hi splatCount])
+                         (< lo hi)
+                         (let* ([mid (/ (+ lo hi) (uint 2))])
+                           (if (<= (at offsets mid) e) (values (+ mid (uint 1)) hi) (values lo mid))))]
+              [s (- (max lo (uint 1)) (uint 1))]
+              [p (at projected s)]
+              [k (- e (at offsets s))])
+         (write! (at entrySplats e) s)
+         (if (< k p.tileCount)
+             (let* ([w (- p.tiles.z p.tiles.x)]
+                    [tile (+ (* (+ p.tiles.y (/ k w)) gridWidth) p.tiles.x (remainder k w))])
+               (write! (at entryKeys e) (depthKeyShifted tile p.depth depthBits near far shift)))
+             (write! (at entryKeys e) (bitnot (uint 0)))))))))
+
+;; 4. Each tile's entries, [start, end) in the sorted keys: an entry starts its tile's range when
+;; the entry before it is of another tile, and ends it when the one after it is. Tiles without
+;; entries keep the clear's (0, 0). Keys of no tile (EmitEntries' 0xFFFFFFFF) only occur after a
+;; wrapped total; they read as the grid's last tile when the tile count is a power of two, which
+;; stays in bounds.
+(compute-material TileRanges
+  (workgroup 256)
+  (bindings
+   (entryKeys (buffer-array uint read))
+   (counts (buffer-array uint read))
+   (ranges (buffer-array uvec2 write)))
+  (push (tileCount uint))
+  (compute
+   (let* ([n (at counts countEntries)]
+          [bits (at counts countDepthBits)])
+     (for ([e (range globalInvocationId.x n (* entryGroupSize workgroupCount.x))])
+       (let* ([tile (keyTile (at entryKeys e) bits)])
+         (when (< tile tileCount)
+           (when (if (= e (uint 0)) #t (not= tile (keyTile (at entryKeys (- e (uint 1))) bits)))
+             (write! (at (at ranges tile) 0) e))
+           (when (if (= (+ e (uint 1)) n) #t (not= tile (keyTile (at entryKeys (+ e (uint 1))) bits)))
+             (write! (at (at ranges tile) 1) (+ e (uint 1))))))))))
+
+;; ---------------------------------------------------------------------------------------------
+;; The graph
+;; ---------------------------------------------------------------------------------------------
+(graph SplatGraph
+  ;; The scene: splatCount splats in splatFile, a camera (cameraIndex) of cameraFile whose image is
+  ;; width x height, and SH bands 0 to shDegree
+  (parameter splatCount uint)
+  (parameter cameraIndex uint)
+  (parameter width uint)
+  (parameter height uint)
+  (parameter shDegree uint)
+  (input splatFile path)
+  (input cameraFile path)
+  ;; Depths: splats at most `near` from the camera are culled, and the keys quantize depth between
+  ;; near and far (0 < near < far; depthKey)
+  (parameter near float)
+  (parameter far float)
+  ;; The most workgroups a dispatch has: groupLimit, or less to test the grid-stride loops
+  (parameter maxGroups uint)  ; at least 1 (groupsFor), as in the invocations below
+  ;; Whether the graph also reads back its inputs and stages for tests (tile_test)
+  (parameter inspect bool)
+  ;; The entries' capacity this frame (at least 1; grownCapacity)
+  (input capacity (per-frame uint))
+
+  (constant gridWidth (/ (+ width 15) 16))
+  (constant gridHeight (/ (+ height 15) 16))
+  (constant tileCount (* gridWidth gridHeight))
+
+  (buffer-file splats Splat splatFile)
+  (buffer-file cameras Camera cameraFile)
+  (buffer projected Projected splatCount #:frames per-frame)
+  (buffer tileCounts uint splatCount #:frames per-frame)
+  (buffer offsets uint splatCount #:frames per-frame)
+  (buffer counts uint 5 #:frames per-frame)  ; countSize
+  (buffer commands DispatchCommand 1 #:frames per-frame)
+  (buffer entryKeys uint capacity #:frames per-frame)
+  (buffer entrySplats uint capacity #:frames per-frame)
+  (buffer ranges uvec2 tileCount #:frames per-frame)
+
+  (material preprocessing Preprocess splats cameras projected tileCounts
+            #:push ((splatCount splatCount) (cameraIndex cameraIndex) (near near) (shDegree shDegree))
+            #:invocations ((min splatCount (* (max maxGroups 1) 64))))  ; 64: the splat workgroup size
+  (material planning PlanEntries counts commands
+            #:push ((capacity capacity) (tileCount tileCount) (near near) (far far)
+                    (maxGroups maxGroups))
+            #:invocations (1))
+  (material emitting EmitEntries projected offsets counts entryKeys entrySplats
+            #:push ((splatCount splatCount) (gridWidth gridWidth) (near near) (far far)))
+  (material ranging TileRanges entryKeys counts ranges #:push ((tileCount tileCount)))
+
+  (dispatch preprocess preprocessing)
+  (exclusive-scan scanTileCounts tileCounts offsets #:op add #:count splatCount)
+  (reduce totalTileCounts tileCounts (at counts 1) #:op add #:count splatCount)
+  (dispatch plan planning)
+  (dispatch emit emitting #:indirect (at commands 0))
+  (sort sortEntries entryKeys #:values entrySplats #:count (at counts 0))
+  (clear clearRanges ranges)
+  (dispatch findRanges ranging #:indirect (at commands 0))
+
+  ;; The sizes, each frame, for the app's capacity
+  (readback readCounts counts)
+  ;; What tests check
+  (readback readSplats splats #:once #t #:when inspect)
+  (readback readCameras cameras #:once #t #:when inspect)
+  (readback readProjected projected #:when inspect)
+  (readback readEntryKeys entryKeys #:when inspect)
+  (readback readEntrySplats entrySplats #:when inspect)
+  (readback readRanges ranges #:when inspect))
