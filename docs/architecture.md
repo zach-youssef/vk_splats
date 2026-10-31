@@ -162,8 +162,7 @@ rasterizer (to come) reads its `ranges`, `entrySplats` and `projected`.
 - **Test inputs**: ZGAL has no expression for a `buffer-file`'s element count and no path
   joining, so tile_test takes the files, splat count and camera size as options; its `test.sh`
   reads them from the scene's `manifest.json` (`scenes.py`), and the check verifies them against
-  the readbacks. The test also runs with `--timings` (a frame waits for the GPU) so that each
-  frame's readbacks arrive: a vulkan_test gap, to remove after its readback-delivery fix lands.
+  the readbacks.
 
 ### Structs
 

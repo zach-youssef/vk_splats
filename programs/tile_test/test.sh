@@ -16,16 +16,12 @@ mkdir -p "$out"
 "$python" tools/make_synthetic.py s3 "$out/s3" > /dev/null
 "$python" "$here/scenes.py" degenerate "$out/s2" "$out/s2-degenerate"
 
-# --timings waits for each frame, so each frame's readbacks arrive before the next frame reuses
-# their frame slot. Without it, a frame loop faster than the GPU can drop every copy before it is
-# polled, and the read events never come (a vulkan_test gap). Remove it after the vulkan_test
-# readback-delivery fix lands (submodule bump).
 status=0
 run() {  # run <scene> <camera> [<max groups>]
     groups=${3:-65535}
     log="$out/$(basename "$1")-camera-$2-groups-$groups.log"
     # shellcheck disable=SC2046 # the arguments are words without spaces
-    if "$binary" --validation --timings --frames 16 --initial-entries 16 --max-groups "$groups" \
+    if "$binary" --validation --frames 16 --initial-entries 16 --max-groups "$groups" \
         $("$python" "$here/scenes.py" args "$1" "$2") > "$log" 2>&1; then
         grep '^tile_test:' "$log" | tail -n 3
     else
