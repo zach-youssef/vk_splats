@@ -10,6 +10,9 @@
 ;;     deterministic).
 ;; It passes once a frame is checked and --repeats more frames' outputs matched it, and fails on a
 ;; mismatch, an overflowing frame (raise --capacity) or when the frames run out first.
+;; On the web (render_test.inputs.ts), `check` writes the frame's readbacks to the directory
+;; $RENDER_TEST_READBACKS names instead (an extern can't take a path option), and
+;; web-check/render_test_check.cpp runs the same C++ checks on them (test.sh does both).
 
 (import "../../lib/render_graph.zgal")
 
@@ -31,7 +34,7 @@
   (parameter oracle bool)
   (parameter repeats uint)
   ;; Checks one frame's readbacks (false when they haven't all arrived yet); exits the program on
-  ;; a mismatch
+  ;; a mismatch. On the web it writes them for render_test_check instead.
   (extern (check [splats : (data Splat)] [cameras : (data Camera)] [counts : (data uint)]
                  [projected : (data Projected)] [entrySplats : (data uint)] [ranges : (data uint)]
                  [colours : (data vec4)] [lastEntries : (data uint)] [cameraIndex : uint]

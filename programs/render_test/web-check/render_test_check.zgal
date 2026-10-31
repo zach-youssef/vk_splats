@@ -1,0 +1,3 @@
+;; SplatGraph's structs and functions for render_test_check.cpp (its generated
+;; render_test_check.zgal.h, namespace render_test_check), which render_check.h checks with.
+(import "../../../lib/render_graph.zgal")

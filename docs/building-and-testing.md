@@ -17,7 +17,8 @@ scipy and Pillow (`tools/requirements.txt`); a virtualenv in `.venv/` is ignored
   - `test-cpp`: each `tests/cpp/<name>.cpp`, built into `build/tests/<name>` and run;
   - `test-programs`: each program's `test.sh` (`make test-<name>` runs one).
 - `make web`: builds every program for the web into `build/web/<name>`.
-- `make test-web`: each program's `test-web.sh` under Node (`make test-web-<name>` runs one).
+- `make test-web`: each program's `test-web.sh` under Node (`make test-web-<name>` runs one),
+  after building its web-check tools; it needs Python as `make test` does (`PYTHON=...`).
 - `make clean`: removes `build/`.
 - `ZGAL_ROOT=<checkout>` builds against another wrapper checkout; `CXX=...` another compiler
   (clang by default); `PYTHON=...` another Python.
@@ -36,8 +37,16 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   `test.sh <binary> <output dir>`. It runs the program headless with `--validation` (which fails
   unless validation and synchronization validation are both available) and exits non-zero on any
   failure; a validation message is a failure.
-- **A web test**: `programs/<name>/test-web.sh`, run as `test-web.sh <main.js> <output dir>`
-  (`node <main.js> ...` runs it under Node with Dawn).
+- **A web test**: `programs/<name>/test-web.sh`, run from the repository's root as
+  `test-web.sh <main.js> <output dir> <web-check dir>` (`node <main.js> ...` runs the program
+  under Node with Dawn, where WebGPU validation errors fail a `--validation` run). The programs'
+  `test-web.sh` call their `test.sh`, which runs a `.js` binary under `$NODE` (`node` by default),
+  so the web runs the native tests ([web.md](web.md#tests)).
+- **A web-check tool**: `programs/<name>/web-check/<tool>.cpp`, a host program a web test runs on
+  what the web run wrote, for checks written in C++ (render_test's `render_test_check`). It's built
+  like a C++ test (with `tests/` on the include path, and a `<tool>.zgal` beside it for a generated
+  header) into `build/web-check/<tool>` before the program's `test-web-<name>`, and rebuilt when
+  the program's or `tests/oracle/`'s headers change. Tool names must be unique across programs.
 - **A C++ test**: `tests/cpp/<name>.cpp`, a whole program (doctest with
   `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`, or its own `main`) with `tests/`, doctest and the wrapper's
   headers on the include path, and no library linked, so it tests header-only code (the oracles).

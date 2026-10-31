@@ -10,7 +10,9 @@ The planned layout, filled in as the M1 and M2 tasks land.
   - `splat_render`: renders a camera of a scene in a window, or headless with a PNG capture
     ([below](#splat_render)).
   - `tile_test` and `render_test`: the render graph's GPU tests against the CPU and the
-    closed-form oracles ([below](#render-graph)).
+    closed-form oracles ([below](#render-graph)). render_test's checks are in `render_check.h`,
+    shared by the native program and `web-check/render_test_check.cpp`, which checks a web run's
+    readbacks ([web.md](web.md#tests)).
 - `lib/`: ZGAL modules the programs share, imported by relative path:
   `(import "../../lib/<module>.zgal")`. A module's name is a C++ namespace (ZGAL compiles its
   functions to C++ too), so it uses underscores, not hyphens.
@@ -134,7 +136,7 @@ with a window, draws the image on the surface.
    `ranges`; `TileRanges` (the same indirect dispatch) writes each tile's [start, end) where
    neighbouring keys' tiles differ. Tiles without entries keep (0, 0). `ranges` is two `uint`s a
    tile (start at 2t, end at 2t + 1), not a `uvec2`, as different invocations write a tile's start
-   and end, and WGSL lets a store to one component rewrite the whole vector.
+   and end ([web.md](web.md#portability)).
 5. `Rasterize`: one 16×16 workgroup per tile (a 2D dispatch of the tile grid, at most 181² tiles
    for the programs' 2896² pixels, so no grid-stride loop and no `maxGroups`), one invocation per
    pixel. The workgroup walks the

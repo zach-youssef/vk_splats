@@ -100,10 +100,30 @@ test-programs: $(foreach p,$(TESTED_PROGRAMS),test-$(p))
 
 test: test-tools test-cpp test-programs
 
-# Web tests: programs/<name>/test-web.sh, run as test-web.sh <main.js> <output dir>, under Node
+# Web-check tools: host programs a web test runs on what a web run wrote, where its checks are C++
+# (e.g. render_test's readbacks, checked by the native program's checks). Each
+# programs/<name>/web-check/<tool>.cpp (tool names unique across programs) is built like a C++ test
+# into build/web-check/<tool>, including its generated <tool>.zgal.h when a <tool>.zgal is beside
+# it, and with the program's headers and tests/oracle's as prerequisites.
+WEB_CHECK_SOURCES = $(wildcard programs/*/web-check/*.cpp)
+WEB_CHECK_TOOL = $(OUT)/web-check/$(basename $(notdir $(1)))
+web-check-tools = $(foreach s,$(wildcard programs/$(1)/web-check/*.cpp),$(call WEB_CHECK_TOOL,$(s)))
+
+define web-check-rule
+$(if $(wildcard $(1:.cpp=.zgal)),$(call zgal-rule,$(1:.cpp=.zgal),$(OUT)/web-check/gen/$(basename $(notdir $(1))),$(OUT)/web-check/gen/$(basename $(notdir $(1)))/spv))
+$(call WEB_CHECK_TOOL,$(1)): $(1) $(wildcard $(dir $(1))*.h $(dir $(1))../*.h tests/oracle/*.h) \
+		$(if $(wildcard $(1:.cpp=.zgal)),$(OUT)/web-check/gen/$(basename $(notdir $(1)))/$(basename $(notdir $(1))).zgal.stamp)
+	@mkdir -p $$(dir $$@)
+	$$(CXX) -o $$@ $$< $$(CXXFLAGS) $$(ZGAL_CFLAGS) -Itests \
+		$(if $(wildcard $(1:.cpp=.zgal)),-I$(OUT)/web-check/gen/$(basename $(notdir $(1))))
+endef
+$(foreach s,$(WEB_CHECK_SOURCES),$(eval $(call web-check-rule,$(s))))
+
+# Web tests: programs/<name>/test-web.sh, run as test-web.sh <main.js> <output dir> <web-check
+# dir> under Node, after its program's web build and its web-check tools
 WEB_TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test-web.sh),$(p)))
 
-$(foreach p,$(WEB_TESTED_PROGRAMS),$(eval test-web-$(p): $(OUT)/web/$(p) ; programs/$(p)/test-web.sh $(OUT)/web/$(p)/$(p).zgal.main.js $(OUT)/test-web/$(p)))
+$(foreach p,$(WEB_TESTED_PROGRAMS),$(eval test-web-$(p): $(OUT)/web/$(p) $(call web-check-tools,$(p)) ; programs/$(p)/test-web.sh $(OUT)/web/$(p)/$(p).zgal.main.js $(OUT)/test-web/$(p) $(OUT)/web-check))
 
 test-web: $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
 
