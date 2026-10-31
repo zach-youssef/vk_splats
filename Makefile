@@ -44,6 +44,10 @@ PROGRAMS = $(sort $(foreach dir,$(wildcard programs/*/),$(if $(wildcard $(dir)$(
 
 $(foreach p,$(PROGRAMS),$(eval $(call zgal-program,programs/$(p)/$(p).zgal,$(OUT)/$(p),$(p),$(LIBS_$(p)))))
 
+# zgal.mk's object rules know the generated header but not a program's own headers (e.g.
+# render_test's render_check.h, which includes tests/oracle's)
+$(foreach p,$(PROGRAMS),$(eval $(patsubst %.cpp,$(OUT)/$(p)/%.o,$(notdir $(wildcard programs/$(p)/*.cpp))): $(wildcard programs/$(p)/*.h tests/oracle/*.h)))
+
 all: $(foreach p,$(PROGRAMS),$(OUT)/$(p)/$(p))
 
 # For the web (WebGPU): the same programs, compiled to TypeScript and WGSL and built to JavaScript
