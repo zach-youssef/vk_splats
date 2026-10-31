@@ -7,6 +7,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
 - `programs/<name>/`: one ZGAL program each (`<name>.zgal` with a `main`, plus its own `.cpp` and
   `.ts` files, `assets/` and optional `test.sh` / `test-web.sh`). The Makefile finds them; adding
   one needs no Makefile change ([building-and-testing.md](building-and-testing.md)).
+  - `splat_render`: renders a camera of a scene in a window, or headless with a PNG capture
+    ([below](#splat_render)).
   - `tile_test` and `render_test`: the render graph's GPU tests against the CPU and the
     closed-form oracles ([below](#render-graph)).
 - `lib/`: ZGAL modules the programs share, imported by relative path:
@@ -18,7 +20,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
     ranges and rasterizer, and the window's present ([below](#render-graph)); it imports
     `splat_math.zgal`.
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
-  programs' inputs, and the synthetic scene generator.
+  programs' inputs, the synthetic scene generator, and `scene_args.py`, which prints
+  splat_render's arguments for a scene and a camera.
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`), Python tests and test
   data.
 - `colmap/`: the one real scene: `colmap_exports3`, a COLMAP text export (one SIMPLE_RADIAL
@@ -225,6 +228,26 @@ rather than in the program.
   their `test.sh` reads them from the scene's `manifest.json` (`scenes.py`), and the checks verify
   them against the readbacks.
 
+## splat_render
+
+`programs/splat_render` runs `SplatGraph` for one camera: in a window by default (escape quits;
+`--size` sets the window, and the image is letterboxed in it), or headless with `--frames N`,
+`--capture FILE` writing the last frame's `rendered` as a PNG. ZGAL can't read the manifest or
+join paths, so the scene comes as options, which `tools/scene_args.py <scene dir> <camera>`
+prints (the camera an index or a name):
+
+```
+build/splat_render/splat_render $(tools/scene_args.py <scene dir> <camera>) --frames 8 --capture out.png
+```
+
+`--background` is a grey level. The tile entries' capacity starts at `--initial-entries` (2²⁰)
+and grows after a frame that overflowed it (`grownCapacity`, with a message): that frame and
+those already in flight miss splats, so a capture needs enough frames after the growth (the
+readback arrives a few frames later) or a large enough start. Its `test.sh` renders the
+committed S3 scene (`programs/splat_render/golden/s3`, `make_synthetic.py s3` with seed 0,
+committed so a change in numpy's random streams can't move it) from cameras 0 and 24, one starting
+at 16 entries so it must grow, and compares each capture with the reviewed golden
+(`golden/s3-camera-<k>.png`) at a PSNR of at least 45 dB (`psnr.py`).
 
 ### Structs
 

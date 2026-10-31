@@ -102,6 +102,7 @@ bytes with the same numpy version on the same platform, and the manifest's `sour
 generator and its arguments. Across numpy versions or machines the bytes may differ: numpy doesn't
 promise stable random streams, and float64 maths and BLAS can differ in the last bit. So a golden
 (a capture compared across runs) must commit the scene it was made from, not regenerate it in CI.
+splat_render's does: `programs/splat_render/golden/s3` (S3, seed 0) with its captures.
 
 ```
 tools/make_synthetic.py s1 <out dir> [--variant <name>]

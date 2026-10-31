@@ -1,0 +1,63 @@
+;; splat_render: renders one camera of a scene (lib/render_graph.zgal's SplatGraph) in a window, or
+;; headless (--frames N), writing the last frame to a PNG (--capture FILE). The scene is the
+;; converter's files (docs/data-format.md); ZGAL can't join paths or read the manifest, so
+;; tools/scene_args.py prints the arguments for a scene directory and a camera:
+;;
+;;     build/splat_render/splat_render $(tools/scene_args.py <scene dir> <camera>) [--frames 4 --capture out.png]
+;;
+;; The tile entries' capacity starts at --initial-entries and grows after a frame that needed more
+;; (grownCapacity): a frame that overflowed it misses splats, so the program says so, and a capture
+;; should be of a frame after the capacity has grown (enough --frames, or a large enough start).
+
+(import "../../lib/render_graph.zgal")
+
+(app SplatRender
+  (parameter splatFile path)
+  (parameter cameraFile path)
+  (parameter splatCount uint)
+  (parameter cameraIndex uint)
+  (parameter width uint)
+  (parameter height uint)
+  (parameter shDegree uint)
+  (parameter near float)
+  (parameter far float)
+  (parameter initialEntries uint)
+  (parameter background float)
+  (state
+   (capacity uint (grownCapacity initialEntries 0)))
+  (on (key-pressed escape) (quit!))
+  (on (read readCounts d)
+    (let* ([grown (grownCapacity state.capacity (at d countTotal))])
+      (when (not= grown state.capacity)
+        (print! "splat_render: a frame needed " (at d countTotal) " tile entries, more than its capacity of "
+                state.capacity "; growing it to " grown))
+      (with state #:capacity grown)))
+  (run SplatGraph (splatFile splatFile) (cameraFile cameraFile) (splatCount splatCount)
+       (cameraIndex cameraIndex) (width width) (height height) (shDegree shDegree) (near near)
+       (far far) (maxGroups groupLimit) (inspect #f) (capacity state.capacity)
+       (background (vec3 background)) (window (not headless)) (capture capture)
+       (presentScale (letterbox surfaceSize width height))))
+
+(main SplatRender
+  (about "Renders a camera of a splat scene, in a window or headless (--frames N, --capture FILE)")
+  (window "splat_render" 800 800)
+  (capture readRendered)
+  (option splatFile "--splats" "the scene's splats.bin" #:default "splats.bin")
+  (option cameraFile "--cameras" "the scene's cameras.bin" #:default "cameras.bin")
+  (option splatCount "--splat-count" "the splats in it (the manifest's splatCount)" #:default 1
+          #:range (1 16777216))
+  (option cameraIndex "--camera" "the camera to render" #:default 0)
+  ;; At most 2896 a side: the graph's colours (16 bytes a pixel) must stay within one binding's
+  ;; 128 MiB (docs/architecture.md's budgets); ZGAL can't check the product of two options
+  (option width "--width" "the camera's image width (at most 2896: the 128 MiB binding budget)" #:default 64
+          #:range (1 2896))
+  (option height "--height" "the camera's image height (at most 2896: the 128 MiB binding budget)" #:default 64
+          #:range (1 2896))
+  (option shDegree "--sh-degree" "the SH bands to evaluate" #:default 3 #:range (0 3))
+  (option near "--near" "the near plane" #:default 0.2)
+  (option far "--far" "the depth keys' far depth" #:default 1000.0)
+  (option initialEntries "--initial-entries" "the tile entries' first capacity" #:default 1048576
+          #:range (1 33554432))
+  (option background "--background" "the background's grey level (0 black, 1 white)" #:default 0.0
+          #:range (0.0 1.0))
+  (controls "Controls:" "  escape  quit"))

@@ -2,8 +2,8 @@
 """render_test's arguments for a camera of a scene (tools/make_synthetic.py's), from its manifest.
 
   scenes.py <scene dir> <camera>
-      The files, the splat count, the SH degree and the camera's size; for an S1 scene also the
-      oracle's background and --oracle.
+      tools/scene_args.py's (the files, the splat count, the SH degree and the camera's index and
+      size); for an S1 scene also the oracle's background and --oracle.
 
 Only the standard library, so it runs wherever test.sh does.
 """
@@ -12,21 +12,14 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
+from scene_args import scene_args  # noqa: E402
+
 
 def args(scene, camera):
+    out = scene_args(scene, str(camera))
     with open(os.path.join(scene, "manifest.json")) as f:
-        m = json.load(f)
-    cam = m["cameras"][camera]
-    out = [
-        "--splats", os.path.join(scene, m["files"]["splats"]),
-        "--cameras", os.path.join(scene, m["files"]["cameras"]),
-        "--splat-count", str(m["splatCount"]),
-        "--sh-degree", str(m["shDegree"]),
-        "--camera", str(camera),
-        "--width", str(cam["width"]),
-        "--height", str(cam["height"]),
-    ]
-    source = m.get("source") or {}
+        source = json.load(f).get("source") or {}
     if source.get("scene") == "s1":
         r, g, b = source["oracle"]["background"]
         out += ["--oracle", "--background-r", repr(r), "--background-g", repr(g), "--background-b", repr(b)]
