@@ -132,7 +132,9 @@ with a window, draws the image on the surface.
    the splat's rectangle (row by row), and writes its key and splat index.
 4. A `sort` of the keys with the splat indices as values, over the entries held; a `clear` of
    `ranges`; `TileRanges` (the same indirect dispatch) writes each tile's [start, end) where
-   neighbouring keys' tiles differ. Tiles without entries keep (0, 0).
+   neighbouring keys' tiles differ. Tiles without entries keep (0, 0). `ranges` is two `uint`s a
+   tile (start at 2t, end at 2t + 1), not a `uvec2`, as different invocations write a tile's start
+   and end, and WGSL lets a store to one component rewrite the whole vector.
 5. `Rasterize`: one 16×16 workgroup per tile (a 2D dispatch of the tile grid, at most 181² tiles
    for the programs' 2896² pixels, so no grid-stride loop and no `maxGroups`), one invocation per
    pixel. The workgroup walks the
@@ -206,9 +208,11 @@ rather than in the program.
 - **Rasterizer against C++** (`programs/render_test`): with a fixed `--capacity` (a frame needing
   more fails), every frame is complete and the same, so readbacks of different frames can be
   checked together. Every pixel's colour and T are compared within 1e-4 with a CPU blend in
-  double of the GPU's projections over the GPU's tile ranges (checked by tile_test), and its last
-  entry exactly; with `--oracle` (each S1 variant, every camera of the rotated ones), within 1e-3
-  with the closed-form oracle (`tests/oracle/closed_form.h`), recomputed from the splat's
+  double of the GPU's projections over the GPU's tile ranges (checked by tile_test; render_test
+  also checks that no range is inverted and that the non-empty ones partition the entries, which
+  catches a lost start or end write on backends without a tile_test), and its last entry exactly;
+  with `--oracle` (each S1 variant, every camera of the rotated ones), within 1e-3 with the
+  closed-form oracle (`tests/oracle/closed_form.h`), recomputed from the splat's
   parameters and the camera's rotation about z, each splat blended only into its tile rectangle
   (which must equal the GPU's). A pixel with a threshold decision within rounding of its bound
   (α near 1/255, T near 1e-4, a nonzero exponent near 0) can go either way: it's borderline, and

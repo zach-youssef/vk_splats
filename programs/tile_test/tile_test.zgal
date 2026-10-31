@@ -32,7 +32,7 @@
   ;; program on a mismatch
   (extern (check [splats : (data Splat)] [cameras : (data Camera)] [counts : (data uint)]
                  [projected : (data Projected)] [entryKeys : (data uint)] [entrySplats : (data uint)]
-                 [ranges : (data uvec2)] [cameraIndex : uint] [shDegree : uint] [near : float]
+                 [ranges : (data uint)] [cameraIndex : uint] [shDegree : uint] [near : float]
                  [far : float] [culledTail : uint]) : uint)
   ;; Exits the program with status 1
   (extern (fail) : void)
@@ -45,7 +45,7 @@
    (projected (data Projected) (empty-data Projected))
    (entryKeys (data uint) (empty-data uint))
    (entrySplats (data uint) (empty-data uint))
-   (ranges (data uvec2) (empty-data uvec2))
+   (ranges (data uint) (empty-data uint))
    (checkedOverflow bool #f)
    (checked bool #f))
   (on (read readSplats d) (with state #:splats d))
@@ -96,7 +96,7 @@
         [(= result checkedOverflowing)
          (with state #:checkedOverflow overflowChecked #:counts (empty-data uint)
                #:projected (empty-data Projected) #:entryKeys (empty-data uint)
-               #:entrySplats (empty-data uint) #:ranges (empty-data uvec2))]
+               #:entrySplats (empty-data uint) #:ranges (empty-data uint))]
         [else (with state #:checkedOverflow overflowChecked)])))
   (run SplatGraph (splatFile splatFile) (cameraFile cameraFile) (splatCount splatCount)
        (cameraIndex cameraIndex) (width width) (height height) (shDegree shDegree) (near near)

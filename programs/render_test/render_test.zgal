@@ -2,7 +2,8 @@
 ;; scene with a fixed capacity (so every frame is complete and the same), reads back the tile
 ;; pipeline and the rasterizer's outputs, and has C++ (render_test.cpp) check them:
 ;;   - `check`: each pixel's colour, final transmittance and last entry against a CPU blend (in
-;;     double) of the GPU's projections over the GPU's tile ranges (tile_test checks those), and,
+;;     double) of the GPU's projections over the GPU's tile ranges (tile_test checks those; this
+;;     checks only that none is inverted and that the non-empty ones partition the entries), and,
 ;;     with --oracle (S1's scenes), against the closed-form oracle (tests/oracle/closed_form.h);
 ;;     no NaNs; it prints a hash of the outputs, which test.sh compares between runs;
 ;;   - `sameColours` and `sameEntries`: later frames' outputs bit for bit (the rasterizer is
@@ -32,7 +33,7 @@
   ;; Checks one frame's readbacks (false when they haven't all arrived yet); exits the program on
   ;; a mismatch
   (extern (check [splats : (data Splat)] [cameras : (data Camera)] [counts : (data uint)]
-                 [projected : (data Projected)] [entrySplats : (data uint)] [ranges : (data uvec2)]
+                 [projected : (data Projected)] [entrySplats : (data uint)] [ranges : (data uint)]
                  [colours : (data vec4)] [lastEntries : (data uint)] [cameraIndex : uint]
                  [background : vec3] [oracle : bool]) : bool)
   ;; Whether two frames' outputs are the same, bit for bit
@@ -46,7 +47,7 @@
    (counts (data uint) (empty-data uint))
    (projected (data Projected) (empty-data Projected))
    (entrySplats (data uint) (empty-data uint))
-   (ranges (data uvec2) (empty-data uvec2))
+   (ranges (data uint) (empty-data uint))
    (colours (data vec4) (empty-data vec4))
    (lastEntries (data uint) (empty-data uint))
    (checked bool #f)

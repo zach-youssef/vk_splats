@@ -63,7 +63,7 @@ std::string str(glm::uvec4 v) {
 uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cameras,
                const zgal::Data<uint32_t>& counts, const zgal::Data<Projected>& projected,
                const zgal::Data<uint32_t>& entryKeys, const zgal::Data<uint32_t>& entrySplats,
-               const zgal::Data<glm::uvec2>& ranges, uint32_t cameraIndex, uint32_t shDegree, float near, float far,
+               const zgal::Data<uint32_t>& ranges, uint32_t cameraIndex, uint32_t shDegree, float near, float far,
                uint32_t culledTail) {
     if (counts.size() != countSize) return checkedNothing;
     const uint32_t entries = counts[countEntries];
@@ -88,8 +88,8 @@ uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& camera
     const Camera& cam = cameras[cameraIndex];
     const glm::uvec2 grid = tileGrid(cam.size);
     const uint32_t tileCount = grid.x * grid.y;
-    if (ranges.size() != tileCount) {
-        std::cout << "tile_test: --width and --height give " << ranges.size() << " tiles, camera " << cameraIndex
+    if (ranges.size() != 2 * tileCount) {
+        std::cout << "tile_test: --width and --height give " << ranges.size() / 2 << " tiles, camera " << cameraIndex
                   << "'s size " << cam.size.x << "x" << cam.size.y << " " << tileCount << std::endl;
         std::exit(1);
     }
@@ -191,7 +191,7 @@ uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& camera
     uint32_t occupied = 0;
     uint32_t largest = 0;
     for (uint32_t t = 0; t < tileCount; ++t) {
-        const glm::uvec2 r = ranges[t];
+        const glm::uvec2 r(ranges[2 * t], ranges[2 * t + 1]);
         const glm::uvec2 want = expectedRanges[t];
         if (r != want) {
             fail("tile " + std::to_string(t) + ": GPU range [" + std::to_string(r.x) + ", " + std::to_string(r.y) +

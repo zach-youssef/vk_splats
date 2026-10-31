@@ -139,15 +139,17 @@
 
 ;; 4. Each tile's entries, [start, end) in the sorted keys: an entry starts its tile's range when
 ;; the entry before it is of another tile, and ends it when the one after it is. Tiles without
-;; entries keep the clear's (0, 0). Keys of no tile (EmitEntries' 0xFFFFFFFF) only occur after a
-;; wrapped total; they read as the grid's last tile when the tile count is a power of two, which
-;; stays in bounds.
+;; entries keep the clear's (0, 0). `ranges` holds them as two uints a tile (start at 2t, end at
+;; 2t + 1), not a uvec2: different invocations write a tile's start and end, and WGSL lets a store
+;; to a vector's component rewrite the whole vector, so on the web the two writes raced (one lost).
+;; Keys of no tile (EmitEntries' 0xFFFFFFFF) only occur after a wrapped total; they read as the
+;; grid's last tile when the tile count is a power of two, which stays in bounds.
 (compute-material TileRanges
   (workgroup 256)
   (bindings
    (entryKeys (buffer-array uint read))
    (counts (buffer-array uint read))
-   (ranges (buffer-array uvec2 write)))
+   (ranges (buffer-array uint write)))
   (push (tileCount uint))
   (compute
    (let* ([n (at counts countEntries)]
@@ -156,9 +158,9 @@
        (let* ([tile (keyTile (at entryKeys e) bits)])
          (when (< tile tileCount)
            (when (if (= e (uint 0)) #t (not= tile (keyTile (at entryKeys (- e (uint 1))) bits)))
-             (write! (at (at ranges tile) 0) e))
+             (write! (at ranges (* tile (uint 2))) e))
            (when (if (= (+ e (uint 1)) n) #t (not= tile (keyTile (at entryKeys (+ e (uint 1))) bits)))
-             (write! (at (at ranges tile) 1) (+ e (uint 1))))))))))
+             (write! (at ranges (+ (* tile (uint 2)) (uint 1))) (+ e (uint 1))))))))))
 
 ;; 5. Each tile's pixels, one invocation each in a 16x16 workgroup per tile (Sec. 6): the
 ;; workgroup loads the tile's entries in batches of rasterBatch splats into shared memory (one entry
@@ -182,7 +184,7 @@
   (bindings
    (projected (buffer-array Projected read))
    (entrySplats (buffer-array uint read))
-   (ranges (buffer-array uvec2 read))
+   (ranges (buffer-array uint read))  ; two uints a tile: TileRanges
    (colours (buffer-array vec4 write))
    (lastEntries (buffer-array uint write))
    (rendered (storage-image write)))
@@ -193,7 +195,8 @@
    (batchConicOpacities (array vec4 256))  ; the conic (a, b, c) and the opacity
    (batchColours (array vec4 256)))        ; the colour (vec4: vec3 arrays pad to 16 bytes anyway)
   (compute
-   (let* ([tileRange (at ranges (+ (* workgroupId.y workgroupCount.x) workgroupId.x))]
+   (let* ([tile (+ (* workgroupId.y workgroupCount.x) workgroupId.x)]
+          [tileRange (uvec2 (at ranges (* tile (uint 2))) (at ranges (+ (* tile (uint 2)) (uint 1))))]
           [lane (+ (* localInvocationId.y tileSize) localInvocationId.x)]
           [pixel globalInvocationId.xy]
           [inside (and (< pixel.x width) (< pixel.y height))]
@@ -307,7 +310,7 @@
   (buffer commands DispatchCommand 1 #:frames per-frame)
   (buffer entryKeys uint capacity #:frames per-frame)
   (buffer entrySplats uint capacity #:frames per-frame)
-  (buffer ranges uvec2 tileCount #:frames per-frame)
+  (buffer ranges uint (* tileCount 2) #:frames per-frame)  ; [start, end) a tile: TileRanges
   ;; The rasterizer's outputs, per pixel (row by row): the colour and the final transmittance, and
   ;; the entry after the last one blended
   (buffer colours vec4 (* width height) #:frames per-frame)

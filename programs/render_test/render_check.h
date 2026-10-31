@@ -161,7 +161,7 @@ inline uint64_t fnv1a(uint64_t h, const void* bytes, size_t size) {
 
 inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cameras, const zgal::Data<uint32_t>& counts,
            const zgal::Data<Projected>& projected, const zgal::Data<uint32_t>& entrySplats,
-           const zgal::Data<glm::uvec2>& ranges, const zgal::Data<glm::vec4>& colours,
+           const zgal::Data<uint32_t>& ranges, const zgal::Data<glm::vec4>& colours,
            const zgal::Data<uint32_t>& lastEntries, uint32_t cameraIndex, glm::vec3 background, bool useOracle) {
     if (counts.size() != countSize || entrySplats.size() != counts[countCapacity]) return false;
     if (cameraIndex >= cameras.size()) {
@@ -175,7 +175,7 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
     const Camera& cam = cameras[cameraIndex];
     const uint32_t width = cam.size.x, height = cam.size.y;
     const glm::uvec2 grid = tileGrid(cam.size);
-    if (ranges.size() != grid.x * grid.y || colours.size() != width * height || lastEntries.size() != width * height) {
+    if (ranges.size() != 2 * grid.x * grid.y || colours.size() != width * height || lastEntries.size() != width * height) {
         usage("--width and --height aren't camera " + std::to_string(cameraIndex) + "'s size " +
               std::to_string(width) + "x" + std::to_string(height));
     }
@@ -184,10 +184,38 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
     const oracle::Rgb bg{background.x, background.y, background.z};
 
     Failures fail;
+    // The tile ranges themselves: the CPU blend below reads the GPU's ranges, so a lost start or end
+    // write (an inverted or empty range) would blend the same wrong entries on both sides. Every
+    // sorted entry is of exactly one tile, so the non-empty ranges must partition [0, entries).
+    uint32_t largestTile = 0;
+    std::vector<glm::uvec2> occupied;
+    for (uint32_t t = 0; t < grid.x * grid.y; ++t) {
+        const glm::uvec2 range(ranges[2 * t], ranges[2 * t + 1]);
+        if (range.x > range.y) {
+            fail("tile " + std::to_string(t) + "'s range [" + std::to_string(range.x) + ", " +
+                 std::to_string(range.y) + ") is inverted");
+        } else if (range.x < range.y) {
+            occupied.push_back(range);
+            largestTile = std::max(largestTile, range.y - range.x);
+        }
+    }
+    std::sort(occupied.begin(), occupied.end(), [](glm::uvec2 a, glm::uvec2 b) { return a.x < b.x; });
+    uint32_t covered = 0;
+    for (const glm::uvec2& range : occupied) {
+        if (range.x != covered) {
+            fail("the tile ranges " + std::string(range.x < covered ? "overlap" : "leave a gap") + " at entry " +
+                 std::to_string(std::min(range.x, covered)));
+        }
+        covered = std::max(covered, range.y);
+    }
+    if (covered != entries) {
+        fail("the tile ranges cover up to entry " + std::to_string(covered) + ", not the " +
+             std::to_string(entries) + " entries");
+    }
+
     // The rasterizer against the CPU's blend of the same entries
     double colourError = 0.0, tError = 0.0;
-    uint32_t borderline = 0, blendedPixels = 0, stoppedPixels = 0, largestTile = 0;
-    for (const glm::uvec2& r : ranges) largestTile = std::max(largestTile, r.y - r.x);
+    uint32_t borderline = 0, blendedPixels = 0, stoppedPixels = 0;
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
             const uint32_t index = y * width + x;
@@ -196,7 +224,8 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
                 fail(pixelName(x, y) + " isn't finite");
                 continue;
             }
-            const glm::uvec2 range = ranges[(y / tileSize) * grid.x + x / tileSize];
+            const uint32_t tile = (y / tileSize) * grid.x + x / tileSize;
+            const glm::uvec2 range(ranges[2 * tile], ranges[2 * tile + 1]);
             if (range.y > entries) {
                 fail(pixelName(x, y) + "'s tile range ends past the " + std::to_string(entries) + " entries");
                 continue;
