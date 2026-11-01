@@ -47,11 +47,14 @@
 (define lossL1 (uint 0))  ; mean |I - t| over the image's channels (Sec. 7's L1 term)
 (define lossL2 (uint 1))  ; sum (I - t)^2 over them (smooth: the gradient tests')
 
-;; The projection field Perturb changes (0: none)
+;; The field Perturb changes (0: none): one of the projection's, or perturbParameter plus a
+;; parameter's float offset in Splat (0-2 the position, 3 the opacity logit, 4-6 the log-scale,
+;; 8-11 the quaternion, 12-59 the SH coefficients; 7, the padding, changes nothing)
 (define perturbNone (uint 0))
 (define perturbOpacity (uint 1))
 (define perturbRed (uint 2))      ; red, green, blue: 2, 3, 4
 (define perturbMeanX (uint 5))    ; x, y: 5, 6
+(define perturbParameter (uint 16))
 
 ;; `losses`, element by element
 (define lossTotal (uint 0))   ; the image's loss: the pixels' sum
@@ -348,23 +351,52 @@
              (write! (at densifyStats i)
                      (DensifyStat (+ d.gradientNorm (densifyNorm g.mean cam.size)) (+ d.visible (uint 1)))))))))))
 
+;; The unit vector along axis i (0-2; none past them)
+(define (unit3 [i : uint]) : vec3
+  (vec3 (if (= i (uint 0)) 1.0 0.0) (if (= i (uint 1)) 1.0 0.0) (if (= i (uint 2)) 1.0 0.0)))
+(define (unit4 [i : uint]) : vec4
+  (vec4 (unit3 i) (if (= i (uint 3)) 1.0 0.0)))
+
+;; A splat with delta added to its parameter at float offset (perturbParameter's offsets; the SH
+;; coefficients' aren't changed here: projectSplatPerturbed adds delta to them)
+(define (perturbedSplat [s : Splat] [offset : uint] [delta : float]) : Splat
+  (with s #:position (+ s.position (* (unit3 offset) delta))
+        #:opacity (+ s.opacity (if (= offset (uint 3)) delta 0.0))
+        #:logScale (+ s.logScale (* (unit3 (- offset (uint 4))) delta))
+        #:rotation (+ s.rotation (* (unit4 (- offset (uint 8))) delta))))
+
 ;; With finiteDifferences: adds delta to one field of one splat's projection (perturbOpacity and
-;; so on; perturbNone changes nothing), after the preprocess. Its tiles stay as they were, so the
-;; perturbed frame blends the same entries.
+;; so on), or to one of its parameters (perturbParameter + its offset) and projects it again,
+;; after the preprocess (perturbNone changes nothing). Its depth and tiles stay as they were, so
+;; the perturbed frame blends the same entries in the same order: the analytic gradients don't see
+;; the sort's or the tiles' discrete changes either. A perturbed splat projectSplat would cull
+;; keeps its projection (no probe gets that close).
 (compute-material Perturb
   (workgroup 1)
-  (bindings (projected (buffer-array Projected read-write)))
-  (push (splatCount uint) (splat uint) (field uint) (delta float))
+  (bindings
+   (splats (buffer-array Splat read))
+   (cameras (buffer-array Camera read))
+   (projected (buffer-array Projected read-write)))
+  (push (splatCount uint) (splat uint) (field uint) (delta float) (cameraIndex uint) (near float)
+        (shDegree uint))
   (compute
    (when (and (not= field perturbNone) (< splat splatCount))
-     (let* ([p (at projected splat)]
-            [unit (vec3 (if (= field perturbRed) 1.0 0.0) (if (= field (+ perturbRed (uint 1))) 1.0 0.0)
-                        (if (= field (+ perturbRed (uint 2))) 1.0 0.0))]
-            [shift (vec2 (if (= field perturbMeanX) 1.0 0.0) (if (= field (+ perturbMeanX (uint 1))) 1.0 0.0))])
-       (write! (at projected splat)
-               (with p #:opacity (+ p.opacity (if (= field perturbOpacity) delta 0.0))
-                     #:colour (+ p.colour (* unit delta))
-                     #:mean (+ p.mean (* shift delta))))))))
+     (let* ([p (at projected splat)])
+       (if (>= field perturbParameter)
+           (let* ([offset (- field perturbParameter)]
+                  [q (projectSplatPerturbed (perturbedSplat (at splats splat) offset delta)
+                                            (at cameras cameraIndex) near shDegree
+                                            (if (>= offset (uint 12)) (- offset (uint 12)) (uint 48)) delta)])
+             (when (> q.tileCount (uint 0))
+               (write! (at projected splat)
+                       (with p #:mean q.mean #:conic q.conic #:opacity q.opacity #:colour q.colour))))
+           (let* ([unit (vec3 (if (= field perturbRed) 1.0 0.0) (if (= field (+ perturbRed (uint 1))) 1.0 0.0)
+                              (if (= field (+ perturbRed (uint 2))) 1.0 0.0))]
+                  [shift (vec2 (if (= field perturbMeanX) 1.0 0.0) (if (= field (+ perturbMeanX (uint 1))) 1.0 0.0))])
+             (write! (at projected splat)
+                     (with p #:opacity (+ p.opacity (if (= field perturbOpacity) delta 0.0))
+                           #:colour (+ p.colour (* unit delta))
+                           #:mean (+ p.mean (* shift delta))))))))))
 
 ;; Whether a splat's projection blends into a pixel at all, as Rasterize decides (alpha against
 ;; alphaMin, the exponent's sign)
@@ -374,17 +406,18 @@
     (not (or (> power 0.0) (< (min alphaMax (* opacity (exp power))) alphaMin)))))
 
 ;; With finiteDifferences: a probe runs its +h side, then its -h side (probes 2k + 1 and 2k + 2,
-;; probe 0 unperturbed). The +h frames keep each pixel's loss and last entry (plusLosses and
-;; plusLasts, shared between frames); the -h frame writes each pixel's plus - minus, reduced into
-;; losses' lossDelta, so the difference is summed pixel by pixel rather than as the difference of
-;; two whole losses. Every frame writes its probe into lossProbe, so the app knows which frame it
-;; reads. The loss is discontinuous where a decision flips, and the analytic gradient is the
-;; derivative between those jumps, so a pixel where one flips between the sides counts nothing:
-;;   - the perturbed splat's alpha crossing alphaMin (it blends into the pixel or not): this
-;;     frame's projection against the other side's (perturbed by -2 delta);
+;; probe 0 unperturbed). The +h frames keep each pixel's loss and last entry and the perturbed
+;; splat's projection (plusLosses, plusLasts and plusProjected, shared between frames); the -h
+;; frame writes each pixel's plus - minus, reduced into losses' lossDelta, so the difference is
+;; summed pixel by pixel rather than as the difference of two whole losses. Every frame writes its
+;; probe into lossProbe, so the app knows which frame it reads. The loss is discontinuous where a
+;; decision flips, and the analytic gradient is the derivative between those jumps, so a pixel
+;; where one flips between the sides counts nothing:
+;;   - the perturbed splat's alpha crossing alphaMin (it blends into the pixel or not), in its
+;;     tiles: this frame's projection against the +h side's;
 ;;   - the stop at T < 1e-4 moving to another entry (any splat's, as the perturbation changes T):
 ;;     the pixel's lastEntries differ between the sides.
-;; Only the opacity and the mean move them; such pixels are few.
+;; Such pixels are few.
 (compute-material LossDelta
   (workgroup 256)
   (bindings
@@ -393,30 +426,37 @@
    (lastEntries (buffer-array uint read))
    (plusLosses (buffer-array float read-write))
    (plusLasts (buffer-array uint read-write))
+   (plusProjected (buffer-array Projected read-write))  ; one element
    (lossDeltas (buffer-array float write))
    (losses (buffer-array float write)))
-  (push (pixels uint) (width uint) (probe uint) (splatCount uint) (splat uint) (field uint) (delta float))
+  (push (pixels uint) (width uint) (probe uint) (splatCount uint) (splat uint))
   (compute
-   (when (= globalInvocationId.x (uint 0)) (write! (at losses lossProbe) (float probe)))
    (let* ([plus (= (remainder probe (uint 2)) (uint 1))]
           [minus (and (not= probe (uint 0)) (not plus))]
-          [valid (and minus (< splat splatCount))]
-          [p (at projected (if valid splat (uint 0)))]
-          ;; The other side's: this frame's projection minus twice the delta
-          [otherOpacity (- p.opacity (if (= field perturbOpacity) (* 2.0 delta) 0.0))]
-          [otherMean (- p.mean (* 2.0 delta (vec2 (if (= field perturbMeanX) 1.0 0.0)
-                                                  (if (= field (+ perturbMeanX (uint 1))) 1.0 0.0))))])
+          [valid (< splat splatCount)]
+          [p (at projected (if valid splat (uint 0)))])
+     (when (= globalInvocationId.x (uint 0))
+       (write! (at losses lossProbe) (float probe))
+       (when (and plus valid) (write! (at plusProjected 0) p)))
+     ;; plusProjected is read only in -h frames, so no frame reads it while invocation 0 writes it
      (for ([i (range globalInvocationId.x pixels (* entryGroupSize workgroupCount.x))])
        (when plus
          (write! (at plusLosses i) (at pixelLosses i))
          (write! (at plusLasts i) (at lastEntries i)))
        (when (not minus) (write! (at lossDeltas i) 0.0))
        (when minus
-         (let* ([centre (+ (vec2 (float (remainder i width)) (float (/ i width))) 0.5)]
+         (let* ([other (at plusProjected 0)]
+                [x (remainder i width)]
+                [y (/ i width)]
+                [tx (/ x tileSize)]
+                [ty (/ y tileSize)]
+                [centre (+ (vec2 (float x) (float y)) 0.5)]
+                [inTiles (and valid (> p.tileCount (uint 0)) (>= tx p.tiles.x) (< tx p.tiles.z)
+                              (>= ty p.tiles.y) (< ty p.tiles.w))]
                 [flips (or (not= (at plusLasts i) (at lastEntries i))
-                           (and valid (> p.tileCount 0)
+                           (and inTiles
                                 (not= (blends p.mean p.conic p.opacity centre)
-                                      (blends otherMean p.conic otherOpacity centre))))])
+                                      (blends other.mean other.conic other.opacity centre))))])
            (write! (at lossDeltas i) (if flips 0.0 (- (at plusLosses i) (at pixelLosses i))))))))))
 
 ;; ---------------------------------------------------------------------------------------------
@@ -449,8 +489,9 @@
   (parameter loss uint)
   ;; Whether the graph perturbs a projection (Perturb) and sums the loss's change (LossDelta) for
   ;; finite differences: probe 0 is unperturbed, any other perturbs field perturbField
-  ;; (perturbOpacity and so on) of splat perturbSplat by perturbDelta, +h for an odd probe and -h
-  ;; (after the same probe's +h frames) for an even one
+  ;; (perturbOpacity and so on, or perturbParameter plus a parameter's offset) of splat
+  ;; perturbSplat by perturbDelta, +h for an odd probe and -h (after the same probe's +h frames)
+  ;; for an even one
   (parameter finiteDifferences bool)
   (input probe (per-frame uint))
   (input perturbSplat (per-frame uint))
@@ -492,13 +533,15 @@
   ;; Finite differences': the +h side's, shared, so the -h frames see the last +h frame's
   (buffer plusLosses float pixels #:frames shared #:when finiteDifferences)
   (buffer plusLasts uint pixels #:frames shared #:when finiteDifferences)
+  (buffer plusProjected Projected 1 #:frames shared #:when finiteDifferences)
   (buffer lossDeltas float pixels #:frames per-frame #:when finiteDifferences)
 
   (material preprocessing Preprocess splats cameras projected tileCounts
             #:push ((splatCount splatCount) (cameraIndex cameraIndex) (near near) (shDegree shDegree))
             #:invocations ((min splatCount (* (max maxGroups 1) 64))))  ; 64: the splat workgroup size
-  (material perturbing Perturb projected
-            #:push ((splatCount splatCount) (splat perturbSplat) (field perturbField) (delta perturbDelta))
+  (material perturbing Perturb splats cameras projected
+            #:push ((splatCount splatCount) (splat perturbSplat) (field perturbField) (delta perturbDelta)
+                    (cameraIndex cameraIndex) (near near) (shDegree shDegree))
             #:invocations (1) #:when finiteDifferences)
   (material planning PlanEntries counts commands
             #:push ((capacity (min capacity 3145728)) (tileCount tileCount) (near near) (far far)
@@ -513,9 +556,9 @@
   (material scoring Loss colours targets pixelGrads pixelLosses
             #:push ((pixels pixels) (targetOffset targetOffset) (loss loss))
             #:invocations ((min pixels (* (max maxGroups 1) 256))))  ; 256: its workgroup size
-  (material differencing LossDelta projected pixelLosses lastEntries plusLosses plusLasts lossDeltas losses
-            #:push ((pixels pixels) (width width) (probe probe) (splatCount splatCount) (splat perturbSplat)
-                    (field perturbField) (delta perturbDelta))
+  (material differencing LossDelta projected pixelLosses lastEntries plusLosses plusLasts plusProjected
+            lossDeltas losses
+            #:push ((pixels pixels) (width width) (probe probe) (splatCount splatCount) (splat perturbSplat))
             #:invocations ((min pixels (* (max maxGroups 1) 256))) #:when finiteDifferences)
   (material lasting TileLasts ranges lastEntries backwardRanges
             #:push ((width width) (height height) (gridWidth gridWidth) (tileCount tileCount))

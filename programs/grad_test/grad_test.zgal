@@ -7,9 +7,9 @@
 ;;     densification's statistics consistent with the frames, and with --oracle (S1's "gradient"
 ;;     variant: one splat over every pixel, a constant target), against the closed-form oracle's
 ;;     (tests/oracle/closed_form.h's single_splat_gradients, for the L2 loss or with --l1 the L1:
-;;     the projection's gradients and the parameters' it has); it prints a hash, which test.sh compares between runs. Then,
-;;     without --finite-differences, --repeats more frames' gradients must match it bit for bit
-;;     (`sameGradients`: the backward pass is deterministic).
+;;     the projection's gradients and the parameters' it has); it prints a hash, which test.sh
+;;     compares between runs. Then, without --finite-differences, --repeats more frames'
+;;     gradients must match it bit for bit (`sameGradients`: the backward pass is deterministic).
 ;;   - with --finite-differences, central differences of the loss on the GPU (the plan's rule).
 ;;     The probes are chosen without looking at the analytic gradients, so a gradient wrongly 0 is
 ;;     probed too: of each kind (the opacity; the colour's r, g, b; the mean's x, y), the visible
@@ -20,14 +20,25 @@
 ;;     loss's change between the two pixel by pixel, leaving out pixels where a decision flips
 ;;     between them (the splat's alpha crossing 1/255, a pixel's stop at T < 1e-4 moving), where
 ;;     the loss jumps.
+;;     With --parameters, the kinds are the splats' parameters instead (the position; the opacity
+;;     logit; the log-scale; the quaternion; each SH band up to --sh-degree, the DC on its own),
+;;     each perturbed and projected again on the GPU (keeping the splat's depth and tiles, so the
+;;     sort and the entries don't change: the analytic gradients don't see those jumps either),
+;;     with h 1e-3 of the value, at least 1e-3, and for the position the step that moves the 2D
+;;     mean about 0.005 px (0.005 depth / fx). An SH coefficient whose colour channel is within
+;;     0.01 of its clamp at 0 isn't probed (the step would cross the kink).
 ;;     With a the analytic gradient and fd = (plus - minus) / 2h, both must be finite, and unless
 ;;     both are negligible (below 1e-2 of the largest analytic gradient of the kind: the float
 ;;     noise of summing the pixels' changes is about 1e-3 of it), |a - fd| must be within
-;;     2e-2 max(|a|, |fd|) + 1e-5. Each kind must have a gradient that isn't negligible. Every
-;;     frame reads back which probe it ran, so a frame's change is matched with its probe,
-;;     however late its readback arrives. --multi-batch and --stops make sure a run reaches the
-;;     paths small scenes don't: a tile whose backward walks more than one batch (from the
-;;     backwardRanges readback), a pixel stopped at T < 1e-4 (counted on the CPU).
+;;     2e-2 max(|a|, |fd|) + 1e-5, and for the quaternion + 2e-3 largest: its mid-sized
+;;     gradients sit in the summation's noise (S2's 0.47 is off by 0.03 beside its largest's
+;;     21), and a larger step trades the noise for truncation error and for more flipped,
+;;     excluded pixels (at 1e-2 |q| the FD is 0.42, off by 0.05), as the rotation of S2's
+;;     anisotropic splats isn't close to linear over it. Each kind must have a gradient that
+;;     isn't negligible. Every frame reads back which probe it ran, so a frame's change is
+;;     matched with its probe, however late its readback arrives. --multi-batch and --stops make
+;;     sure a run reaches the paths small scenes don't: a tile whose backward walks more than one
+;;     batch (from the backwardRanges readback), a pixel stopped at T < 1e-4 (counted on the CPU).
 ;; It fails on a mismatch, an overflowing frame (raise --capacity) or when the frames run out first.
 ;; On the web (grad_test.inputs.ts), `check` writes the frame's readbacks to the directory
 ;; $GRAD_TEST_READBACKS names instead, and web-check/grad_test_check.cpp runs the same C++ checks
@@ -35,43 +46,93 @@
 
 (import "../../lib/train_graph.zgal")
 
-;; One finite difference: a splat's field (perturbOpacity and so on), its analytic gradient and
-;; the step
-;; and the largest analytic gradient of its kind (what's negligible is relative to)
+;; One finite difference: a splat's field (perturbOpacity and so on, or perturbParameter plus an
+;; offset), its analytic gradient, the step and the largest analytic gradient of its kind (what's
+;; negligible is relative to)
 (struct Probe (splat uint) (field uint) (analytic float) (h float) (largest float))
 
-;; The gradient and the projection's value for a field (perturbOpacity to perturbMeanX + 1)
-(define (fieldGradient [g : ProjectedGradient] [field : uint]) : float
-  (cond [(= field perturbOpacity) g.opacity]
+;; A parameter of a splat (or of its gradients) at its float offset in Splat (Perturb's
+;; perturbParameter offsets; 7, the padding, is 0)
+(define (parameterValue [s : Splat] [offset : uint]) : float
+  (cond [(= offset (uint 0)) s.position.x]
+        [(= offset (uint 1)) s.position.y]
+        [(= offset (uint 2)) s.position.z]
+        [(= offset (uint 3)) s.opacity]
+        [(= offset (uint 4)) s.logScale.x]
+        [(= offset (uint 5)) s.logScale.y]
+        [(= offset (uint 6)) s.logScale.z]
+        [(= offset (uint 7)) 0.0]
+        [(= offset (uint 8)) s.rotation.x]
+        [(= offset (uint 9)) s.rotation.y]
+        [(= offset (uint 10)) s.rotation.z]
+        [(= offset (uint 11)) s.rotation.w]
+        [else (at s.sh (- offset (uint 12)))]))
+
+;; The analytic gradient for a field (perturbOpacity to perturbMeanX + 1 from the projection's
+;; gradients, perturbParameter + an offset from the parameters')
+(define (fieldGradient [g : ProjectedGradient] [pg : Splat] [field : uint]) : float
+  (cond [(>= field perturbParameter) (parameterValue pg (- field perturbParameter))]
+        [(= field perturbOpacity) g.opacity]
         [(= field perturbRed) g.colour.x]
         [(= field (+ perturbRed (uint 1))) g.colour.y]
         [(= field (+ perturbRed (uint 2))) g.colour.z]
         [(= field perturbMeanX) g.mean.x]
         [else g.mean.y]))
 
-(define (fieldValue [p : Projected] [field : uint]) : float
-  (cond [(= field perturbOpacity) p.opacity]
+;; The value a field perturbs
+(define (fieldValue [s : Splat] [p : Projected] [field : uint]) : float
+  (cond [(>= field perturbParameter) (parameterValue s (- field perturbParameter))]
+        [(= field perturbOpacity) p.opacity]
         [(= field perturbRed) p.colour.x]
         [(= field (+ perturbRed (uint 1))) p.colour.y]
         [(= field (+ perturbRed (uint 2))) p.colour.z]
         [(= field perturbMeanX) p.mean.x]
         [else p.mean.y]))
 
-;; The finite differences' step h for a field of p (the header says why)
-(define (stepOf [p : Projected] [field : uint]) : float
-  (if (>= field perturbMeanX) 0.005 (max (* 1e-3 (abs (fieldValue p field))) 1e-4)))
+;; The finite differences' step h for a field of a splat projected as p by a camera of focal
+;; length fx (the header says why)
+(define (stepOf [s : Splat] [p : Projected] [fx : float] [field : uint]) : float
+  (cond [(< field perturbMeanX) (max (* 1e-3 (abs (fieldValue s p field))) 1e-4)]
+        [(< field perturbParameter) 0.005]
+        [(< field (+ perturbParameter (uint 3))) (/ (* 0.005 p.depth) fx)]
+        [else (max (* 1e-3 (abs (fieldValue s p field))) 1e-3)]))
 
-;; The kind of a field, whose largest gradient sets what's negligible: 0 opacity, 1 colour, 2 mean
-(define (fieldKind [field : uint]) : uint
-  (cond [(= field perturbOpacity) (uint 0)]
-        [(< field perturbMeanX) (uint 1)]
-        [else (uint 2)]))
+;; The kinds of fields, whose largest gradient sets what's negligible. Of the projection: 0 the
+;; opacity, 1 the colour, 2 the mean. With --parameters: 0 the position, 1 the opacity logit,
+;; 2 the log-scale, 3 the quaternion, then the SH bands, 4 the DC to 7 the third, up to shDegree's.
+(define (kindCount [parameters : bool] [shDegree : uint]) : uint
+  (if parameters (+ (uint 5) (min shDegree (uint 3))) (uint 3)))
+(define (parameterKindOffset [kind : uint]) : uint
+  (cond [(= kind (uint 0)) (uint 0)] [(= kind (uint 1)) (uint 3)] [(= kind (uint 2)) (uint 4)]
+        [(= kind (uint 3)) (uint 8)] [(= kind (uint 4)) (uint 12)] [(= kind (uint 5)) (uint 15)]
+        [(= kind (uint 6)) (uint 24)] [else (uint 39)]))
+(define (fieldKind [parameters : bool] [field : uint]) : uint
+  (if parameters
+      (let* ([offset (- field perturbParameter)])
+        (cond [(< offset (uint 3)) (uint 0)] [(= offset (uint 3)) (uint 1)] [(< offset (uint 7)) (uint 2)]
+              [(< offset (uint 12)) (uint 3)] [(< offset (uint 15)) (uint 4)] [(< offset (uint 24)) (uint 5)]
+              [(< offset (uint 39)) (uint 6)] [else (uint 7)]))
+      (cond [(= field perturbOpacity) (uint 0)]
+            [(< field perturbMeanX) (uint 1)]
+            [else (uint 2)])))
 
 ;; A kind's first field and its number of fields
-(define (kindField [kind : uint]) : uint
-  (cond [(= kind (uint 0)) perturbOpacity] [(= kind (uint 1)) perturbRed] [else perturbMeanX]))
-(define (kindFields [kind : uint]) : uint
-  (cond [(= kind (uint 0)) (uint 1)] [(= kind (uint 1)) (uint 3)] [else (uint 2)]))
+(define (kindField [parameters : bool] [kind : uint]) : uint
+  (if parameters
+      (+ perturbParameter (parameterKindOffset kind))
+      (cond [(= kind (uint 0)) perturbOpacity] [(= kind (uint 1)) perturbRed] [else perturbMeanX])))
+(define (kindFields [parameters : bool] [kind : uint]) : uint
+  (if parameters
+      (- (if (= kind (uint 7)) (uint 60) (parameterKindOffset (+ kind (uint 1)))) (parameterKindOffset kind))
+      (cond [(= kind (uint 0)) (uint 1)] [(= kind (uint 1)) (uint 3)] [else (uint 2)])))
+
+;; Whether to probe a field: not an SH coefficient whose colour channel is clamped at 0 or within
+;; 0.01 of it (a step would cross the clamp, where the loss has a kink)
+(define (probed [p : Projected] [field : uint]) : bool
+  (if (>= field (+ perturbParameter (uint 12)))
+      (let* ([c (remainder (- field (+ perturbParameter (uint 12))) (uint 3))])
+        (>= (cond [(= c (uint 0)) p.colour.x] [(= c (uint 1)) p.colour.y] [else p.colour.z]) 0.01))
+      #t))
 
 ;; Whether a float is finite (false for NaN, whose comparisons are all false)
 (define (finite [x : float]) : bool (< (abs x) 1e30))
@@ -99,6 +160,7 @@
   (parameter targetG float)
   (parameter targetB float)
   (parameter finiteDifferences bool)
+  (parameter parameters bool)
   (parameter repeats uint)
   (parameter samples uint)
   (parameter multiBatch bool)
@@ -131,9 +193,8 @@
    (side uint 0)             ; 0: +h, 1: -h
    (failures uint 0)
    (negligible uint 0)       ; probes whose a and fd were both negligible
-   (checkedOpacity uint 0)   ; probes of each kind that weren't
-   (checkedColour uint 0)
-   (checkedMean uint 0)
+   (checkedProbes uint 0)    ; probes that weren't (and matched)
+   (checkedKinds uint 0)     ; the kinds with such a probe, a bit each
    (worst float 0.0)         ; the largest |a - fd| / max(|a|, |fd|)
    ;; The most entries a tile's backward walks (to its last pixel's last entry) in the
    ;; unperturbed frames, for --multi-batch
@@ -180,16 +241,18 @@
          (let* ([p (at state.probes state.index)]
                 ;; The step float rounding gives, (x + h) - (x - h), not the nominal 2h (it differs by
                 ;; up to ulp(x), about 1% for a mean past 1024 px)
-                [x (fieldValue (at state.projected p.splat) p.field)]
+                [x (fieldValue (at state.splats p.splat) (at state.projected p.splat) p.field)]
                 [fd (/ (at d lossDelta) (- (+ x p.h) (- x p.h)))]
                 [a p.analytic]
                 [scale (max (abs a) (abs fd))]
                 [error (abs (- a fd))]
                 [finiteBoth (and (finite a) (finite fd))]
                 [small (and finiteBoth (< scale (* 1e-2 p.largest)))]
-                [ok (and finiteBoth (or small (<= error (+ (* 0.02 scale) 1e-5))))]
+                [kind (fieldKind parameters p.field)]
+                ;; The quaternion's float noise (the header says why it alone)
+                [noise (if (and parameters (= kind (uint 3))) (* 2e-3 p.largest) 0.0)]
+                [ok (and finiteBoth (or small (<= error (+ (* 0.02 scale) noise 1e-5))))]
                 [counted (and ok (not small))]
-                [kind (fieldKind p.field)]
                 [next (+ state.index 1)])
            (cond
              [(not ok) (print! "grad_test: MISMATCH splat " p.splat " field " p.field " h " p.h ": analytic " a
@@ -201,9 +264,8 @@
            (with state #:index next #:side 0 #:phase (if (>= next (count state.probes)) 2 1)
                  #:failures (+ state.failures (if ok 0 1))
                  #:negligible (+ state.negligible (if small 1 0))
-                 #:checkedOpacity (+ state.checkedOpacity (if (and counted (= kind 0)) 1 0))
-                 #:checkedColour (+ state.checkedColour (if (and counted (= kind 1)) 1 0))
-                 #:checkedMean (+ state.checkedMean (if (and counted (= kind 2)) 1 0))
+                 #:checkedProbes (+ state.checkedProbes (if counted 1 0))
+                 #:checkedKinds (bitor state.checkedKinds (if counted (shl (uint 1) kind) (uint 0)))
                  #:worst (if (and ok (not small)) (max state.worst (/ error (max scale 1e-30))) state.worst)))])))
   (on (frame dt)
     (cond
@@ -215,10 +277,12 @@
          state)]
       [(and finiteDifferences (= state.phase 2))
        (begin
-         (print! "grad_test: " (count state.probes) " finite differences (" state.checkedOpacity " opacity, "
-                 state.checkedColour " colour, " state.checkedMean " mean checked, " state.negligible
-                 " negligible), " state.failures " mismatches, the largest relative difference " state.worst)
-         (if (and (= state.failures 0) (> state.checkedOpacity 0) (> state.checkedColour 0) (> state.checkedMean 0))
+         (print! "grad_test: " (count state.probes) " finite differences (" state.checkedProbes " checked, "
+                 state.negligible " negligible; kinds checked " state.checkedKinds " of "
+                 (- (shl (uint 1) (kindCount parameters shDegree)) (uint 1)) "), " state.failures
+                 " mismatches, the largest relative difference " state.worst)
+         (if (and (= state.failures 0)
+                  (= state.checkedKinds (- (shl (uint 1) (kindCount parameters shDegree)) (uint 1))))
              (quit!)
              (begin
                (print! "grad_test: FAILED, mismatches or a kind without a gradient that isn't negligible")
@@ -226,7 +290,8 @@
          state)]
       [(and finiteDifferences (= state.phase 0))
        (if (and (>= state.baseFrames 2) (> (count state.gradients) 0)
-                (= (count state.projected) (count state.gradients)) (> (count state.splats) 0)
+                (= (count state.projected) (count state.gradients))
+                (= (count state.parameterGradients) (count state.gradients)) (> (count state.splats) 0)
                 (> (count state.cameras) 0) (> (count state.losses) 0))
            (let* ([g state.gradients]
                   [p state.projected]
@@ -235,22 +300,31 @@
                                   state.losses cameraIndex shDegree (vec3 backgroundR backgroundG backgroundB) (vec3 targetR targetG targetB) l1 #f)]
                   [visible (collect ([s (range (uint 0) (count g))]) s #:when (> (.tileCount (at p s)) 0))]
                   [n (count visible)]
+                  [pg state.parameterGradients]
+                  [sp state.splats]
+                  [fx (.x (.intrinsics (at state.cameras cameraIndex)))]
+                  [kinds (kindCount parameters shDegree)]
                   ;; The largest |gradient| of each kind among the visible splats
-                  [(o c m)
-                   (fold ([o 0.0] [c 0.0] [m 0.0]) ([j (range (uint 0) n)] [f (range (uint 1) (uint 7))])
-                     (let* ([v (abs (fieldGradient (at g (at visible j)) f))]
-                            [k (fieldKind f)])
-                       (values (if (= k 0) (max o v) o) (if (= k 1) (max c v) c) (if (= k 2) (max m v) m))))]
+                  [largest (collect ([kind (range (uint 0) kinds)])
+                             (fold ([m 0.0]) ([j (range (uint 0) n)] [f (range (uint 0) (kindFields parameters kind))])
+                               (let* ([s (at visible j)])
+                                 (max m (abs (fieldGradient (at g s) (at pg s) (+ (kindField parameters kind) f)))))))]
                   ;; Of each kind, its n x kindFields fields (splat by splat), all of them or samples
-                  ;; spread evenly
-                  [probes (collect ([kind (range (uint 0) (uint 3))] [k (range (uint 0) samples)])
-                            (let* ([total (* n (kindFields kind))]
+                  ;; spread evenly, but those probed leaves out
+                  [probes (collect ([kind (range (uint 0) kinds)]
+                                    [k (range (uint 0) (min samples (* n (kindFields parameters kind))))])
+                            (let* ([fields (kindFields parameters kind)]
+                                   [total (* n fields)]
                                    [i (if (<= total samples) k (/ (* k total) samples))]
-                                   [s (at visible (/ i (kindFields kind)))]
-                                   [f (+ (kindField kind) (remainder i (kindFields kind)))])
-                              (Probe s f (fieldGradient (at g s) f) (stepOf (at p s) f)
-                                     (cond [(= kind (uint 0)) o] [(= kind (uint 1)) c] [else m])))
-                            #:when (< k (* n (kindFields kind))))])
+                                   [s (at visible (/ i fields))]
+                                   [f (+ (kindField parameters kind) (remainder i fields))])
+                              (Probe s f (fieldGradient (at g s) (at pg s) f) (stepOf (at sp s) (at p s) fx f)
+                                     (at largest kind)))
+                            #:when (let* ([fields (kindFields parameters kind)]
+                                          [total (* n fields)]
+                                          [i (if (<= total samples) k (/ (* k total) samples))]
+                                          [s (at visible (/ i fields))])
+                                     (probed (at p s) (+ (kindField parameters kind) (remainder i fields)))))])
              (if checked
                  (begin
                    (print! "grad_test: the deepest tile's backward walks " state.deepestTile " entries")
@@ -346,9 +420,11 @@
   (option targetG "--target-g" "the oracle's constant target's green" #:default 0.0)
   (option targetB "--target-b" "the oracle's constant target's blue" #:default 0.0)
   (flag finiteDifferences "--finite-differences" "check by central differences on the GPU instead")
+  (flag parameters "--parameters"
+        "with --finite-differences, probe the splats' parameters (position, opacity logit, log-scale, quaternion, SH bands) instead of their projections")
   (option repeats "--repeats" "how many frames after the checked one must give the same gradients"
           #:default 3 #:range (1 64))
-  (option samples "--samples" "with --finite-differences, the most fields of each kind (opacity, colour, mean) to probe"
+  (option samples "--samples" "with --finite-differences, the most fields of each kind (opacity, colour, mean; or with --parameters each parameter group and SH band) to probe"
           #:default 32 #:range (1 1024))
   (flag multiBatch "--multi-batch" "with --finite-differences, fail unless a tile's backward takes more than one batch (128 entries)")
   (flag stops "--stops" "with --finite-differences, fail unless a pixel stops at T < 1e-4"))

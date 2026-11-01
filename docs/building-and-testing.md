@@ -124,20 +124,31 @@ differences:
   `projectSplat` (general rotations and cameras, SH degrees 1 to 3, the clamps).
 - **GPU finite differences**, the plan's rule: the smooth L2 loss against a fixed target unlike
   the render (`scenes.py` writes a sin/cos pattern). The probes are the visible splats' opacity,
-  colour (standing for SH DC) and 2D mean (standing for position: the preprocess chain's own check
-  is still to come), chosen without looking at the analytic gradients, so a gradient wrongly 0 or
-  small is probed too: of each kind, every field, or `--samples` (default 32) spread evenly over
-  them on a bigger scene. Central differences with h = 1e-3 of the value (at least 1e-4) for the
-  opacity and colour, and a fixed 0.005 px for the mean (a step relative to a pixel position means
-  nothing, and 0.05 px left a few % of truncation error on S3's smaller splats). A probe passes
-  when the analytic gradient and the FD are both finite and |analytic − FD| ≤
-  2e-2·max(|analytic|, |FD|) + 1e-5, or both are negligible. Each kind needs at least one probe
-  that isn't negligible. The perturbation is to the projection, one frame per side, and the
-  loss's change between the sides is summed pixel by pixel by a `reduce`.
+  colour and 2D mean, or with `--parameters` their parameters (the position, the opacity logit,
+  the log-scale, the quaternion, and each SH band up to the scene's degree, the DC on its own),
+  chosen without looking at the analytic gradients, so a gradient wrongly 0 or small is probed
+  too: of each kind, every field, or `--samples` (default 32) spread evenly over them on a bigger
+  scene. Central differences with h = 1e-3 of the value (at least 1e-4) for the opacity and
+  colour, and a fixed 0.005 px for the mean (a step relative to a pixel position means nothing,
+  and 0.05 px left a few % of truncation error on S3's smaller splats); for the parameters 1e-3
+  of the value (at least 1e-3), and for the position 0.005·depth/fx, which moves the 2D mean
+  about 0.005 px. An SH coefficient whose colour channel is within 0.01 of its clamp at 0 isn't
+  probed (the step would cross the kink). A probe passes when the analytic gradient and the FD
+  are both finite and |analytic − FD| ≤ 2e-2·max(|analytic|, |FD|) + 1e-5 (for the quaternion,
+  + 2e-3·largest), or both are negligible. Each kind needs at least
+  one probe that isn't negligible. The perturbation is to the projection, or with `--parameters`
+  to the splat, projected again (keeping its depth and tiles, so the sort and the entries stay
+  the same), one frame per side, and the loss's change between the sides is summed pixel by pixel
+  by a `reduce`.
   - Negligible: max(|analytic|, |FD|) below 1e-2 of the largest analytic gradient of its kind
-    (opacity, colour, mean) among the visible splats. Summing the per-pixel changes in float
-    leaves an absolute error of about 1e-3 of the largest gradient, which fails the rule's relative
-    bound on smaller gradients.
+    (opacity, colour, mean, or with `--parameters` each parameter kind above) among the visible
+    splats. Summing the per-pixel changes in float leaves an absolute error of about 1e-3 of the
+    largest gradient, which fails the rule's relative bound on smaller gradients. The
+    quaternion's mid-sized gradients sit in that noise (S2's 0.47 was off by 0.03 beside the
+    kind's largest, 21), hence its 2e-3·largest; a larger step trades the noise for truncation
+    error and for more flipped, excluded pixels (at 1e-2 of |q| the FD was off by 0.05: the
+    rotation of an anisotropic splat isn't close to linear over it). The other kinds keep the
+    plain rule.
   - The loss jumps where a splat's α crosses 1/255 (a jump adds up to about 4 to a difference) and
     where the stop at T < 1e-4 moves to another entry, so pixels where either flips between the
     two sides are left out ([architecture.md](architecture.md#train-graph)). Without the first, 12
@@ -146,7 +157,8 @@ differences:
     clamped at 0.99, whose derivative is exactly 0); S1's `stack`, with `--stops` (fails unless a
     pixel stops at T < 1e-4, counted on the CPU from the projections); S3's cameras 0 and 24 with
     `--samples 24` and `--multi-batch` (fails unless a tile's backward walks more than one batch,
-    from `backwardRanges`).
+    from `backwardRanges`). With `--parameters`: S2's two cameras (SH degree 3, so every band),
+    and S3's camera 0 with `--samples 24` (with 8, every probe of the third band was negligible).
 - Every run checks that the gradients are finite and prints a hash; test.sh compares two runs'
   hashes. The runs without `--finite-differences` also check that the next `--repeats` frames
   give the same bits.

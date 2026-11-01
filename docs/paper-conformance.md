@@ -137,6 +137,8 @@ pass that is wrong but consistent. Four checks together cover it:
   (`tools/tests/test_colmap_reprojection.py`);
 - GPU finite differences of the whole forward pass, on tiny synthetic scenes: central differences
   with h = 1e-3 relative (1e-4 absolute floor) on a smooth L2 test loss, passing when
-  |analytic − FD| ≤ 2e-2·max(|analytic|, |FD|) + 1e-5, skipping parameters with negligible gradient;
+  |analytic − FD| ≤ 2e-2·max(|analytic|, |FD|) + 1e-5 (plus, for the quaternion, 2e-3 of its
+  largest gradient: the float noise of summing the pixels' changes), skipping parameters with
+  negligible gradient, for the projection's fields and every parameter group and SH band;
 - re-fitting a synthetic scene of known Gaussians, then a PSNR report (no target) on the cs5330
   scene.

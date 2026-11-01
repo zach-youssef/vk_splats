@@ -329,7 +329,12 @@ the projections and `backwardRanges`, and the splats and cameras once.
   loudly at the cap.
 - **Finite differences** (`finiteDifferences`, for grad_test): `Perturb` adds `perturbDelta` to
   one field (`perturbField`: opacity, a colour channel, the mean's x or y) of one splat's
-  projection after the preprocess, so the tiles stay the same. A probe k runs its +h frame
+  projection after the preprocess, so the tiles stay the same; or, with `perturbField` =
+  `perturbParameter` plus a float offset in `Splat`, to one of the splat's parameters, projecting
+  it again (`projectSplatPerturbed`, which also takes an SH coefficient) and keeping the new
+  mean, conic, opacity and colour but the old depth and tiles, so the sort and the entries don't
+  change (nor would the analytic gradients see them change). A re-projection that culls the splat
+  keeps the old projection. A probe k runs its +h frame
   (`probe` 2k + 1), then its −h frame (2k + 2); probe 0 is unperturbed. `LossDelta` keeps the +h
   frame's per-pixel losses and `lastEntries` (`plusLosses`, `plusLasts`, `#:frames shared`), and
   the −h frame writes each pixel's plus − minus, reduced into `losses[2]`: the difference is
@@ -338,7 +343,8 @@ the projections and `backwardRanges`, and the splats and cameras once.
   between the sides counts nothing, since the loss jumps there and the analytic gradient is the
   derivative between the jumps: the perturbed splat's blend (α against 1/255, the exponent's
   sign), or the stop at T < 1e-4 moving to another entry (any splat's: the pixel's
-  `lastEntries` differ).
+  `lastEntries` differ). The +h frame keeps the perturbed projection too (`plusProjected`, one
+  element), so the −h frame compares the splat's blend decision on both sides' projections.
 - **Tests** (`programs/grad_test`): with `--oracle` (S1's `gradient` variant: one splat covering
   the image, a constant target), the GPU's projection gradients and loss must be within 1e-3
   relative of `projected_gradients` (L2 and L1) on the oracle's projection. With
@@ -346,7 +352,8 @@ the projections and `backwardRanges`, and the splats and cameras once.
   ([building-and-testing.md](building-and-testing.md#gradient-checks)) where the oracle can't
   reach: S2's cameras (cam_1 is 80×48, non-square), S1's `one-splat-clamped` (the clamp's
   derivative), S1's `stack` (the stop at T < 1e-4) and S3's cameras 0 and 24 (tiles past one
-  backward batch). The S2 L1 run with `--max-groups 3` (so the grid-stride loops go round) runs
+  backward batch); with `--parameters`, the parameters' gradients the same way on S2's cameras and
+  S3's camera 0. The S2 L1 run with `--max-groups 3` (so the grid-stride loops go round) runs
   twice, and the hashes are compared. Every run checks the gradients are finite; the others also
   check the next frames' gradients are the same bit for bit.
 

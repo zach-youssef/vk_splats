@@ -6,6 +6,11 @@
 #     S1's one-splat-clamped (alpha's clamp at 0.99) and stack (the stop at T < 1e-4, which
 #     --stops requires); S3's cameras 0 and 24 (2000 splats: tiles past one backward batch, which
 #     --multi-batch requires);
+#   - by finite differences through the splats' parameters (--parameters: the position, the
+#     opacity logit, the log-scale, the quaternion and every SH band of degree 3, the DC included),
+#     each splat perturbed and projected again: on S2's cameras 0 and 1, and a subset of S3's
+#     camera 0 (--samples 24 of each kind: fewer can
+#     leave the third band's all negligible);
 #   - S2's camera 0 with the L1 loss and the 1D dispatches capped at three workgroups (the
 #     grid-stride loops go round), twice, with the hashes compared (deterministic across runs, not
 #     only across frames).
@@ -75,6 +80,11 @@ for camera in 0 24; do
     run "$out/s3" $camera "s3-camera-$camera-fd" 4000 --finite-differences --samples 24 --multi-batch \
         --capacity 1000000 > /dev/null
 done
+for camera in 0 1; do
+    run "$out/s2" $camera "s2-camera-$camera-parameters" 6000 --finite-differences --parameters > /dev/null
+done
+run "$out/s3" 0 s3-camera-0-parameters 8000 --finite-differences --parameters --samples 24 \
+    --capacity 1000000 > /dev/null
 first=$(run "$out/s2" 0 s2-l1 16 --l1 --max-groups 3)
 second=$(run "$out/s2" 0 s2-l1-again 16 --l1 --max-groups 3)
 if [ -z "$first" ] || [ "$first" != "$second" ]; then
