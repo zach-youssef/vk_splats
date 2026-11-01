@@ -1,0 +1,223 @@
+;; The backward preprocess's math (Kerbl et al. 2023, Sec. 5 and Appendix A): a splat's gradients
+;; with respect to its parameters (position, opacity logit, log-scale, quaternion, SH coefficients)
+;; from its gradients with respect to its projection (the 2D mean, the conic, the activated opacity
+;; and the colour: the backward rasterize's, summed per splat), through the conic's inverse, the
+;; EWA projection J W Sigma W^T J^T (Eq. 5), Sigma = M M^T with M = R S (Eq. 6, Appendix A), the
+;; quaternion's rotation (Eq. 10, normalized first), the sigmoid and exponential activations, the
+;; pinhole projection of the mean, and the SH colour's coefficients and view direction (degrees
+;; 0-3). It recomputes the forward pass (lib/splat_math.zgal's projectSplat) rather than storing it.
+;; Like the splat math it's pure, so ZGAL compiles it to C++ too, and tests/cpp/splat_backward_test.cpp
+;; checks it against the closed-form oracle and central differences of projectSplat.
+;; lib/train_graph.zgal imports it.
+;;
+;; Where the forward pass isn't differentiable, the gradients are the one-sided derivative a step
+;; inside the smooth region gives: the Jacobian's clamp of x/z and y/z (frustumGuard) passes no
+;; gradient to x or y where it holds, and the colour's clamp at 0 passes none where it holds
+;; (reference code: the colour's; its Jacobian keeps the unclamped z derivative, a departure listed in
+;; docs/paper-conformance.md).
+
+(import "splat_math.zgal")
+
+;; A splat's gradients with respect to its projection (48 bytes): the sum of its entries'
+(struct ProjectedGradient
+  (mean vec2)       ; dL/dmean, per pixel of shift
+  (conic vec3)      ; dL/d(a, b, c) of the conic [[a, b], [b, c]]: b counts both off-diagonal entries
+  (opacity float)   ; dL/dsigmoid(opacity)
+  (colour vec3))    ; dL/dcolour, the colour after SH evaluation and its clamp at 0
+
+;; A splat's gradients with respect to its parameters but the SH coefficients, and what those
+;; take (shGradient)
+(struct SplatGradient
+  (position vec3)   ; dL/dposition, world space
+  (opacity float)   ; dL/d(the opacity logit)
+  (logScale vec3)   ; dL/dlogScale
+  (rotation vec4)   ; dL/d(the quaternion as stored, before its normalization)
+  (colour vec3)     ; dL/d(the SH sum), the colour's gradient where its clamp at 0 doesn't hold
+  (direction vec3)) ; the unit view direction the colour was evaluated in
+
+;; The coefficients SH degrees 0 to degree use: (degree + 1)^2, at most 16
+(define (shCoefficientCount [degree : uint]) : uint
+  (let* ([d (+ (min degree (uint 3)) (uint 1))])
+    (* d d)))
+
+;; The real SH basis function k (0-15) at unit direction d, in the reference code's order and signs
+;; (splat_math.zgal's shSumPerturbed sums coefficient k times this)
+(define (shBasis [d : vec3] [k : uint]) : float
+  (let* ([x d.x]
+         [y d.y]
+         [z d.z]
+         [xx (* x x)]
+         [yy (* y y)]
+         [zz (* z z)])
+    (cond
+      [(= k (uint 0)) SH_C0]
+      [(= k (uint 1)) (* (- SH_C1) y)]
+      [(= k (uint 2)) (* SH_C1 z)]
+      [(= k (uint 3)) (* (- SH_C1) x)]
+      [(= k (uint 4)) (* SH_C2_0 x y)]
+      [(= k (uint 5)) (* SH_C2_1 y z)]
+      [(= k (uint 6)) (* SH_C2_2 (- (* 2.0 zz) xx yy))]
+      [(= k (uint 7)) (* SH_C2_3 x z)]
+      [(= k (uint 8)) (* SH_C2_4 (- xx yy))]
+      [(= k (uint 9)) (* SH_C3_0 y (- (* 3.0 xx) yy))]
+      [(= k (uint 10)) (* SH_C3_1 x y z)]
+      [(= k (uint 11)) (* SH_C3_2 y (- (* 4.0 zz) xx yy))]
+      [(= k (uint 12)) (* SH_C3_3 z (- (* 2.0 zz) (* 3.0 xx) (* 3.0 yy)))]
+      [(= k (uint 13)) (* SH_C3_4 x (- (* 4.0 zz) xx yy))]
+      [(= k (uint 14)) (* SH_C3_5 z (- xx yy))]
+      [else (* SH_C3_6 x (- xx (* 3.0 yy)))])))
+
+;; shBasis's gradient with respect to d (as a function on all of R^3, the polynomial's)
+(define (shBasisGradient [d : vec3] [k : uint]) : vec3
+  (let* ([x d.x]
+         [y d.y]
+         [z d.z]
+         [xx (* x x)]
+         [yy (* y y)]
+         [zz (* z z)])
+    (cond
+      [(= k (uint 0)) (vec3 0.0)]
+      [(= k (uint 1)) (vec3 0.0 (- SH_C1) 0.0)]
+      [(= k (uint 2)) (vec3 0.0 0.0 SH_C1)]
+      [(= k (uint 3)) (vec3 (- SH_C1) 0.0 0.0)]
+      [(= k (uint 4)) (* SH_C2_0 (vec3 y x 0.0))]
+      [(= k (uint 5)) (* SH_C2_1 (vec3 0.0 z y))]
+      [(= k (uint 6)) (* SH_C2_2 (vec3 (* -2.0 x) (* -2.0 y) (* 4.0 z)))]
+      [(= k (uint 7)) (* SH_C2_3 (vec3 z 0.0 x))]
+      [(= k (uint 8)) (* SH_C2_4 (vec3 (* 2.0 x) (* -2.0 y) 0.0))]
+      [(= k (uint 9)) (* SH_C3_0 (vec3 (* 6.0 x y) (- (* 3.0 xx) (* 3.0 yy)) 0.0))]
+      [(= k (uint 10)) (* SH_C3_1 (vec3 (* y z) (* x z) (* x y)))]
+      [(= k (uint 11)) (* SH_C3_2 (vec3 (* -2.0 x y) (- (* 4.0 zz) xx (* 3.0 yy)) (* 8.0 y z)))]
+      [(= k (uint 12)) (* SH_C3_3 (vec3 (* -6.0 x z) (* -6.0 y z) (- (* 6.0 zz) (* 3.0 xx) (* 3.0 yy))))]
+      [(= k (uint 13)) (* SH_C3_4 (vec3 (- (* 4.0 zz) (* 3.0 xx) yy) (* -2.0 x y) (* 8.0 x z)))]
+      [(= k (uint 14)) (* SH_C3_5 (vec3 (* 2.0 x z) (* -2.0 y z) (- xx yy)))]
+      [else (* SH_C3_6 (vec3 (- (* 3.0 xx) (* 3.0 yy)) (* -6.0 x y) 0.0))])))
+
+;; dL/d(SH coefficient k's RGB): Y_k(d) dL/d(the SH sum), for the coefficients of degrees 0 to
+;; degree; 0 for the higher bands, which the colour ignores
+(define (shGradient [g : SplatGradient] [k : uint] [degree : uint]) : vec3
+  (if (< k (shCoefficientCount degree)) (* (shBasis g.direction k) g.colour) (vec3 0.0)))
+
+;; G v for the gradient G = dL/dSigma (world space, symmetric) of a = j0 . Sigma j0 + 0.3,
+;; b = j0 . Sigma j1 and c = j1 . Sigma j1 + 0.3 with gradients gabc = (dL/da, dL/db, dL/dc):
+;; G = da j0 j0^T + db / 2 (j0 j1^T + j1 j0^T) + dc j1 j1^T
+(define (covarianceGradientTimes [j0 : vec3] [j1 : vec3] [gabc : vec3] [v : vec3]) : vec3
+  (let* ([p0 (dot j0 v)]
+         [p1 (dot j1 v)])
+    (+ (* j0 (+ (* gabc.x p0) (* 0.5 gabc.y p1)))
+       (* j1 (+ (* 0.5 gabc.y p0) (* gabc.z p1))))))
+
+;; A splat's gradients with respect to its parameters, from g, its gradients with respect to its
+;; projection by cam (projectSplat's, with colour from SH degrees 0 to shDegree); the splat must be
+;; one projectSplat doesn't cull. With J's rows through W, j0 and j1 (splat_math.zgal's
+;; covariance2d), and the 2D covariance (a, b, c), det = a c - b^2:
+;;   - the conic (c, -b, a) / det: dL/da = (-c^2 gA + b c gB + (det - a c) gC) / det^2,
+;;     dL/db = (2 b c gA - (det + 2 b^2) gB + 2 a b gC) / det^2,
+;;     dL/dc = ((det - a c) gA + a b gB - a^2 gC) / det^2 (b and gB counting both entries);
+;;   - Sigma (Appendix A): dL/dSigma = G (covarianceGradientTimes), dL/dM = 2 G M with M = R S, so
+;;     with R's columns r_i and s_i = exp(logScale_i): dL/dlogScale_i = 2 s_i^2 r_i . G r_i and
+;;     dL/dr_i = 2 s_i^2 G r_i, then through Eq. 10's R(q / |q|) to the normalized quaternion n,
+;;     and dL/dq = (dL/dn - n (n . dL/dn)) / |q|;
+;;   - J (the camera-space rows (fx / z, 0, -fx u / z) and (0, fy / z, -fy v / z), u = x/z and
+;;     v = y/z clamped): dL/dJ's rows, W (2 da Sigma j0 + db Sigma j1) and
+;;     W (db Sigma j0 + 2 dc Sigma j1), to the camera-space mean t, with u's and v's derivatives 0
+;;     where the clamp holds;
+;;   - the mean (fx x / z + cx, fy y / z + cy) to t, and t = W p + T to p;
+;;   - the colour max(sum + 0.5, 0): dL/dsum is dL/dcolour where the clamp doesn't hold (from below,
+;;     at 0 inclusive, as the reference code's), dL/dsh_k = Y_k(d) dL/dsum, and the view direction
+;;     d = (p - centre) / |p - centre|: dL/dd = sum_k (sh_k . dL/dsum) grad Y_k(d), to p through
+;;     (dL/dd - d (d . dL/dd)) / |p - centre|;
+;;   - the opacity sigmoid(o): dL/do = dL/dsigmoid sigmoid (1 - sigmoid).
+(define (preprocessBackward [s : Splat] [cam : Camera] [shDegree : uint] [g : ProjectedGradient]) : SplatGradient
+  (let* ([w (mat3 cam.worldToCamera)]
+         [wt (transpose w)]
+         [t (toCamera cam.worldToCamera s.position)]
+         [focal cam.intrinsics.xy]
+         [centre cam.intrinsics.zw]
+         [size (vec2 cam.size)]
+         ;; covariance2d's clamp
+         [margin (* (* 0.5 (- frustumGuard 1.0)) size)]
+         [lo (/ (- (- centre) margin) focal)]
+         [hi (/ (+ (- size centre) margin) focal)]
+         [ratio (/ t.xy t.z)]
+         [uv (clamp ratio lo hi)]
+         [free (vec2 (if (and (>= ratio.x lo.x) (<= ratio.x hi.x)) 1.0 0.0)
+                     (if (and (>= ratio.y lo.y) (<= ratio.y hi.y)) 1.0 0.0))]
+         [iz (/ 1.0 t.z)]
+         [iz2 (* iz iz)]
+         [j0 (* wt (vec3 (* focal.x iz) 0.0 (- (* focal.x uv.x iz))))]
+         [j1 (* wt (vec3 0.0 (* focal.y iz) (- (* focal.y uv.y iz))))]
+         ;; Sigma = M M^T, M = R S
+         [r (quatToMatrix s.rotation)]
+         [r0 (* r (vec3 1.0 0.0 0.0))]
+         [r1 (* r (vec3 0.0 1.0 0.0))]
+         [r2 (* r (vec3 0.0 0.0 1.0))]
+         [scale (exp s.logScale)]
+         [m (* r (mat3 (vec3 scale.x 0.0 0.0) (vec3 0.0 scale.y 0.0) (vec3 0.0 0.0 scale.z)))]
+         [sigma (* m (transpose m))]
+         [s0 (* sigma j0)]
+         [s1 (* sigma j1)]
+         [a (+ (dot j0 s0) lowPass)]
+         [b (dot j0 s1)]
+         [c (+ (dot j1 s1) lowPass)]
+         [det (- (* a c) (* b b))]
+         [id2 (/ 1.0 (* det det))]
+         [gA g.conic.x]
+         [gB g.conic.y]
+         [gC g.conic.z]
+         [gabc (* id2 (vec3 (+ (* (- (* c c)) gA) (* b c gB) (* (- det (* a c)) gC))
+                            (+ (* 2.0 b c gA) (- (* (+ det (* 2.0 b b)) gB)) (* 2.0 a b gC))
+                            (+ (* (- det (* a c)) gA) (* a b gB) (- (* a a gC)))))]
+         ;; The scales and R's columns
+         [gr0 (covarianceGradientTimes j0 j1 gabc r0)]
+         [gr1 (covarianceGradientTimes j0 j1 gabc r1)]
+         [gr2 (covarianceGradientTimes j0 j1 gabc r2)]
+         [s2 (* scale scale)]
+         [dLogScale (* 2.0 s2 (vec3 (dot r0 gr0) (dot r1 gr1) (dot r2 gr2)))]
+         [d0 (* 2.0 s2.x gr0)]  ; dL/dR's columns: D[row][col] = d_col[row]
+         [d1 (* 2.0 s2.y gr1)]
+         [d2 (* 2.0 s2.z gr2)]
+         ;; Eq. 10's R(n) for n = (w, x, y, z), then the normalization
+         [n (normalize s.rotation)]
+         [qw n.x]
+         [qx n.y]
+         [qy n.z]
+         [qz n.w]
+         [dn (* 2.0 (vec4 (+ (* qz (- d0.y d1.x)) (* qy (- d2.x d0.z)) (* qx (- d1.z d2.y)))
+                          (- (+ (* qy (+ d0.y d1.x)) (* qz (+ d0.z d2.x)) (* qw (- d1.z d2.y)))
+                             (* 2.0 qx (+ d1.y d2.z)))
+                          (- (+ (* qx (+ d0.y d1.x)) (* qz (+ d1.z d2.y)) (* qw (- d2.x d0.z)))
+                             (* 2.0 qy (+ d0.x d2.z)))
+                          (- (+ (* qx (+ d0.z d2.x)) (* qy (+ d1.z d2.y)) (* qw (- d0.y d1.x)))
+                             (* 2.0 qz (+ d0.x d1.y)))))]
+         [dRotation (/ (- dn (* n (dot n dn))) (length s.rotation))]
+         ;; J's rows to t, in camera space
+         [gj0 (* w (+ (* 2.0 gabc.x s0) (* gabc.y s1)))]
+         [gj1 (* w (+ (* gabc.y s0) (* 2.0 gabc.z s1)))]
+         [fx focal.x]
+         [fy focal.y]
+         [dt (vec3 (- (* g.mean.x fx iz) (* gj0.z fx iz2 free.x))
+                   (- (* g.mean.y fy iz) (* gj1.z fy iz2 free.y))
+                   (+ (- (* (+ (* g.mean.x fx t.x) (* g.mean.y fy t.y)) iz2))
+                      (- (* fx iz2 gj0.x))
+                      (- (* fy iz2 gj1.y))
+                      (* gj0.z fx uv.x iz2 (+ 1.0 free.x))
+                      (* gj1.z fy uv.y iz2 (+ 1.0 free.y))))]
+         ;; The colour
+         [v (- s.position cam.center)]
+         [dir (normalize v)]
+         [shSum (shSumPerturbed s.sh dir shDegree (uint 48) 0.0)]
+         [dSum (vec3 (if (>= (+ shSum.x 0.5) 0.0) g.colour.x 0.0) (if (>= (+ shSum.y 0.5) 0.0) g.colour.y 0.0)
+                     (if (>= (+ shSum.z 0.5) 0.0) g.colour.z 0.0))]
+         [dDir (fold ([acc (vec3 0.0)]) ([k (range (uint 0) (shCoefficientCount shDegree))])
+                 (+ acc (* (dot (shCoefficient s.sh k) dSum) (shBasisGradient dir k))))]
+         [dPosition (+ (* wt dt) (/ (- dDir (* dir (dot dir dDir))) (length v)))]
+         [alpha (sigmoid s.opacity)])
+    (SplatGradient dPosition (* g.opacity alpha (- 1.0 alpha)) dLogScale dRotation dSum dir)))
+
+;; The densification's statistic for a splat's 2D-mean gradient dL/dmean (per pixel) in an image of
+;; size pixels: its norm in normalized device coordinates, |(W / 2 dL/dmean.x, H / 2 dL/dmean.y)|
+;; (reference code: the norm of the screen-space points' gradient, which its rasterizer gives per NDC
+;; unit; Sec. 5.2's "view-space positional gradients")
+(define (densifyNorm [meanGradient : vec2] [size : uvec2]) : float
+  (length (* (* 0.5 (vec2 size)) meanGradient)))

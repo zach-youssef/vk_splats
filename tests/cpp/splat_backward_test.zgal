@@ -1,0 +1,22 @@
+;; The backward preprocess's math for its C++ test (splat_backward_test.cpp includes the generated
+;; splat_backward_test.zgal.h, whose namespace is this file's name). The probe material calls the
+;; module's functions, so the build also compiles them to GLSL (glslc checks them); the test never
+;; runs it.
+(import "../../lib/splat_backward.zgal")
+
+(compute-material SplatBackwardProbe
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat))
+   (cameras (buffer-array Camera))
+   (gradients (buffer-array ProjectedGradient))
+   (results (buffer-array SplatGradient))
+   (norms (buffer-array float)))
+  (push (count uint) (shDegree uint))
+  (compute
+   (let* ([i globalInvocationId.x])
+     (when (< i count)
+       (let* ([cam (at cameras 0)]
+              [g (preprocessBackward (at splats i) cam shDegree (at gradients i))])
+         (write! (at results i) g)
+         (write! (at norms i) (+ (densifyNorm g.position.xy cam.size) (.x (shGradient g (uint 15) shDegree)))))))))

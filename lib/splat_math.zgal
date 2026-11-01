@@ -192,43 +192,59 @@
 (define (shCoefficient [sh : (array float 48)] [k : uint]) : vec3
   (vec3 (at sh (* 3 k)) (at sh (+ (* 3 k) 1)) (at sh (+ (* 3 k) 2))))
 
-;; The colour of SH coefficients of degree 0 to `degree` (at most 3; the higher bands are ignored)
-;; seen from unit direction d, from the camera to the splat: max(sum_k sh_k Y_k(d) + 0.5, 0)
-;; (reference code's computeColorFromSH: the basis and its signs, the +0.5 that centres a zero
-;; coefficient on grey, and the clamp from below only)
-(define (shColour [sh : (array float 48)] [d : vec3] [degree : uint]) : vec3
+;; Coefficient k's RGB with delta added to sh[index] when it's one of k's (with index 48, every
+;; coefficient gets 0.0 added, which leaves its value as it is)
+(define (shCoefficientPlus [sh : (array float 48)] [k : uint] [index : uint] [delta : float]) : vec3
+  (+ (shCoefficient sh k)
+     (vec3 (if (= index (* 3 k)) delta 0.0) (if (= index (+ (* 3 k) 1)) delta 0.0)
+           (if (= index (+ (* 3 k) 2)) delta 0.0))))
+
+;; The SH sum before the +0.5 and the clamp, sum_k sh_k Y_k(d), of degrees 0 to `degree` (at most
+;; 3; the higher bands are ignored) seen from unit direction d, with delta added to sh[index]
+;; (index 48: none; the finite differences' perturbation of a coefficient)
+(define (shSumPerturbed [sh : (array float 48)] [d : vec3] [degree : uint] [index : uint] [delta : float]) : vec3
   (let* ([x d.x]
          [y d.y]
          [z d.z]
          [xx (* x x)]
          [yy (* y y)]
          [zz (* z z)]
-         [r0 (* SH_C0 (shCoefficient sh 0))]
+         [r0 (* SH_C0 (shCoefficientPlus sh 0 index delta))]
          [r1 (if (>= degree 1)
                  (+ r0
-                    (* (* (- SH_C1) y) (shCoefficient sh 1))
-                    (* (* SH_C1 z) (shCoefficient sh 2))
-                    (* (* (- SH_C1) x) (shCoefficient sh 3)))
+                    (* (* (- SH_C1) y) (shCoefficientPlus sh 1 index delta))
+                    (* (* SH_C1 z) (shCoefficientPlus sh 2 index delta))
+                    (* (* (- SH_C1) x) (shCoefficientPlus sh 3 index delta)))
                  r0)]
          [r2 (if (>= degree 2)
                  (+ r1
-                    (* (* SH_C2_0 (* x y)) (shCoefficient sh 4))
-                    (* (* SH_C2_1 (* y z)) (shCoefficient sh 5))
-                    (* (* SH_C2_2 (- (* 2.0 zz) xx yy)) (shCoefficient sh 6))
-                    (* (* SH_C2_3 (* x z)) (shCoefficient sh 7))
-                    (* (* SH_C2_4 (- xx yy)) (shCoefficient sh 8)))
-                 r1)]
-         [r3 (if (>= degree 3)
-                 (+ r2
-                    (* (* SH_C3_0 y (- (* 3.0 xx) yy)) (shCoefficient sh 9))
-                    (* (* SH_C3_1 x y z) (shCoefficient sh 10))
-                    (* (* SH_C3_2 y (- (* 4.0 zz) xx yy)) (shCoefficient sh 11))
-                    (* (* SH_C3_3 z (- (* 2.0 zz) (* 3.0 xx) (* 3.0 yy))) (shCoefficient sh 12))
-                    (* (* SH_C3_4 x (- (* 4.0 zz) xx yy)) (shCoefficient sh 13))
-                    (* (* SH_C3_5 z (- xx yy)) (shCoefficient sh 14))
-                    (* (* SH_C3_6 x (- xx (* 3.0 yy))) (shCoefficient sh 15)))
-                 r2)])
-    (max (+ r3 0.5) (vec3 0.0))))
+                    (* (* SH_C2_0 (* x y)) (shCoefficientPlus sh 4 index delta))
+                    (* (* SH_C2_1 (* y z)) (shCoefficientPlus sh 5 index delta))
+                    (* (* SH_C2_2 (- (* 2.0 zz) xx yy)) (shCoefficientPlus sh 6 index delta))
+                    (* (* SH_C2_3 (* x z)) (shCoefficientPlus sh 7 index delta))
+                    (* (* SH_C2_4 (- xx yy)) (shCoefficientPlus sh 8 index delta)))
+                 r1)])
+    (if (>= degree 3)
+        (+ r2
+           (* (* SH_C3_0 y (- (* 3.0 xx) yy)) (shCoefficientPlus sh 9 index delta))
+           (* (* SH_C3_1 x y z) (shCoefficientPlus sh 10 index delta))
+           (* (* SH_C3_2 y (- (* 4.0 zz) xx yy)) (shCoefficientPlus sh 11 index delta))
+           (* (* SH_C3_3 z (- (* 2.0 zz) (* 3.0 xx) (* 3.0 yy))) (shCoefficientPlus sh 12 index delta))
+           (* (* SH_C3_4 x (- (* 4.0 zz) xx yy)) (shCoefficientPlus sh 13 index delta))
+           (* (* SH_C3_5 z (- xx yy)) (shCoefficientPlus sh 14 index delta))
+           (* (* SH_C3_6 x (- xx (* 3.0 yy))) (shCoefficientPlus sh 15 index delta)))
+        r2)))
+
+;; shColour (below) with delta added to sh[index] (48: none)
+(define (shColourPerturbed [sh : (array float 48)] [d : vec3] [degree : uint] [index : uint] [delta : float]) : vec3
+  (max (+ (shSumPerturbed sh d degree index delta) 0.5) (vec3 0.0)))
+
+;; The colour of SH coefficients of degree 0 to `degree` (at most 3; the higher bands are ignored)
+;; seen from unit direction d, from the camera to the splat: max(sum_k sh_k Y_k(d) + 0.5, 0)
+;; (reference code's computeColorFromSH: the basis and its signs, the +0.5 that centres a zero
+;; coefficient on grey, and the clamp from below only)
+(define (shColour [sh : (array float 48)] [d : vec3] [degree : uint]) : vec3
+  (shColourPerturbed sh d degree (uint 48) 0.0))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; The whole preprocess of one splat for one camera
@@ -236,12 +252,10 @@
 (define culled
   (Projected (vec2 0.0) 0.0 (uint 0) (vec3 0.0) 0.0 (vec3 0.0) (uint 0) (uvec4 (uint 0))))
 
-;; A splat as cam sees it, or culled (tileCount 0) when its camera-space depth is at most near
-;; (the reference code's 0.2; Sec. 6's near-plane guard), its 2D covariance's determinant isn't
-;; positive and finite (not positive definite; NaN, e.g. from a zero quaternion or a scale whose
-;; exp overflows; or inf, from a huge but finite scale), or its tile rectangle is empty. Colour
-;; uses SH degrees 0 to shDegree.
-(define (projectSplat [s : Splat] [cam : Camera] [near : float] [shDegree : uint]) : Projected
+;; projectSplat (below) with delta added to the SH coefficient sh[shIndex] (48: none), for the finite
+;; differences of the colour's gradients (ZGAL can't replace an array's element)
+(define (projectSplatPerturbed [s : Splat] [cam : Camera] [near : float] [shDegree : uint] [shIndex : uint]
+                               [shDelta : float]) : Projected
   (let* ([t (toCamera cam.worldToCamera s.position)])
     (if (<= t.z near)
         culled
@@ -257,8 +271,16 @@
                 (if (= count (uint 0))
                     culled
                     (Projected mean t.z radius (conicOf cov) (sigmoid s.opacity)
-                               (shColour s.sh (normalize (- s.position cam.center)) shDegree)
+                               (shColourPerturbed s.sh (normalize (- s.position cam.center)) shDegree shIndex shDelta)
                                count rect))))))))
+
+;; A splat as cam sees it, or culled (tileCount 0) when its camera-space depth is at most near
+;; (the reference code's 0.2; Sec. 6's near-plane guard), its 2D covariance's determinant isn't
+;; positive and finite (not positive definite; NaN, e.g. from a zero quaternion or a scale whose
+;; exp overflows; or inf, from a huge but finite scale), or its tile rectangle is empty. Colour
+;; uses SH degrees 0 to shDegree.
+(define (projectSplat [s : Splat] [cam : Camera] [near : float] [shDegree : uint]) : Projected
+  (projectSplatPerturbed s cam near shDegree (uint 48) 0.0))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Sort keys (D5a: one 32-bit key, tile then depth quantized by its float bits)

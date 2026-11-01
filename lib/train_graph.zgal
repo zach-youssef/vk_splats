@@ -18,6 +18,7 @@
 ;; (import "../../lib/train_graph.zgal"), which imports the render graph and the splat math too. docs/architecture.md has the stages' contracts.
 
 (import "render_graph.zgal")
+(import "splat_backward.zgal")  ; ProjectedGradient, preprocessBackward
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Constants
@@ -52,13 +53,6 @@
 (define lossTotal (uint 0))   ; the image's loss: the pixels' sum
 (define lossProbe (uint 1))   ; with finiteDifferences, the probe this frame ran (a float)
 (define lossDelta (uint 2))   ; with finiteDifferences, a -h frame's: the +h side's loss minus its own
-
-;; A splat's gradients with respect to its projection (48 bytes): the sum of its entries'
-(struct ProjectedGradient
-  (mean vec2)       ; dL/dmean, per pixel of shift
-  (conic vec3)      ; dL/d(a, b, c) of the conic [[a, b], [b, c]]: b counts both off-diagonal entries
-  (opacity float)   ; dL/dsigmoid(opacity)
-  (colour vec3))    ; dL/dcolour, the colour after SH evaluation and its clamp at 0
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Kernels

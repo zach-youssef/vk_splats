@@ -51,6 +51,9 @@ every stage. Its camera conventions were found by trial and error ("Fix inverted
   T < 1e-4.
 - The backward pass: a reverse traversal rebuilding T from the last contributor and the final T,
   and Appendix A's gradients (M = RS, Eq. 11).
+- The quaternion is normalized before R (Eq. 10), and its gradient goes through the normalization,
+  dL/dq = (dL/dn − n(n·dL/dn))/|q|: the gradient of the stored quaternion, as the reference's
+  PyTorch `normalize` gives it by autograd.
 - Adam, with sigmoid (opacity), exp (scale) and a normalized quaternion.
 - The loss (1−λ)·L1 + λ·D-SSIM with λ = 0.2.
 - One image per iteration, an SH band added every 1000 iterations, exponential decay of the
@@ -94,7 +97,10 @@ Training, to be checked against the reference repository when training lands:
    global float atomics. The devices have them (MoltenVK and lavapipe report buffer float
    atomic-add), but global atomics contend on popular splats and are a CAS loop on the web, and
    their summation order varies from run to run, so the gradients wouldn't be deterministic.
-4. **Densification gradient**: the norm of the 2D-mean gradient, as in the reference code.
+4. **Densification gradient**: the norm of the 2D-mean gradient, as in the reference code, and in
+   its units: per normalized device coordinate, |(W/2·∂L/∂x, H/2·∂L/∂y)| with the pixel gradient
+   (`densifyNorm`), so the threshold τ = 0.0002 applies unchanged. The paper says only
+   "view-space positional gradients".
 5. **No whole-tile early exit**: ZGAL barriers can't sit in a loop that depends on shared memory.
    Each pixel still stops blending on its own.
 6. **No low-resolution warm-up.**
@@ -113,6 +119,12 @@ Training, to be checked against the reference repository when training lands:
 9. **Conic gradient convention**: the conic's b gradient counts both off-diagonal entries;
    the reference's `dL_dconic2D.y` is half of it ([building-and-testing.md](building-and-testing.md#closed-form-oracles)).
    The preprocess chain must take it as it is.
+10. **The Jacobian clamp's gradient**: where x/z (or y/z) is clamped to the frustum guard, J
+    uses the clamped ratio, and its gradient passes nothing to x (or y) and differentiates the
+    clamped value through z alone, the exact derivative. The reference code also zeroes x's
+    gradient there, but its z derivative uses the unclamped formula, as if the clamped x were
+    fixed rather than the ratio times z: twice the exact derivative of J's third column. Only
+    splats far outside the view (past 1.3·tan(fov/2)) are affected.
 
 ## How correctness is checked
 
