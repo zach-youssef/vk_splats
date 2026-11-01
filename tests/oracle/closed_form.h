@@ -374,9 +374,21 @@ inline Projected project(const Camera& cam, const Splat& s) {
     return {mean2d(cam, s), cov2d(cam, s), sigmoid(s.opacity_logit), colour(s)};
 }
 
-// The L2 loss of a projected splat over cam's image and its gradients (only cam's size is used).
-inline L2Gradients2d projected_l2(const Camera& cam, const Projected& pr, const Rgb& target, const Rgb& bg) {
+// The losses the gradient functions take: kL2 is the sum above, L = sum_p sum_ch r^2 (dL/dI =
+// 2 r); kL1 is training's mean absolute error, L = sum_p sum_ch |r| / (3 W H) (dL/dI = sign(r) /
+// (3 W H), 0 at r = 0), smooth wherever no residual is 0.
+enum class Loss { kL2, kL1 };
+
+inline double loss_term(Loss loss, double r, double n) { return loss == Loss::kL2 ? r * r : std::abs(r) / n; }
+inline double loss_derivative(Loss loss, double r, double n) {
+    return loss == Loss::kL2 ? 2.0 * r : ((r > 0.0) - (r < 0.0)) / n;
+}
+
+// The loss of a projected splat over cam's image and its gradients (only cam's size is used).
+inline L2Gradients2d projected_gradients(const Camera& cam, const Projected& pr, const Rgb& target, const Rgb& bg,
+                                         Loss loss) {
     const Sym2 A = inverse(pr.cov);
+    const double n = 3.0 * cam.width * cam.height;
     L2Gradients2d g{};
     for (int j = 0; j < cam.height; ++j)
         for (int i = 0; i < cam.width; ++i) {
@@ -386,16 +398,17 @@ inline L2Gradients2d projected_l2(const Camera& cam, const Projected& pr, const 
             const double alpha = pr.opacity * G;
             require(alpha <= kAlphaMax, "a pixel's alpha is clamped at 0.99; lower the opacity");
             if (alpha < kAlphaMin) {
-                for (int ch = 0; ch < 3; ++ch) g.loss += (bg[ch] - target[ch]) * (bg[ch] - target[ch]);
+                for (int ch = 0; ch < 3; ++ch) g.loss += loss_term(loss, bg[ch] - target[ch], n);
                 continue;
             }
             double dl_dalpha = 0.0;
             for (int ch = 0; ch < 3; ++ch) {
                 const double I = pr.colour[ch] * alpha + bg[ch] * (1.0 - alpha);
                 const double r = I - target[ch];
-                g.loss += r * r;
-                g.colour[ch] += 2.0 * r * alpha;
-                dl_dalpha += 2.0 * r * (pr.colour[ch] - bg[ch]);
+                const double dl_di = loss_derivative(loss, r, n);
+                g.loss += loss_term(loss, r, n);
+                g.colour[ch] += dl_di * alpha;
+                dl_dalpha += dl_di * (pr.colour[ch] - bg[ch]);
             }
             g.opacity += dl_dalpha * G;
             const double dl_dp = dl_dalpha * alpha;
@@ -410,6 +423,11 @@ inline L2Gradients2d projected_l2(const Camera& cam, const Projected& pr, const 
             g.conic.c -= dl_dp * 0.5 * dy * dy;
         }
     return g;
+}
+
+// The L2 loss of a projected splat over cam's image and its gradients (only cam's size is used).
+inline L2Gradients2d projected_l2(const Camera& cam, const Projected& pr, const Rgb& target, const Rgb& bg) {
+    return projected_gradients(cam, pr, target, bg, Loss::kL2);
 }
 
 // The splat's parameters, from the projected gradients (s = exp(l), k = (f/z)^2, u = x/z, v = y/z):

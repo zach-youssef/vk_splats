@@ -481,6 +481,29 @@ TEST_CASE("projected-splat (2D) gradients match central differences, off the axi
     CHECK(std::abs(g3.x - mean_only) > 0.01 * std::abs(g3.x));
 }
 
+TEST_CASE("projected-splat L1 gradients match central differences") {
+    // No residual is near 0 (the target is far from every pixel's value), so L1 is smooth here.
+    const Projected p0 = project(kGradCam, grad_splat());
+    auto l1 = [&](const Projected& p) { return projected_gradients(kGradCam, p, kTarget, kBg, Loss::kL1); };
+    const L2Gradients2d g = l1(p0);
+    const double h = 1e-6, eps = 1e-6;
+    auto fd = [&](const std::function<void(Projected&, double)>& perturb) {
+        return central_difference([&](double d) { Projected p = p0; perturb(p, d); return l1(p).loss; }, h);
+    };
+    CHECK(g.mean.x == doctest::Approx(fd([](Projected& p, double d) { p.mean.x += d; })).epsilon(eps));
+    CHECK(g.mean.y == doctest::Approx(fd([](Projected& p, double d) { p.mean.y += d; })).epsilon(eps));
+    CHECK(g.cov.b == doctest::Approx(fd([](Projected& p, double d) { p.cov.b += d; })).epsilon(eps));
+    CHECK(g.opacity == doctest::Approx(fd([](Projected& p, double d) { p.opacity += d; })).epsilon(eps));
+    for (int ch = 0; ch < 3; ++ch)
+        CHECK(g.colour[ch] == doctest::Approx(fd([ch](Projected& p, double d) { p.colour[ch] += d; })).epsilon(eps));
+    // The loss is the mean absolute error over 3 W H values.
+    const Image img = render(kGradCam, {grad_splat()}, kBg);
+    double sum = 0.0;
+    for (const Rgb& px : img.colour)
+        for (int ch = 0; ch < 3; ++ch) sum += std::abs(px[ch] - kTarget[ch]);
+    CHECK(g.loss == doctest::Approx(sum / (3.0 * kGradCam.width * kGradCam.height)).epsilon(1e-13));
+}
+
 TEST_CASE("single-splat L2 gradients: symmetry and limit cases") {
     const Camera cam = kGradCam;
     Splat s = grad_splat();

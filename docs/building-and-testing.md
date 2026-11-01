@@ -96,9 +96,10 @@ tests it on its own. When using it:
 - Feed kernels the rotation as `quat_about_z(theta)`. For a camera rotated about z, feed the world
   splat and compare with the oracle on `world_to_camera_about_z()`'s splat; that guards the
   covariance's W against Wᵀ.
-- `projected_l2()` gives the gradients of the projected stage (2D mean, Σ′ or the conic, activated
-  opacity, colour) for the backward rasterize; `single_splat_l2()` chains them to the splat's
-  parameters. A symmetric matrix's `b` gradient is for the shared off-diagonal value (both entries).
+- `projected_gradients()` gives the gradients of the projected stage (2D mean, Σ′ or the conic,
+  activated opacity, colour) for the backward rasterize, with the L2 loss (Σ(I − t)²,
+  `projected_l2()`) or the L1 (the mean |I − t| over 3WH, training's L1 term); `single_splat_l2()`
+  chains the L2's to the splat's parameters. A symmetric matrix's `b` gradient is for the shared off-diagonal value (both entries).
   Against the reference: its conic gradient's off-diagonal is half of `conic.b`, its Σ′ gradient
   equals `cov.b`, and its `dL_dmean2D` is per NDC unit (0.5·W, or 0.5·H for y, times `mean`).
 
