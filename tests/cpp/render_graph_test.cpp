@@ -1,7 +1,7 @@
 // lib/render_graph.zgal's host-side functions, as ZGAL compiles them to C++: the dispatch sizing
 // (groupsFor, which keeps every dispatch within the devices' 65535 workgroups per dimension; the
 // kernels' grid-stride loops cover the rest, which tile_test runs on the GPU with --max-groups)
-// and the entries' capacity growth (grownCapacity).
+// and the entries' capacity growth (grownCapacity, grownCapacityUpTo).
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest.h>
 
@@ -51,5 +51,22 @@ TEST_CASE("grownCapacity: unchanged when the total fits, else total + 25%, at mo
         const uint32_t grown = rg::grownCapacity(1, total);
         CHECK(grown >= total);
         CHECK(grown <= rg::entryCapacityMax);
+    }
+}
+
+TEST_CASE("grownCapacityUpTo: grownCapacity's rule under another cap (the training graph's 3 x 2^20)") {
+    constexpr uint32_t most = 3u << 20;
+    CHECK(rg::grownCapacityUpTo(0, 0, most) == 1);
+    CHECK(rg::grownCapacityUpTo(16, 17, most) == 21);
+    CHECK(rg::grownCapacityUpTo(1000, 400, most) == 1000);
+    CHECK(rg::grownCapacityUpTo(16, 1000000, most) == 1250000);
+    CHECK(rg::grownCapacityUpTo(16, most - most / 4 - 1, most) == most - most / 4 - 1 + (most - most / 4 - 1) / 4);
+    CHECK(rg::grownCapacityUpTo(16, most - most / 4, most) == most);
+    CHECK(rg::grownCapacityUpTo(16, most + 1, most) == most);
+    CHECK(rg::grownCapacityUpTo(most, 0xFFFFFFFFu, most) == most);
+    for (uint32_t total : {1u, 17u, 4096u, most / 2, most - 1}) {
+        const uint32_t grown = rg::grownCapacityUpTo(1, total, most);
+        CHECK(grown >= total);
+        CHECK(grown <= most);
     }
 }

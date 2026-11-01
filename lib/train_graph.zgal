@@ -32,6 +32,13 @@
 ;; TrainGraph says 3145728 too (a graph expression can't name a constant).
 (define trainEntryCapacityMax (uint 3145728))
 
+;; A training app's capacity after a frame that needed `total` entries (grownCapacity, at most
+;; trainEntryCapacityMax). A frame needing more than trainEntryCapacityMax is truncated, its
+;; dropped entries' gradients lost, so a trainer must fail on one (counts' countTotal past
+;; trainEntryCapacityMax) rather than step on its gradients.
+(define (grownTrainCapacity [capacity : uint] [total : uint]) : uint
+  (grownCapacityUpTo capacity total trainEntryCapacityMax))
+
 ;; The floats an entry's gradients take in entryGradients, at these offsets
 (define gradientStride (uint 9))
 (define gradientMean (uint 0))     ; dL/dmean (x, y), per pixel
@@ -73,7 +80,9 @@
 ;; 6. Each pixel's loss and dL/dI, against its target (RGBA8, the red in the low byte, at
 ;; targetOffset + the pixel's index: docs/data-format.md's images): with lossL2, (I - t)^2 summed
 ;; over the channels and 2 (I - t); with lossL1, |I - t| / (3 pixels) and sign(I - t) / (3 pixels),
-;; so the sum is the mean. I is the rasterizer's C + T bg, unclamped.
+;; so the sum is the mean. I is the rasterizer's C + T bg, unclamped. A pixel past the targets'
+;; targetPixels reads black instead of past the buffer: the app must check the camera's pixels fit
+;; (grad_test does, up front); this only keeps a wrong offset from reading out of bounds.
 (compute-material Loss
   (workgroup 256)
   (bindings
@@ -81,11 +90,11 @@
    (targets (buffer-array uint read))
    (pixelGrads (buffer-array vec4 write))   ; dL/dI in .rgb
    (pixelLosses (buffer-array float write)))
-  (push (pixels uint) (targetOffset uint) (loss uint))
+  (push (pixels uint) (targetOffset uint) (targetPixels uint) (loss uint))
   (compute
    (let* ([scale (/ 1.0 (* 3.0 (float pixels)))])
      (for ([i (range globalInvocationId.x pixels (* entryGroupSize workgroupCount.x))])
-       (let* ([r (- (.rgb (at colours i)) (unpackRgb (at targets (+ targetOffset i))))])
+       (let* ([r (- (.rgb (at colours i)) (if (< (+ targetOffset i) targetPixels) (unpackRgb (at targets (+ targetOffset i))) (vec3 0.0)))])
          (when (= loss lossL2)
            (write! (at pixelGrads i) (vec4 (* 2.0 r) 0.0))
            (write! (at pixelLosses i) (dot r r)))
@@ -482,8 +491,10 @@
   ;; larger one counts as that (counts' countCapacity says so)
   (input capacity (per-frame uint))
   (input background (per-frame vec3))
-  ;; The targets (RGBA8 pixels, row by row: an images_<k>.bin) and the camera's first pixel in them
+  ;; The targets (RGBA8 pixels, row by row: an images_<k>.bin), the pixels it holds and the
+  ;; camera's first pixel in them (the app checks targetOffset + width x height <= targetPixels)
   (input targetFile path)
+  (input targetPixels (per-frame uint))
   (input targetOffset (per-frame uint))
   ;; lossL1 or lossL2
   (parameter loss uint)
@@ -554,7 +565,7 @@
             #:push ((width width) (height height) (background background))
             #:invocations ((* gridWidth 16) (* gridHeight 16)))  ; 16: tileSize, a workgroup a tile
   (material scoring Loss colours targets pixelGrads pixelLosses
-            #:push ((pixels pixels) (targetOffset targetOffset) (loss loss))
+            #:push ((pixels pixels) (targetOffset targetOffset) (targetPixels targetPixels) (loss loss))
             #:invocations ((min pixels (* (max maxGroups 1) 256))))  ; 256: its workgroup size
   (material differencing LossDelta projected pixelLosses lastEntries plusLosses plusLasts plusProjected
             lossDeltas losses

@@ -151,6 +151,7 @@
   (parameter capacity uint)
   (parameter maxGroups uint)
   (parameter targetOffset uint)
+  (parameter targetPixels uint)
   (parameter backgroundR float)
   (parameter backgroundG float)
   (parameter backgroundB float)
@@ -269,6 +270,13 @@
                  #:worst (if (and ok (not small)) (max state.worst (/ error (max scale 1e-30))) state.worst)))])))
   (on (frame dt)
     (cond
+      ;; The camera's pixels must lie in the targets (the Loss kernel reads black past them)
+      [(or (> targetOffset targetPixels) (> (* width height) (- targetPixels targetOffset)))
+       (begin
+         (print! "grad_test: FAILED, the camera's " (* width height) " pixels at --target-offset "
+                 targetOffset " don't fit in --target-pixels " targetPixels)
+         (fail)
+         state)]
       [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
        (begin
          (print! "grad_test: FAILED, " frameLimit " frames weren't enough (phase " state.phase ", probe "
@@ -381,7 +389,7 @@
        (shDegree shDegree) (near near) (far far) (maxGroups maxGroups) (inspect #t)
        (loss (if l1 lossL1 lossL2)) (finiteDifferences finiteDifferences)
        (capacity capacity) (background (vec3 backgroundR backgroundG backgroundB))
-       (targetOffset targetOffset)
+       (targetPixels targetPixels) (targetOffset targetOffset)
        (probe (if (= state.phase 1) (+ (* state.index (uint 2)) state.side (uint 1)) (uint 0)))
        (perturbSplat (if (= state.phase 1) (.splat (at state.probes state.index)) (uint 0)))
        (perturbField (if (= state.phase 1) (.field (at state.probes state.index)) perturbNone))
@@ -411,6 +419,7 @@
   (option maxGroups "--max-groups" "the most workgroups a dispatch has (groupLimit, 65535, or less to test the grid-stride loops)"
           #:default 65535 #:range (1 65535))
   (option targetOffset "--target-offset" "the camera's first pixel in the targets" #:default 0)
+  (option targetPixels "--target-pixels" "the pixels the targets hold (required: the camera's must fit)" #:default 0)
   (option backgroundR "--background-r" "the background's red" #:default 0.0)
   (option backgroundG "--background-g" "the background's green" #:default 0.0)
   (option backgroundB "--background-b" "the background's blue" #:default 0.0)

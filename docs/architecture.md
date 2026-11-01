@@ -221,11 +221,11 @@ rather than in the program.
   floor and ceil), every key and splat position for position, and every range exactly. It checks a
   frame that overflowed its starting capacity of 16 (the first 16 entries in splat order, sorted,
   and their ranges), that the capacity grew, then a complete frame, some runs with `--max-groups` 1
-  or 3. `tests/cpp/render_graph_test.cpp` checks `groupsFor` and `grownCapacity` on the CPU. The
-  preprocess itself is compared to float precision (mean 1e-4 relative, depth 1e-5, radius ±1),
-  since the GPU's `exp`, `sqrt` and division needn't round as C++'s do. Degenerate splats (a zero
-  quaternion, logScale 100 and 30, appended by `scenes.py`; `--culled-tail`) must be culled on both;
-  the `!(det > 0)` NaN guard holds on MoltenVK.
+  or 3. `tests/cpp/render_graph_test.cpp` checks `groupsFor`, `grownCapacity` and
+  `grownCapacityUpTo` on the CPU. The preprocess itself is compared to float precision (mean 1e-4
+  relative, depth 1e-5, radius ±1), since the GPU's `exp`, `sqrt` and division needn't round as
+  C++'s do. Degenerate splats (a zero quaternion, logScale 100 and 30, appended by `scenes.py`;
+  `--culled-tail`) must be culled on both; the `!(det > 0)` NaN guard holds on MoltenVK.
 - **Rasterizer against C++** (`programs/render_test`): with a fixed `--capacity` (a frame needing
   more fails), every frame is complete and the same, so readbacks of different frames can be
   checked together. Every pixel's colour and T are compared within 1e-4 with a CPU blend in
@@ -263,8 +263,10 @@ clears it.
 
 6. `Loss` (256-wide, grid stride): per pixel, I = C + T·bg (the rasterizer's `colours`, unclamped)
    against the target, an RGBA8 pixel at `targetOffset` + the pixel's index in `targetFile`
-   (an `images_<k>.bin`: [data-format.md](data-format.md)). With `loss` = `lossL2`, the loss is
-   Σ(I − t)² over the channels (the gradient tests' smooth loss) and dL/dI = 2(I − t); with
+   (an `images_<k>.bin`: [data-format.md](data-format.md)), which holds `targetPixels` pixels: a
+   pixel past them reads black rather than past the buffer, and the app must check up front that
+   `targetOffset` + W·H ≤ `targetPixels` (grad_test fails otherwise). With `loss` = `lossL2`, the
+   loss is Σ(I − t)² over the channels (the gradient tests' smooth loss) and dL/dI = 2(I − t); with
    `lossL1`, |I − t| / 3WH and sign(I − t) / 3WH, so the image's loss is the mean (training's L1
    term). Per-pixel values go to `pixelLosses` and `pixelGrads`, and a `reduce` sums the loss into
    `losses[0]`.
@@ -321,12 +323,13 @@ the projections and `backwardRanges`, and the splats and cameras once.
   measured against the forward pass on a real scene (T13's profiling).
 - **Capacity**: the entry buffers are capped at 3·2²⁰ entries (`trainEntryCapacityMax`; a larger
   `capacity` counts as that), so `entryGradients` (36 B an entry) stays within one binding's 128 MiB
-  (108 MiB). The rest of the render graph's capacity rules apply. **Open limit**: a real scene at
-  full resolution can need 10M+ entries; past the cap a frame is silently truncated (the dropped
-  entries' gradients are lost), and an app growing the capacity with `grownCapacity` keeps asking
-  for more than it gets. Splitting `entryGradients` can't reach 2²⁵ within WebGPU's 8 storage
-  buffers (BackwardRasterize binds 7). The trainer (T12) must process the tiles in chunks or fail
-  loudly at the cap.
+  (108 MiB). The rest of the render graph's capacity rules apply, but an app grows the capacity
+  with `grownTrainCapacity` (`grownCapacityUpTo`'s rule at most `trainEntryCapacityMax`), and a
+  frame needing more than the cap (`counts`' total past it) is truncated, the dropped entries'
+  gradients lost, so a trainer must fail on it rather than step. **Open limit**: a real scene at
+  full resolution can need 10M+ entries. Splitting `entryGradients` can't reach 2²⁵ within
+  WebGPU's 8 storage buffers (BackwardRasterize binds 7); processing the tiles in chunks past the
+  cap is left for when the trainer's profiling shows real scenes need it.
 - **Finite differences** (`finiteDifferences`, for grad_test): `Perturb` adds `perturbDelta` to
   one field (`perturbField`: opacity, a colour channel, the mean's x or y) of one splat's
   projection after the preprocess, so the tiles stay the same; or, with `perturbField` =

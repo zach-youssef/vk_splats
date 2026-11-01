@@ -54,12 +54,17 @@
 
 ;; The capacity after a frame that needed `total` entries: the same when they fit, otherwise
 ;; total + 25% (so a view needing a few more entries each frame doesn't grow it every frame), at
-;; most entryCapacityMax. Never smaller, and at least 1 (a buffer can't hold nothing).
-(define (grownCapacity [capacity : uint] [total : uint]) : uint
+;; most `most` (below 2^32 - 2^30, so total + 25% can't wrap). Never smaller, and at least 1 (a
+;; buffer can't hold nothing).
+(define (grownCapacityUpTo [capacity : uint] [total : uint] [most : uint]) : uint
   (cond
     [(<= total capacity) (max capacity (uint 1))]
-    [(>= total (- entryCapacityMax (/ entryCapacityMax (uint 4)))) entryCapacityMax]
+    [(>= total (- most (/ most (uint 4)))) most]
     [else (+ total (/ total (uint 4)))]))
+
+;; The render graph's: at most entryCapacityMax
+(define (grownCapacity [capacity : uint] [total : uint]) : uint
+  (grownCapacityUpTo capacity total entryCapacityMax))
 
 ;; `counts`, the graph's GPU-side sizes (read back as readCounts), element by element
 (define countEntries (uint 0))    ; the entries this frame holds: min(total, capacity), the sort's count

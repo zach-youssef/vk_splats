@@ -9,11 +9,11 @@
 #   - by finite differences through the splats' parameters (--parameters: the position, the
 #     opacity logit, the log-scale, the quaternion and every SH band of degree 3, the DC included),
 #     each splat perturbed and projected again: on S2's cameras 0 and 1, and a subset of S3's
-#     camera 0 (--samples 24 of each kind: fewer can
-#     leave the third band's all negligible);
+#     camera 0 (--samples 24 of each kind: fewer can leave the third band's all negligible);
 #   - S2's camera 0 with the L1 loss and the 1D dispatches capped at three workgroups (the
 #     grid-stride loops go round), twice, with the hashes compared (deterministic across runs, not
-#     only across frames).
+#     only across frames);
+#   - S2's camera 1 with --target-pixels too small for it, which must fail.
 # A <binary> ending in .js is the web build (test-web.sh), run under $NODE (node by default): each
 # run writes its checked frame's readbacks to <log name>-readbacks ($GRAD_TEST_READBACKS), and
 # <web-check dir>/grad_test_check runs the native checks on them; a copy with its gradients
@@ -89,6 +89,16 @@ first=$(run "$out/s2" 0 s2-l1 16 --l1 --max-groups 3)
 second=$(run "$out/s2" 0 s2-l1-again 16 --l1 --max-groups 3)
 if [ -z "$first" ] || [ "$first" != "$second" ]; then
     echo "grad_test: S2 camera 0 isn't deterministic: '$first', then '$second'" >&2
+    status=1
+fi
+# A camera whose pixels run past the targets must fail up front (S2's camera 1 starts at pixel
+# 4096, which is then the targets' end), not read past them
+# shellcheck disable=SC2046 # the arguments are words without spaces
+if program short-targets --validation --frames 16 $("$python" "$here/scenes.py" "$out/s2" 1 \
+        "$out/short-targets.bin" | sed 's/--target-pixels [0-9]*/--target-pixels 4096/') \
+        > "$out/short-targets.log" 2>&1 || ! grep -q "don't fit in --target-pixels" "$out/short-targets.log"; then
+    cat "$out/short-targets.log" >&2
+    echo "grad_test: FAILED, targets too short for the camera weren't refused" >&2
     status=1
 fi
 if [ -n "$web" ]; then

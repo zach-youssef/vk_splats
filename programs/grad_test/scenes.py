@@ -4,7 +4,8 @@
   scenes.py <scene dir> <camera> <targets file>
       Writes the scene's targets to <targets file> (RGBA8, the red in the low byte, row by row,
       every camera's image in the manifest's order, as an images_<k>.bin holds them) and prints
-      tools/scene_args.py's arguments, --targets, the camera's --target-offset and the background:
+      tools/scene_args.py's arguments, --targets, the camera's --target-offset, --target-pixels (all
+      the cameras' pixels) and the background:
       - an S1 variant with an oracle target (the gradient variant): the constant target
         (round(255 t) in every pixel), the oracle's background, --oracle and the unrounded target
         (grad_check.h rounds it as here);
@@ -57,7 +58,8 @@ def args(scene, camera, targets):
         offsets.append(offset)
         offset += w * h
     np.concatenate(images).tofile(targets)
-    out = scene_args(scene, str(camera)) + ["--targets", targets, "--target-offset", str(offsets[camera])]
+    out = scene_args(scene, str(camera)) + ["--targets", targets, "--target-offset", str(offsets[camera]),
+                                         "--target-pixels", str(offset)]
     if oracle is not None:
         r, g, b = oracle["background"]
         tr, tg, tb = oracle["target"]

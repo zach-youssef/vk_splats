@@ -159,6 +159,9 @@ differences:
     `--samples 24` and `--multi-batch` (fails unless a tile's backward walks more than one batch,
     from `backwardRanges`). With `--parameters`: S2's two cameras (SH degree 3, so every band),
     and S3's camera 0 with `--samples 24` (with 8, every probe of the third band was negligible).
+- `--target-pixels` (the pixels the targets file holds; `scenes.py` passes it) is required in
+  effect: a camera whose pixels at `--target-offset` don't fit fails up front, which test.sh
+  checks with a too-small value.
 - Every run checks that the gradients are finite and prints a hash; test.sh compares two runs'
   hashes. The runs without `--finite-differences` also check that the next `--repeats` frames
   give the same bits.
