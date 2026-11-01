@@ -106,6 +106,14 @@ Training, to be checked against the reference repository when training lands:
    It shows in images: at 3σ, α = opacity·e^−4.5 ≈ 0.011·opacity, above the 1/255 cutoff, so
    pixels in those tiles blend differently from a reference render.
 
+8. **Alpha clamp's gradient**: where α = min(0.99, opacity·G) clamps, the backward rasterize
+   gives the opacity, mean and conic a gradient of 0 (the exact derivative). The reference code
+   passes the gradient through the clamp as if it didn't hold. It matters only for splats with
+   opacity·G > 0.99, rare after the sigmoid.
+9. **Conic gradient convention**: the conic's b gradient counts both off-diagonal entries;
+   the reference's `dL_dconic2D.y` is half of it ([building-and-testing.md](building-and-testing.md#closed-form-oracles)).
+   The preprocess chain must take it as it is.
+
 ## How correctness is checked
 
 Finite differences and re-fitting check the code against itself, so they can't catch a forward

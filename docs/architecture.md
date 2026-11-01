@@ -21,6 +21,9 @@ The planned layout, filled in as the M1 and M2 tasks land.
   - `render_graph.zgal`: `SplatGraph`, the render graph's preprocess, tile entries, sort, tile
     ranges and rasterizer, and the window's present ([below](#render-graph)); it imports
     `splat_math.zgal`.
+  - `train_graph.zgal`: `TrainGraph`, the render graph's forward pass followed by the loss and the
+    backward rasterize, giving each splat's gradients with respect to its projection
+    ([below](#train-graph)); it imports `render_graph.zgal`.
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
   programs' inputs, the synthetic scene generator, and `scene_args.py`, which prints
   splat_render's arguments for a scene and a camera.
@@ -34,7 +37,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
 ## Pipeline
 
 The planned pipeline (M1 renders, M2 trains). Steps 1 to 5 are `lib/render_graph.zgal`
-([below](#render-graph)); training is to come.
+([below](#render-graph)), and steps 6 to 8 are `lib/train_graph.zgal` ([below](#train-graph)).
+The rest of training is to come.
 
 Data is converted offline: the programs read std430 `buffer-file` data and a `manifest.json`, the
 same on native and the web, so no image or COLMAP parsing library is linked. The training images
@@ -55,8 +59,16 @@ Per frame, rendering follows the paper's tile-based rasterizer:
    batches, writing the colour, the final transmittance and the last contributor (kept for the
    backward pass), and an RGBA8 image.
 
-Training will add the backward pass (the reverse traversal, then the preprocess chain), Adam, and
-densification and pruning on a fixed capacity, compacted by scan.
+Training's backward pass so far:
+
+6. **Loss**: each pixel's loss against the camera's target image and its gradient with respect to
+   the pixel's colour, summed.
+7. **Backward rasterize**: each tile's entries walked back to front, from each pixel's last
+   blended entry, giving each entry's gradients with respect to its splat's projection.
+8. **Gather**: each splat's projection gradients, the sum of its entries'.
+
+Training will add the preprocess chain (the projection's gradients back to the splat's
+parameters), Adam, and densification and pruning on a fixed capacity, compacted by scan.
 
 ## Conventions
 
@@ -233,6 +245,73 @@ rather than in the program.
   joining, so tile_test and render_test take the files, splat count and camera size as options;
   their `test.sh` reads them from the scene's `manifest.json` (`scenes.py`), and the checks verify
   them against the readbacks.
+
+## Train graph
+
+`lib/train_graph.zgal`'s `TrainGraph` runs the render graph's stages 1 to 5 for one camera per
+frame (the same kernels and nodes, repeated: ZGAL has no graph composition, so there is no window
+or capture), then pipeline steps 6 to 8. `splatGradients` (a `ProjectedGradient` per splat: the 2D
+mean, the conic, the activated opacity and the colour) is overwritten every frame, so nothing
+clears it.
+
+6. `Loss` (256-wide, grid stride): per pixel, I = C + T·bg (the rasterizer's `colours`, unclamped)
+   against the target, an RGBA8 pixel at `targetOffset` + the pixel's index in `targetFile`
+   (an `images_<k>.bin`: [data-format.md](data-format.md)). With `loss` = `lossL2`, the loss is
+   Σ(I − t)² over the channels (the gradient tests' smooth loss) and dL/dI = 2(I − t); with
+   `lossL1`, |I − t| / 3WH and sign(I − t) / 3WH, so the image's loss is the mean (training's L1
+   term). Per-pixel values go to `pixelLosses` and `pixelGrads`, and a `reduce` sums the loss into
+   `losses[0]`.
+7. `TileLasts` (64-wide, grid stride over the tiles) writes each tile's start, last and end into
+   `backwardRanges` (3 uints a tile), the last being the largest of its pixels' `lastEntries`.
+   `BackwardRasterize`: one 16×16 workgroup per tile, as Rasterize. Each pixel starts at its
+   `lastEntries` with its final T and walks the tile's entries from the tile's last back to its
+   start, in shared-memory batches of `backwardBatch` = 128 (half the forward's, so the batch and the reduction's scratch
+   fit in 16 KB: 14,912 B). It undoes the blend as the reference code does: T ← T/(1 − α);
+   dL/dc = αT·dL/dI; dL/dα = T(c − R)·dL/dI − T_final/(1 − α)·(bg·dL/dI), with R the colour
+   behind the entry. dL/dα goes through α = min(0.99, opacity·G) to the opacity, mean and conic,
+   with the clamp's exact derivative: 0 where it holds. The conic's b counts both off-diagonal
+   entries (closed_form.h's convention). It skips exactly the entries the forward pass skipped
+   (same computation). For each entry, the workgroup reduces its 256 pixels' 9 values in shared
+   memory (256 → 16 partial sums → 1, in a fixed order) and one invocation per value writes it to
+   `entryGradients` (9 floats an entry): no float atomics (D4(b)). The entries past the tile's
+   last, which no pixel blended, get zeros.
+8. `InvertEntries` writes each sorted entry's index at its place before the sort (its splat's
+   offset plus its index in the splat's tile rectangle, row by row, recovered from the key's
+   tile). `GatherGradients` (one invocation per splat) then sums its entries' gradients in tile
+   order into `splatGradients`. Places no entry maps to (only after a wrapped total) keep the
+   clear's 0xFFFFFFFF and are skipped, as are entries past the capacity.
+
+`losses` holds (the loss, the probe, the loss's change) and is read back every frame, with
+`counts`. With `inspect` (tests), so are `splatGradients`, the projections and `backwardRanges`,
+and the splats and cameras once.
+
+- **Determinism**: every sum has a fixed order (the per-entry reduction, the per-splat gather, ZGAL's
+  `reduce`), so a frame's gradients are the same bit for bit on every run and every frame. The
+  price is in BackwardRasterize: every entry up to the tile's last costs the workgroup two
+  barriers and a 9-value reduction, whether or not a given pixel blends it (the forward pass
+  costs one barrier per 256 entries). `TileLasts` cuts the walk at the last entry any pixel
+  blended, so a saturated tile's tail past every pixel's stop costs only its zero writes. Not yet
+  measured against the forward pass on a real scene (T13's profiling).
+- **Capacity**: the entry buffers are capped at 3·2²⁰ entries (`trainEntryCapacityMax`; a larger
+  `capacity` counts as that), so `entryGradients` (36 B an entry) stays within one binding's 128 MiB
+  (108 MiB). The rest of the render graph's capacity rules apply. **Open limit**: a real scene at
+  full resolution can need 10M+ entries; past the cap a frame is silently truncated (the dropped
+  entries' gradients are lost), and an app growing the capacity with `grownCapacity` keeps asking
+  for more than it gets. Splitting `entryGradients` can't reach 2²⁵ within WebGPU's 8 storage
+  buffers (BackwardRasterize binds 7). The trainer (T12) must process the tiles in chunks or fail
+  loudly at the cap.
+- **Finite differences** (`finiteDifferences`, for grad_test): `Perturb` adds `perturbDelta` to
+  one field (`perturbField`: opacity, a colour channel, the mean's x or y) of one splat's
+  projection after the preprocess, so the tiles stay the same. A probe k runs its +h frame
+  (`probe` 2k + 1), then its −h frame (2k + 2); probe 0 is unperturbed. `LossDelta` keeps the +h
+  frame's per-pixel losses and `lastEntries` (`plusLosses`, `plusLasts`, `#:frames shared`), and
+  the −h frame writes each pixel's plus − minus, reduced into `losses[2]`: the difference is
+  summed pixel by pixel, not taken between two whole losses. Every frame writes its probe into
+  `losses[1]`, so the app matches a late readback with its probe. A pixel where a decision flips
+  between the sides counts nothing, since the loss jumps there and the analytic gradient is the
+  derivative between the jumps: the perturbed splat's blend (α against 1/255, the exponent's
+  sign), or the stop at T < 1e-4 moving to another entry (any splat's: the pixel's
+  `lastEntries` differ).
 
 ## splat_render
 

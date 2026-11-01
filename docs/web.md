@@ -19,6 +19,12 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | EmitEntries | 5 | 1 | 0 | 0 | 256 |
 | TileRanges | 3 | 1 | 0 | 0 | 256 |
 | Rasterize | 5 | 1 | 1 (`rgba8unorm`) | 10240 B (256 × (8 + 16 + 16): a batch's means, conics and opacities, colours) | 16 × 16 |
+| Loss | 4 | 1 | 0 | 0 | 256 |
+| TileLasts | 3 | 1 | 0 | 0 | 64 |
+| BackwardRasterize | 7 | 1 | 0 | 14912 B (128 × (8 + 16 + 16) for a batch, 9 × 256 × 4 and 9 × 16 × 4 for the reduction) | 16 × 16 |
+| InvertEntries | 6 | 1 | 0 | 0 | 256 |
+| GatherGradients | 6 | 1 | 0 | 0 | 64 |
+| Perturb, LossDelta (grad_test only) | 1, 7 | 1 | 0 | 0 | 1, 256 |
 | ZgalSortCount | 4 | 1 | 0 | 64 B (16 atomic bins) | 256 |
 | ZgalSortOffsets | 1 | 1 | 0 | 260 B with subgroups, 1028 B without (256 lanes and a carry) | 256 |
 | ZgalSortScatter | 6 | 1 | 0 | 8320 B with subgroups (2048 subgroup counts), 1152 B without (256 digits, 16 next, 16 bins) | 256 |
@@ -28,7 +34,8 @@ without subgroups embedded in `splat_render.zgal.ts`):
 The largest buffers stay within `maxStorageBufferBindingSize` (128 MiB) and so within
 `maxBufferSize` (256 MiB): the rasterizer's `colours` at the programs' largest image, 2896² ×
 16 B = 134,189,056 B, and the tile entries' keys at their cap of 2²⁵ entries
-([architecture.md](architecture.md#render-graph)). A 1D dispatch is at most 65535 workgroups
+([architecture.md](architecture.md#render-graph)), and the training graph's `entryGradients` at
+its cap of 3·2²⁰ entries, 113,246,208 B ([architecture.md](architecture.md#train-graph)). A 1D dispatch is at most 65535 workgroups
 (`maxComputeWorkgroupsPerDimension`), as natively. ZGAL enables subgroups when the adapter has
 them, and the sort and scan kernels fall back to their variants without them otherwise; both fit.
 

@@ -1,0 +1,515 @@
+;; The training graph's forward and backward passes (Kerbl et al. 2023, Sec. 5 and 6), for one
+;; camera per frame: SplatGraph's forward pass (lib/render_graph.zgal's stages 1 to 5, the same
+;; kernels), then
+;;   6. the loss against the camera's target image: each pixel's loss and its gradient dL/dI with
+;;      respect to the pixel's colour I = C + T bg (Loss: the L2 test loss or training's L1), and
+;;      their sum;
+;;   7. the backward rasterize: each tile's entries back to front (BackwardRasterize), from the
+;;      last any of its pixels blended (TileLasts), giving each entry's gradients with respect to
+;;      its splat's projection (the 2D mean, the conic, the activated opacity and the colour);
+;;   8. the gather: each splat's gradients, the sum of its entries' (InvertEntries finds each of a
+;;      splat's entries after the sort, GatherGradients sums them in a fixed order), into
+;;      splatGradients.
+;; No global float atomics anywhere (D4(b)): every entry's gradients are reduced in the tile's
+;; workgroup and written once, and every splat's summed by one invocation, so the gradients are
+;; the same, bit for bit, on every run. With finiteDifferences, the graph also perturbs one splat's
+;; projection (Perturb) and sums the loss's change between a probe's +h and -h frames
+;; (LossDelta), for grad_test's finite differences. Programs import it,
+;; (import "../../lib/train_graph.zgal"), which imports the render graph and the splat math too. docs/architecture.md has the stages' contracts.
+
+(import "render_graph.zgal")
+
+;; ---------------------------------------------------------------------------------------------
+;; Constants
+;; ---------------------------------------------------------------------------------------------
+;; The most tile entries a training frame holds: 3 x 2^20, so their gradients (gradientStride
+;; floats, 36 bytes, an entry) stay within one binding's 128 MiB (108 MiB; docs/architecture.md).
+;; TrainGraph says 3145728 too (a graph expression can't name a constant).
+(define trainEntryCapacityMax (uint 3145728))
+
+;; The floats an entry's gradients take in entryGradients, at these offsets
+(define gradientStride (uint 9))
+(define gradientMean (uint 0))     ; dL/dmean (x, y), per pixel
+(define gradientConic (uint 2))    ; dL/dconic (a, b, c): b counts both off-diagonal entries
+(define gradientOpacity (uint 5))  ; dL/dopacity, the activated opacity
+(define gradientColour (uint 6))   ; dL/dcolour (r, g, b)
+
+;; The backward rasterize's batch: half the forward's, so its shared memory (the batch, and the
+;; reduction's scratch) fits in 16 KB; BackwardRasterize's shared arrays say 128 too
+(define backwardBatch (uint 128))
+
+;; Graph parameter values: which loss
+(define lossL1 (uint 0))  ; mean |I - t| over the image's channels (Sec. 7's L1 term)
+(define lossL2 (uint 1))  ; sum (I - t)^2 over them (smooth: the gradient tests')
+
+;; The projection field Perturb changes (0: none)
+(define perturbNone (uint 0))
+(define perturbOpacity (uint 1))
+(define perturbRed (uint 2))      ; red, green, blue: 2, 3, 4
+(define perturbMeanX (uint 5))    ; x, y: 5, 6
+
+;; `losses`, element by element
+(define lossTotal (uint 0))   ; the image's loss: the pixels' sum
+(define lossProbe (uint 1))   ; with finiteDifferences, the probe this frame ran (a float)
+(define lossDelta (uint 2))   ; with finiteDifferences, a -h frame's: the +h side's loss minus its own
+
+;; A splat's gradients with respect to its projection (48 bytes): the sum of its entries'
+(struct ProjectedGradient
+  (mean vec2)       ; dL/dmean, per pixel of shift
+  (conic vec3)      ; dL/d(a, b, c) of the conic [[a, b], [b, c]]: b counts both off-diagonal entries
+  (opacity float)   ; dL/dsigmoid(opacity)
+  (colour vec3))    ; dL/dcolour, the colour after SH evaluation and its clamp at 0
+
+;; ---------------------------------------------------------------------------------------------
+;; Kernels
+;; ---------------------------------------------------------------------------------------------
+;; An RGBA8 pixel's colour (the red in the low byte), in [0, 1]
+(define (unpackRgb [rgba : uint]) : vec3
+  (/ (vec3 (float (bitand rgba (uint 255))) (float (bitand (shr rgba (uint 8)) (uint 255)))
+           (float (bitand (shr rgba (uint 16)) (uint 255))))
+     255.0))
+
+;; 6. Each pixel's loss and dL/dI, against its target (RGBA8, the red in the low byte, at
+;; targetOffset + the pixel's index: docs/data-format.md's images): with lossL2, (I - t)^2 summed
+;; over the channels and 2 (I - t); with lossL1, |I - t| / (3 pixels) and sign(I - t) / (3 pixels),
+;; so the sum is the mean. I is the rasterizer's C + T bg, unclamped.
+(compute-material Loss
+  (workgroup 256)
+  (bindings
+   (colours (buffer-array vec4 read))
+   (targets (buffer-array uint read))
+   (pixelGrads (buffer-array vec4 write))   ; dL/dI in .rgb
+   (pixelLosses (buffer-array float write)))
+  (push (pixels uint) (targetOffset uint) (loss uint))
+  (compute
+   (let* ([scale (/ 1.0 (* 3.0 (float pixels)))])
+     (for ([i (range globalInvocationId.x pixels (* entryGroupSize workgroupCount.x))])
+       (let* ([r (- (.rgb (at colours i)) (unpackRgb (at targets (+ targetOffset i))))])
+         (when (= loss lossL2)
+           (write! (at pixelGrads i) (vec4 (* 2.0 r) 0.0))
+           (write! (at pixelLosses i) (dot r r)))
+         (when (not= loss lossL2)
+           (write! (at pixelGrads i) (vec4 (* (sign r) scale) 0.0))
+           (write! (at pixelLosses i) (* (+ (abs r.x) (abs r.y) (abs r.z)) scale))))))))
+
+;; 7a. Each tile's [start, last, end): its range, and the entry after the last one any of its pixels
+;; blended (the largest of its pixels' lastEntries, at least the start), three uints a tile in
+;; backwardRanges, so the backward pass walks only [start, last), and its loop bound stays a
+;; buffer's value, the same for the whole workgroup.
+(compute-material TileLasts
+  (workgroup 64)
+  (bindings
+   (ranges (buffer-array uint read))         ; two uints a tile: TileRanges
+   (lastEntries (buffer-array uint read))
+   (backwardRanges (buffer-array uint write)))
+  (push (width uint) (height uint) (gridWidth uint) (tileCount uint))
+  (compute
+   (for ([t (range globalInvocationId.x tileCount (* splatGroupSize workgroupCount.x))])
+     (let* ([x0 (* (remainder t gridWidth) tileSize)]
+            [y0 (* (/ t gridWidth) tileSize)]
+            [start (at ranges (* t (uint 2)))]
+            [last (fold ([m start]) ([y (range y0 (min height (+ y0 tileSize)))]
+                                     [x (range x0 (min width (+ x0 tileSize)))])
+                    (max m (at lastEntries (+ (* y width) x))))])
+       (write! (at backwardRanges (* t (uint 3))) start)
+       (write! (at backwardRanges (+ (* t (uint 3)) (uint 1))) last)
+       (write! (at backwardRanges (+ (* t (uint 3)) (uint 2))) (at ranges (+ (* t (uint 2)) (uint 1))))))))
+
+;; 7b. Each tile's pixels, one invocation each in a 16x16 workgroup per tile as in Rasterize, walk
+;; the tile's entries back to front, from each pixel's last blended entry (lastEntries) with its
+;; final transmittance (colours' .w), undoing the blend (the reference code's backward pass):
+;;   T = T / (1 - alpha), the transmittance before the entry;
+;;   dL/dcolour = alpha T dL/dI;
+;;   dL/dalpha = T (c - R) . dL/dI - T_final / (1 - alpha) bg . dL/dI, R the colour behind the
+;;     entry per unit of transmittance after it (R = alpha' c' + (1 - alpha') R' of the entry
+;;     behind it, starting at 0);
+;;   with alpha = min(alphaMax, opacity G), G = exp(power) and d = mean - the pixel's centre:
+;;   dL/dopacity = G dL/dalpha, dL/dmean = -opacity dL/dalpha G (A d) (A the conic), and
+;;   dL/dconic = -opacity dL/dalpha G (d_x^2 / 2, d_x d_y, d_y^2 / 2): the conic's b counts both
+;;   off-diagonal entries (tests/oracle/closed_form.h's convention; the reference code's
+;;   dL_dconic2D.y is half of it).
+;; Where the clamp holds (opacity G > alphaMax), alpha doesn't depend on the opacity, mean or conic,
+;; so those gradients are 0 (exact; the reference code passes the gradient through the clamp:
+;; docs/paper-conformance.md). Entries the forward pass skipped (alpha < alphaMin, power > 0, the
+;; same computation) or didn't reach (from the pixel's last entry on) give a pixel nothing.
+;; The workgroup loads the entries in batches of backwardBatch, from the tile's last (TileLasts:
+;; entries past it, which no pixel blended, get gradients of 0 without the loop), and for each
+;; entry reduces its 256 pixels' gradients in shared memory (each pixel's 9 values, then 16 sums of
+;; 16 per value, then 1 of 16), so each entry's gradients are written once (entryGradients, at
+;; gradientStride times the entry), in a fixed order: deterministic, and without float atomics.
+;; Every invocation runs every loop (their bounds are the tile's), as the barriers need.
+(compute-material BackwardRasterize
+  (workgroup 16 16)
+  (bindings
+   (projected (buffer-array Projected read))
+   (entrySplats (buffer-array uint read))
+   (backwardRanges (buffer-array uint read)) ; three uints a tile: TileLasts
+   (colours (buffer-array vec4 read))        ; the final transmittance in .w
+   (lastEntries (buffer-array uint read))
+   (pixelGrads (buffer-array vec4 read))     ; dL/dI in .rgb
+   (entryGradients (buffer-array float write)))
+  (push (width uint) (height uint) (background vec3))
+  ;; 128 x (8 + 16 + 16) + 9 x 256 x 4 + 9 x 16 x 4 bytes = 14912 (at most 16 KB:
+  ;; docs/architecture.md)
+  (shared
+   (batchMeans (array vec2 128))
+   (batchConicOpacities (array vec4 128))  ; the conic (a, b, c) and the opacity
+   (batchColours (array vec4 128))
+   (scratch (array float 2304))            ; value v of pixel (lane) l at 256 v + l
+   (partials (array float 144)))           ; value v's 16 partial sums at 16 v
+  (compute
+   (let* ([tile (+ (* workgroupId.y workgroupCount.x) workgroupId.x)]
+          [tileStart (at backwardRanges (* tile (uint 3)))]
+          [tileLast (at backwardRanges (+ (* tile (uint 3)) (uint 1)))]
+          [tileEnd (at backwardRanges (+ (* tile (uint 3)) (uint 2)))]
+          [lane (+ (* localInvocationId.y tileSize) localInvocationId.x)]
+          [pixel globalInvocationId.xy]
+          [inside (and (< pixel.x width) (< pixel.y height))]
+          [index (+ (* pixel.y width) pixel.x)]
+          [centre (+ (vec2 pixel) 0.5)]
+          ;; Outside the image: no entries (the last is the tile's start), only loading and reducing
+          [final (if inside (at colours index) (vec4 0.0 0.0 0.0 1.0))]
+          [last (if inside (at lastEntries index) tileStart)]
+          [dIdC (if inside (.rgb (at pixelGrads index)) (vec3 0.0))]
+          [bgTerm (dot background dIdC)]
+          [batches (/ (+ (- tileLast tileStart) (- backwardBatch (uint 1))) backwardBatch)]
+          [(t behind lastAlpha lastColour)
+           (fold ([t final.w] [behind (vec3 0.0)] [lastAlpha 0.0] [lastColour (vec3 0.0)])
+                 ([b (range (uint 0) batches)])
+             ;; Batch b holds [lo, hi): the last backwardBatch entries before the later batches'
+             (let* ([hi (- tileLast (* b backwardBatch))]
+                    [lo (if (> (- hi tileStart) backwardBatch) (- hi backwardBatch) tileStart)]
+                    [n (- hi lo)])
+               (when (< lane n)
+                 (let* ([p (at projected (at entrySplats (+ lo lane)))])
+                   (write! (at batchMeans lane) p.mean)
+                   (write! (at batchConicOpacities lane) (vec4 p.conic p.opacity))
+                   (write! (at batchColours lane) (vec4 p.colour 0.0))))
+               (barrier!)
+               (fold ([t t] [behind behind] [lastAlpha lastAlpha] [lastColour lastColour])
+                     ([j (range (uint 0) n)])
+                 (let* ([k (- n j (uint 1))]
+                        [e (+ lo k)]
+                        [co (at batchConicOpacities k)]
+                        [d (- (at batchMeans k) centre)]
+                        ;; As Rasterize computes them, so the same entries are skipped
+                        [power (- (* -0.5 (+ (* co.x d.x d.x) (* co.z d.y d.y))) (* co.y d.x d.y))]
+                        [g (exp power)]
+                        [raw (* co.w g)]
+                        [alpha (min alphaMax raw)]
+                        [live (and (< e last) (not (or (> power 0.0) (< alpha alphaMin))))]
+                        [before (/ t (- 1.0 alpha))]
+                        [c (.rgb (at batchColours k))]
+                        [nextBehind (+ (* lastAlpha lastColour) (* (- 1.0 lastAlpha) behind))]
+                        [dLdAlpha (- (* before (dot (- c nextBehind) dIdC))
+                                     (* (/ final.w (- 1.0 alpha)) bgTerm))]
+                        ;; The clamp's derivative: 0 where it holds
+                        [dLdG (if (> raw alphaMax) 0.0 (* co.w dLdAlpha))]
+                        [gdx (* g d.x)]
+                        [gdy (* g d.y)]
+                        [dMean (* dLdG (vec2 (- (- (* gdx co.x)) (* gdy co.y))
+                                             (- (- (* gdy co.z)) (* gdx co.y))))]
+                        [dConic (* dLdG (vec3 (* -0.5 gdx d.x) (- (* gdx d.y)) (* -0.5 gdy d.y)))]
+                        [dOpacity (if (> raw alphaMax) 0.0 (* g dLdAlpha))]
+                        [dColour (* dIdC (* alpha before))]
+                        [use (if live 1.0 0.0)])
+                   (write! (at scratch (+ (* gradientMean (uint 256)) lane)) (* use dMean.x))
+                   (write! (at scratch (+ (* (+ gradientMean (uint 1)) (uint 256)) lane)) (* use dMean.y))
+                   (write! (at scratch (+ (* gradientConic (uint 256)) lane)) (* use dConic.x))
+                   (write! (at scratch (+ (* (+ gradientConic (uint 1)) (uint 256)) lane)) (* use dConic.y))
+                   (write! (at scratch (+ (* (+ gradientConic (uint 2)) (uint 256)) lane)) (* use dConic.z))
+                   (write! (at scratch (+ (* gradientOpacity (uint 256)) lane)) (* use dOpacity))
+                   (write! (at scratch (+ (* gradientColour (uint 256)) lane)) (* use dColour.x))
+                   (write! (at scratch (+ (* (+ gradientColour (uint 1)) (uint 256)) lane)) (* use dColour.y))
+                   (write! (at scratch (+ (* (+ gradientColour (uint 2)) (uint 256)) lane)) (* use dColour.z))
+                   (barrier!)
+                   ;; 144 invocations: value v = lane / 16's lanes 16 (lane % 16) to + 16
+                   (when (< lane (* gradientStride (uint 16)))
+                     (let* ([base (+ (* (/ lane (uint 16)) (uint 256)) (* (remainder lane (uint 16)) (uint 16)))])
+                       (write! (at partials lane) (sum ([i (range (uint 0) (uint 16))]) (at scratch (+ base i))))))
+                   (barrier!)
+                   ;; 9 invocations: value v = lane's 16 partial sums. The next entry's partials
+                   ;; are written after its first barrier, so these reads come first.
+                   (when (< lane gradientStride)
+                     (write! (at entryGradients (+ (* e gradientStride) lane))
+                             (sum ([i (range (uint 0) (uint 16))]) (at partials (+ (* lane (uint 16)) i)))))
+                   (if live
+                       (values before nextBehind alpha c)
+                       (values t behind lastAlpha lastColour))))))])
+     ;; Entries past the tile's last (no pixel blended them): their gradients are 0
+     (for ([i (range lane (* (- tileEnd tileLast) gradientStride) (* tileSize tileSize))])
+       (write! (at entryGradients (+ (* tileLast gradientStride) i)) 0.0))
+     ;; The fold's values are only its state
+     (when (< t 0.0) (return!)))))
+
+;; 8a. Each sorted entry's position, at the entry's place before the sort (its splat's offset plus
+;; its index in the splat's tile rectangle, row by row: EmitEntries' order), from its tile. Places
+;; no entry maps to keep the clear's 0xFFFFFFFF (only after a wrapped total; GatherGradients
+;; skips them).
+(compute-material InvertEntries
+  (workgroup 256)
+  (bindings
+   (projected (buffer-array Projected read))
+   (offsets (buffer-array uint read))
+   (counts (buffer-array uint read))
+   (entryKeys (buffer-array uint read))
+   (entrySplats (buffer-array uint read))
+   (entryPositions (buffer-array uint write)))
+  (push (gridWidth uint))
+  (compute
+   (let* ([entries (at counts countEntries)]
+          [bits (at counts countDepthBits)])
+     (for ([e (range globalInvocationId.x entries (* entryGroupSize workgroupCount.x))])
+       (let* ([p (at projected (at entrySplats e))]
+              [tile (keyTile (at entryKeys e) bits)]
+              [tx (remainder tile gridWidth)]
+              [ty (/ tile gridWidth)]
+              [place (+ (at offsets (at entrySplats e))
+                        (* (- ty p.tiles.y) (- p.tiles.z p.tiles.x)) (- tx p.tiles.x))])
+         (when (and (>= tx p.tiles.x) (< tx p.tiles.z) (>= ty p.tiles.y) (< ty p.tiles.w)
+                    (< place entries))
+           (write! (at entryPositions place) e)))))))
+
+;; 8b. Each splat's gradients: its entries' (those the frame holds), summed in the order of its
+;; tiles, by one invocation, so the sum is the same every run. Culled splats' are 0.
+(compute-material GatherGradients
+  (workgroup 64)
+  (bindings
+   (projected (buffer-array Projected read))
+   (offsets (buffer-array uint read))
+   (counts (buffer-array uint read))
+   (entryPositions (buffer-array uint read))
+   (entryGradients (buffer-array float read))
+   (splatGradients (buffer-array ProjectedGradient write)))
+  (push (splatCount uint))
+  (compute
+   (let* ([entries (at counts countEntries)])
+     (for ([s (range globalInvocationId.x splatCount (* splatGroupSize workgroupCount.x))])
+       (let* ([first (at offsets s)]
+              [(mean conic opacity colour)
+               (fold ([mean (vec2 0.0)] [conic (vec3 0.0)] [opacity 0.0] [colour (vec3 0.0)])
+                     ([k (range (uint 0) (.tileCount (at projected s)))])
+                 (let* ([place (+ first k)]
+                        [e (if (< place entries) (at entryPositions place) (bitnot (uint 0)))])
+                   (if (< e entries)
+                       (let* ([b (* e gradientStride)])
+                         (values (+ mean (vec2 (at entryGradients (+ b gradientMean))
+                                               (at entryGradients (+ b gradientMean (uint 1)))))
+                                 (+ conic (vec3 (at entryGradients (+ b gradientConic))
+                                                (at entryGradients (+ b gradientConic (uint 1)))
+                                                (at entryGradients (+ b gradientConic (uint 2)))))
+                                 (+ opacity (at entryGradients (+ b gradientOpacity)))
+                                 (+ colour (vec3 (at entryGradients (+ b gradientColour))
+                                                 (at entryGradients (+ b gradientColour (uint 1)))
+                                                 (at entryGradients (+ b gradientColour (uint 2)))))))
+                       (values mean conic opacity colour))))])
+         (write! (at splatGradients s) (ProjectedGradient mean conic opacity colour)))))))
+
+;; With finiteDifferences: adds delta to one field of one splat's projection (perturbOpacity and
+;; so on; perturbNone changes nothing), after the preprocess. Its tiles stay as they were, so the
+;; perturbed frame blends the same entries.
+(compute-material Perturb
+  (workgroup 1)
+  (bindings (projected (buffer-array Projected read-write)))
+  (push (splatCount uint) (splat uint) (field uint) (delta float))
+  (compute
+   (when (and (not= field perturbNone) (< splat splatCount))
+     (let* ([p (at projected splat)]
+            [unit (vec3 (if (= field perturbRed) 1.0 0.0) (if (= field (+ perturbRed (uint 1))) 1.0 0.0)
+                        (if (= field (+ perturbRed (uint 2))) 1.0 0.0))]
+            [shift (vec2 (if (= field perturbMeanX) 1.0 0.0) (if (= field (+ perturbMeanX (uint 1))) 1.0 0.0))])
+       (write! (at projected splat)
+               (with p #:opacity (+ p.opacity (if (= field perturbOpacity) delta 0.0))
+                     #:colour (+ p.colour (* unit delta))
+                     #:mean (+ p.mean (* shift delta))))))))
+
+;; Whether a splat's projection blends into a pixel at all, as Rasterize decides (alpha against
+;; alphaMin, the exponent's sign)
+(define (blends [mean : vec2] [conic : vec3] [opacity : float] [centre : vec2]) : bool
+  (let* ([d (- mean centre)]
+         [power (- (* -0.5 (+ (* conic.x d.x d.x) (* conic.z d.y d.y))) (* conic.y d.x d.y))])
+    (not (or (> power 0.0) (< (min alphaMax (* opacity (exp power))) alphaMin)))))
+
+;; With finiteDifferences: a probe runs its +h side, then its -h side (probes 2k + 1 and 2k + 2,
+;; probe 0 unperturbed). The +h frames keep each pixel's loss and last entry (plusLosses and
+;; plusLasts, shared between frames); the -h frame writes each pixel's plus - minus, reduced into
+;; losses' lossDelta, so the difference is summed pixel by pixel rather than as the difference of
+;; two whole losses. Every frame writes its probe into lossProbe, so the app knows which frame it
+;; reads. The loss is discontinuous where a decision flips, and the analytic gradient is the
+;; derivative between those jumps, so a pixel where one flips between the sides counts nothing:
+;;   - the perturbed splat's alpha crossing alphaMin (it blends into the pixel or not): this
+;;     frame's projection against the other side's (perturbed by -2 delta);
+;;   - the stop at T < 1e-4 moving to another entry (any splat's, as the perturbation changes T):
+;;     the pixel's lastEntries differ between the sides.
+;; Only the opacity and the mean move them; such pixels are few.
+(compute-material LossDelta
+  (workgroup 256)
+  (bindings
+   (projected (buffer-array Projected read))
+   (pixelLosses (buffer-array float read))
+   (lastEntries (buffer-array uint read))
+   (plusLosses (buffer-array float read-write))
+   (plusLasts (buffer-array uint read-write))
+   (lossDeltas (buffer-array float write))
+   (losses (buffer-array float write)))
+  (push (pixels uint) (width uint) (probe uint) (splatCount uint) (splat uint) (field uint) (delta float))
+  (compute
+   (when (= globalInvocationId.x (uint 0)) (write! (at losses lossProbe) (float probe)))
+   (let* ([plus (= (remainder probe (uint 2)) (uint 1))]
+          [minus (and (not= probe (uint 0)) (not plus))]
+          [valid (and minus (< splat splatCount))]
+          [p (at projected (if valid splat (uint 0)))]
+          ;; The other side's: this frame's projection minus twice the delta
+          [otherOpacity (- p.opacity (if (= field perturbOpacity) (* 2.0 delta) 0.0))]
+          [otherMean (- p.mean (* 2.0 delta (vec2 (if (= field perturbMeanX) 1.0 0.0)
+                                                  (if (= field (+ perturbMeanX (uint 1))) 1.0 0.0))))])
+     (for ([i (range globalInvocationId.x pixels (* entryGroupSize workgroupCount.x))])
+       (when plus
+         (write! (at plusLosses i) (at pixelLosses i))
+         (write! (at plusLasts i) (at lastEntries i)))
+       (when (not minus) (write! (at lossDeltas i) 0.0))
+       (when minus
+         (let* ([centre (+ (vec2 (float (remainder i width)) (float (/ i width))) 0.5)]
+                [flips (or (not= (at plusLasts i) (at lastEntries i))
+                           (and valid (> p.tileCount 0)
+                                (not= (blends p.mean p.conic p.opacity centre)
+                                      (blends otherMean p.conic otherOpacity centre))))])
+           (write! (at lossDeltas i) (if flips 0.0 (- (at plusLosses i) (at pixelLosses i))))))))))
+
+;; ---------------------------------------------------------------------------------------------
+;; The graph
+;; ---------------------------------------------------------------------------------------------
+;; SplatGraph's forward pass (ZGAL has no graph composition, so its nodes are repeated here,
+;; without the window and capture) and the backward pass. Its parameters and inputs are
+;; SplatGraph's (render_graph.zgal says what they are), and the training's.
+(graph TrainGraph
+  (parameter splatCount uint)
+  (parameter cameraIndex uint)
+  (parameter width uint)
+  (parameter height uint)
+  (parameter shDegree uint)
+  (input splatFile path)
+  (input cameraFile path)
+  (parameter near float)
+  (parameter far float)
+  (parameter maxGroups uint)
+  ;; Whether the graph also reads back the scene, the projections and the gradients, for tests
+  (parameter inspect bool)
+  ;; The entries' capacity this frame (at least 1), at most 3145728 (trainEntryCapacityMax): a
+  ;; larger one counts as that (counts' countCapacity says so)
+  (input capacity (per-frame uint))
+  (input background (per-frame vec3))
+  ;; The targets (RGBA8 pixels, row by row: an images_<k>.bin) and the camera's first pixel in them
+  (input targetFile path)
+  (input targetOffset (per-frame uint))
+  ;; lossL1 or lossL2
+  (parameter loss uint)
+  ;; Whether the graph perturbs a projection (Perturb) and sums the loss's change (LossDelta) for
+  ;; finite differences: probe 0 is unperturbed, any other perturbs field perturbField
+  ;; (perturbOpacity and so on) of splat perturbSplat by perturbDelta, +h for an odd probe and -h
+  ;; (after the same probe's +h frames) for an even one
+  (parameter finiteDifferences bool)
+  (input probe (per-frame uint))
+  (input perturbSplat (per-frame uint))
+  (input perturbField (per-frame uint))
+  (input perturbDelta (per-frame float))
+
+  (constant gridWidth (/ (+ width 15) 16))
+  (constant gridHeight (/ (+ height 15) 16))
+  (constant tileCount (* gridWidth gridHeight))
+  (constant pixels (* width height))
+
+  (buffer-file splats Splat splatFile)
+  (buffer-file cameras Camera cameraFile)
+  (buffer-file targets uint targetFile)
+  (buffer projected Projected splatCount #:frames per-frame)
+  (buffer tileCounts uint splatCount #:frames per-frame)
+  (buffer offsets uint splatCount #:frames per-frame)
+  (buffer counts uint 5 #:frames per-frame)  ; countSize
+  (buffer commands DispatchCommand 1 #:frames per-frame)
+  (buffer entryKeys uint (min capacity 3145728) #:frames per-frame)
+  (buffer entrySplats uint (min capacity 3145728) #:frames per-frame)
+  (buffer ranges uint (* tileCount 2) #:frames per-frame)
+  (buffer backwardRanges uint (* tileCount 3) #:frames per-frame)
+  (buffer colours vec4 pixels #:frames per-frame)
+  (buffer lastEntries uint pixels #:frames per-frame)
+  (image rendered rgba8 (fixed width height) #:frames per-frame)
+  ;; The backward pass's
+  (buffer pixelGrads vec4 pixels #:frames per-frame)
+  (buffer pixelLosses float pixels #:frames per-frame)
+  (buffer losses float 3 #:frames per-frame)  ; lossTotal, lossProbe, lossDelta
+  (buffer entryGradients float (* (min capacity 3145728) 9) #:frames per-frame)  ; gradientStride
+  (buffer entryPositions uint (min capacity 3145728) #:frames per-frame)
+  (buffer splatGradients ProjectedGradient splatCount #:frames per-frame)
+  ;; Finite differences': the +h side's, shared, so the -h frames see the last +h frame's
+  (buffer plusLosses float pixels #:frames shared #:when finiteDifferences)
+  (buffer plusLasts uint pixels #:frames shared #:when finiteDifferences)
+  (buffer lossDeltas float pixels #:frames per-frame #:when finiteDifferences)
+
+  (material preprocessing Preprocess splats cameras projected tileCounts
+            #:push ((splatCount splatCount) (cameraIndex cameraIndex) (near near) (shDegree shDegree))
+            #:invocations ((min splatCount (* (max maxGroups 1) 64))))  ; 64: the splat workgroup size
+  (material perturbing Perturb projected
+            #:push ((splatCount splatCount) (splat perturbSplat) (field perturbField) (delta perturbDelta))
+            #:invocations (1) #:when finiteDifferences)
+  (material planning PlanEntries counts commands
+            #:push ((capacity (min capacity 3145728)) (tileCount tileCount) (near near) (far far)
+                    (maxGroups maxGroups))
+            #:invocations (1))
+  (material emitting EmitEntries projected offsets counts entryKeys entrySplats
+            #:push ((splatCount splatCount) (gridWidth gridWidth) (near near) (far far)))
+  (material ranging TileRanges entryKeys counts ranges #:push ((tileCount tileCount)))
+  (material rasterizing Rasterize projected entrySplats ranges colours lastEntries rendered
+            #:push ((width width) (height height) (background background))
+            #:invocations ((* gridWidth 16) (* gridHeight 16)))  ; 16: tileSize, a workgroup a tile
+  (material scoring Loss colours targets pixelGrads pixelLosses
+            #:push ((pixels pixels) (targetOffset targetOffset) (loss loss))
+            #:invocations ((min pixels (* (max maxGroups 1) 256))))  ; 256: its workgroup size
+  (material differencing LossDelta projected pixelLosses lastEntries plusLosses plusLasts lossDeltas losses
+            #:push ((pixels pixels) (width width) (probe probe) (splatCount splatCount) (splat perturbSplat)
+                    (field perturbField) (delta perturbDelta))
+            #:invocations ((min pixels (* (max maxGroups 1) 256))) #:when finiteDifferences)
+  (material lasting TileLasts ranges lastEntries backwardRanges
+            #:push ((width width) (height height) (gridWidth gridWidth) (tileCount tileCount))
+            #:invocations ((min tileCount (* (max maxGroups 1) 64))))  ; 64: its workgroup size
+  (material backward BackwardRasterize projected entrySplats backwardRanges colours lastEntries pixelGrads
+            entryGradients
+            #:push ((width width) (height height) (background background))
+            #:invocations ((* gridWidth 16) (* gridHeight 16)))
+  (material inverting InvertEntries projected offsets counts entryKeys entrySplats entryPositions
+            #:push ((gridWidth gridWidth)))
+  (material gathering GatherGradients projected offsets counts entryPositions entryGradients
+            splatGradients
+            #:push ((splatCount splatCount))
+            #:invocations ((min splatCount (* (max maxGroups 1) 64))))
+
+  ;; The forward pass: SplatGraph's
+  (dispatch preprocess preprocessing)
+  (dispatch perturb perturbing #:when finiteDifferences)
+  (exclusive-scan scanTileCounts tileCounts offsets #:op add #:count splatCount)
+  (reduce totalTileCounts tileCounts (at counts 1) #:op add #:count splatCount)
+  (dispatch plan planning)
+  (dispatch emit emitting #:indirect (at commands 0))
+  (sort sortEntries entryKeys #:values entrySplats #:count (at counts 0))
+  (clear clearRanges ranges)
+  (dispatch findRanges ranging #:indirect (at commands 0))
+  (dispatch rasterize rasterizing)
+  ;; The loss
+  (dispatch score scoring)
+  (reduce totalLoss pixelLosses (at losses 0) #:op add #:count pixels)  ; lossTotal
+  (dispatch difference differencing #:when finiteDifferences)
+  (reduce totalDelta lossDeltas (at losses 2) #:op add #:count pixels #:when finiteDifferences)
+  ;; The backward pass
+  (dispatch findLasts lasting)
+  (dispatch backwardRasterize backward)
+  (clear clearPositions entryPositions #:value 4294967295)
+  (dispatch invert inverting #:indirect (at commands 0))
+  (dispatch gather gathering)
+
+  (readback readCounts counts)
+  (readback readLosses losses)
+  (readback readSplatGradients splatGradients #:when inspect)
+  (readback readBackwardRanges backwardRanges #:when inspect)
+  (readback readSplats splats #:once #t #:when inspect)
+  (readback readCameras cameras #:once #t #:when inspect)
+  (readback readProjected projected #:when inspect))
