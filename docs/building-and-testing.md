@@ -103,6 +103,43 @@ tests it on its own. When using it:
   Against the reference: its conic gradient's off-diagonal is half of `conic.b`, its Σ′ gradient
   equals `cov.b`, and its `dL_dmean2D` is per NDC unit (0.5·W, or 0.5·H for y, times `mean`).
 
+## Gradient checks
+
+`programs/grad_test` checks `TrainGraph`'s gradients
+([architecture.md](architecture.md#train-graph)) two ways:
+
+- **Closed form**: S1's `gradient` variant against `projected_gradients()`, L2 and L1, within 1e-3
+  relative (or 1e-2 of the largest gradient of its kind, for one near 0). The targets are 8-bit,
+  so the oracle takes the target rounded as the file has it.
+- **GPU finite differences**, the plan's rule: the smooth L2 loss against a fixed target unlike
+  the render (`scenes.py` writes a sin/cos pattern). The probes are the visible splats' opacity,
+  colour (standing for SH DC) and 2D mean (standing for position: the preprocess chain's own check
+  is still to come), chosen without looking at the analytic gradients, so a gradient wrongly 0 or
+  small is probed too: of each kind, every field, or `--samples` (default 32) spread evenly over
+  them on a bigger scene. Central differences with h = 1e-3 of the value (at least 1e-4) for the
+  opacity and colour, and a fixed 0.005 px for the mean (a step relative to a pixel position means
+  nothing, and 0.05 px left a few % of truncation error on S3's smaller splats). A probe passes
+  when the analytic gradient and the FD are both finite and |analytic − FD| ≤
+  2e-2·max(|analytic|, |FD|) + 1e-5, or both are negligible. Each kind needs at least one probe
+  that isn't negligible. The perturbation is to the projection, one frame per side, and the
+  loss's change between the sides is summed pixel by pixel by a `reduce`.
+  - Negligible: max(|analytic|, |FD|) below 1e-2 of the largest analytic gradient of its kind
+    (opacity, colour, mean) among the visible splats. Summing the per-pixel changes in float
+    leaves an absolute error of about 1e-3 of the largest gradient, which fails the rule's relative
+    bound on smaller gradients.
+  - The loss jumps where a splat's α crosses 1/255 (a jump adds up to about 4 to a difference) and
+    where the stop at T < 1e-4 moves to another entry, so pixels where either flips between the
+    two sides are left out ([architecture.md](architecture.md#train-graph)). Without the first, 12
+    of 36 differences failed on S2.
+  - Where the oracle can't reach, test.sh runs: S2's two cameras; S1's `one-splat-clamped` (α
+    clamped at 0.99, whose derivative is exactly 0); S1's `stack`, with `--stops` (fails unless a
+    pixel stops at T < 1e-4, counted on the CPU from the projections); S3's cameras 0 and 24 with
+    `--samples 24` and `--multi-batch` (fails unless a tile's backward walks more than one batch,
+    from `backwardRanges`).
+- Every run checks that the gradients are finite and prints a hash; test.sh compares two runs'
+  hashes. The runs without `--finite-differences` also check that the next `--repeats` frames
+  give the same bits.
+
 ## Synthetic scenes
 
 `tools/make_synthetic.py` writes test scenes in the converter's format (`docs/data-format.md`),
@@ -123,7 +160,7 @@ tools/make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f
 ```
 
 - **S1** (`<out dir>/<variant>/`, no seed): the closed-form oracles' setups, with
-  `tests/cpp/closed_form_test.cpp`'s numbers (and `off-centre`, which no C++ test has). Cameras
+  `tests/cpp/closed_form_test.cpp`'s numbers (and `off-centre` and `stack`, which no C++ test has). Cameras
   sit at the origin, rotated only about z, with fx = fy = f and the principal point at the image
   centre (offset by (`dcx`, `dcy`) for `off-centre`); the splats have DC colour only and
   rotation `quat_about_z(theta)`. `source.oracle` holds what a kernel test needs to build the
@@ -142,6 +179,7 @@ tools/make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f
   | `two-splat` | 50, 33² | the composite in depth order; stored back splat first, so the kernel must sort |
   | `rotated-camera`, `-aligned` | 50, 33², 3 cameras | W against Wᵀ, with theta 0.7 and 0 |
   | `off-centre` | 50, 48×32, (cx, cy) = (21, 12.5) | non-square and an off-centre principal point: swapped cx and cy, or width and height in the tile grid or the row stride, move the splat (the frustum guard's use of the size is not engaged, so it is not checked) |
+  | `stack` | 50, 33² | five splats on the axis, the front four near-opaque: within about 2 px of the centre the stop at T < 1e-4 leaves the third (centre) or fourth and every later splat unblended |
 
   The 33-pixel images put a pixel centre on the principal point. The cameras all sit at the
   origin, so the converter's extent (from camera centres) would be 0; S1 records instead 1.1 times

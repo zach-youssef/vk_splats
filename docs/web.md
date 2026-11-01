@@ -61,6 +61,9 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   `build/web-check/render_test_check` (`programs/render_test/web-check/`) runs the same checks on
   them. A copy with corrupted colours must fail them. `make test-web` therefore needs a C++
   compiler as well as Node.
+- **grad_test**: every run of the native test, in the same way: `$GRAD_TEST_READBACKS` and
+  `build/web-check/grad_test_check`, and a copy with the opacity gradients raised by 1% must fail.
+  The finite differences themselves run in the app, the same on both.
 
 ## Not supported on the web
 
@@ -69,4 +72,4 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 - **The window**: splat_render's present path runs only in a page (`splat_render.zgal.html`), and
   no test covers it; the tests are headless under Node.
 - **Paths in externs**: a ZGAL extern can't take a `path` (or string) parameter, so
-  render_test's readback directory is an environment variable rather than an option.
+  render_test's and grad_test's readback directories are environment variables rather than options.

@@ -84,7 +84,7 @@ def test_s1_writes_every_variant(s1):
 
 # The numbers of tests/cpp/closed_form_test.cpp's setups, written out again so a change on either
 # side shows: (f, width, height, splats as (x, y, z, scales, theta, opacity logit, dc), background,
-# target, camera rotations phi), and off-centre's, which no C++ test has
+# target, camera rotations phi), and off-centre's and stack's, which no C++ test has
 EXPECTED_S1 = {
     "isotropic": (50, 33, 33, [(0, 0, 4, (0.2, 0.2, 0.2), 0.3, 0, (1, 0, -1))], (0, 0, 0), None, [0]),
     "anisotropic": (50, 33, 33, [(0, 0, 4, (0.3, 0.1, 0.5), 0, 0, (1, 0, -1))], (0, 0, 0), None, [0]),
@@ -106,6 +106,11 @@ EXPECTED_S1 = {
                                [0.4, -1.1, 2.5]),
     "off-centre": (50, 48, 32, [(0.3, 0.25, 4, (0.25, 0.08, 0.15), 0.9, 0.5, (1, 0, -1))], (0.1, 0.2, 0.3), None,
                    [0]),
+    "stack": (50, 33, 33, [(0, 0, 3, (0.3, 0.27, 0.2), 0, 4.2, (1, 0, -1)),
+                           (0, 0, 3.5, (0.35, 0.4, 0.2), 0.5, 4.2, (-1, 1, 0)),
+                           (0, 0, 4, (0.45, 0.38, 0.2), 1.0, 4.2, (0, -1, 1)),
+                           (0, 0, 4.5, (0.42, 0.5, 0.2), 2.0, 4.2, (0.5, 0.5, 1)),
+                           (0, 0, 6, (0.6, 0.6, 0.2), 0, 1, (0.5, 0.5, -0.5))], (0.1, 0.2, 0.3), None, [0]),
 }
 # The principal point's offset from the image centre (dcx, dcy); (0, 0) for the others
 PRINCIPAL_OFFSETS = {"off-centre": (-3.0, -3.5)}

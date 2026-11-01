@@ -1,0 +1,347 @@
+;; The backward rasterize's test (lib/train_graph.zgal's stages 6 to 8): it runs the training graph
+;; for one camera of a scene against a target image, with a fixed capacity (so every frame is
+;; complete and the same), reads back each splat's gradients with respect to its projection and
+;; the loss, and checks them two ways:
+;;   - `check` (grad_test.cpp, grad_check.h), on every run: every gradient and the loss finite, and
+;;     with --oracle (S1's "gradient" variant: one splat over every pixel, a constant target),
+;;     against the closed-form oracle's (tests/oracle/closed_form.h's projected_gradients, for the
+;;     L2 loss or with --l1 the L1); it prints a hash, which test.sh compares between runs. Then,
+;;     without --finite-differences, --repeats more frames' gradients must match it bit for bit
+;;     (`sameGradients`: the backward pass is deterministic).
+;;   - with --finite-differences, central differences of the loss on the GPU (the plan's rule).
+;;     The probes are chosen without looking at the analytic gradients, so a gradient wrongly 0 is
+;;     probed too: of each kind (the opacity; the colour's r, g, b; the mean's x, y), the visible
+;;     splats' fields, all of them or --samples spread evenly over them. For each, the graph
+;;     perturbs the projection by +h, then -h (stepOf: 1e-3 of an opacity or colour, at least 1e-4;
+;;     a fixed 0.005 px for the mean, since a step relative to a pixel position means nothing and
+;;     0.05 px already leaves a few % of truncation error on S3's small splats), and sums the
+;;     loss's change between the two pixel by pixel, leaving out pixels where a decision flips
+;;     between them (the splat's alpha crossing 1/255, a pixel's stop at T < 1e-4 moving), where
+;;     the loss jumps.
+;;     With a the analytic gradient and fd = (plus - minus) / 2h, both must be finite, and unless
+;;     both are negligible (below 1e-2 of the largest analytic gradient of the kind: the float
+;;     noise of summing the pixels' changes is about 1e-3 of it), |a - fd| must be within
+;;     2e-2 max(|a|, |fd|) + 1e-5. Each kind must have a gradient that isn't negligible. Every
+;;     frame reads back which probe it ran, so a frame's change is matched with its probe,
+;;     however late its readback arrives. --multi-batch and --stops make sure a run reaches the
+;;     paths small scenes don't: a tile whose backward walks more than one batch (from the
+;;     backwardRanges readback), a pixel stopped at T < 1e-4 (counted on the CPU).
+;; It fails on a mismatch, an overflowing frame (raise --capacity) or when the frames run out first.
+;; On the web (grad_test.inputs.ts), `check` writes the frame's readbacks to the directory
+;; $GRAD_TEST_READBACKS names instead, and web-check/grad_test_check.cpp runs the same C++ checks
+;; on them; the finite differences run in the app itself, so the same on both.
+
+(import "../../lib/train_graph.zgal")
+
+;; One finite difference: a splat's field (perturbOpacity and so on), its analytic gradient and
+;; the step
+;; and the largest analytic gradient of its kind (what's negligible is relative to)
+(struct Probe (splat uint) (field uint) (analytic float) (h float) (largest float))
+
+;; The gradient and the projection's value for a field (perturbOpacity to perturbMeanX + 1)
+(define (fieldGradient [g : ProjectedGradient] [field : uint]) : float
+  (cond [(= field perturbOpacity) g.opacity]
+        [(= field perturbRed) g.colour.x]
+        [(= field (+ perturbRed (uint 1))) g.colour.y]
+        [(= field (+ perturbRed (uint 2))) g.colour.z]
+        [(= field perturbMeanX) g.mean.x]
+        [else g.mean.y]))
+
+(define (fieldValue [p : Projected] [field : uint]) : float
+  (cond [(= field perturbOpacity) p.opacity]
+        [(= field perturbRed) p.colour.x]
+        [(= field (+ perturbRed (uint 1))) p.colour.y]
+        [(= field (+ perturbRed (uint 2))) p.colour.z]
+        [(= field perturbMeanX) p.mean.x]
+        [else p.mean.y]))
+
+;; The finite differences' step h for a field of p (the header says why)
+(define (stepOf [p : Projected] [field : uint]) : float
+  (if (>= field perturbMeanX) 0.005 (max (* 1e-3 (abs (fieldValue p field))) 1e-4)))
+
+;; The kind of a field, whose largest gradient sets what's negligible: 0 opacity, 1 colour, 2 mean
+(define (fieldKind [field : uint]) : uint
+  (cond [(= field perturbOpacity) (uint 0)]
+        [(< field perturbMeanX) (uint 1)]
+        [else (uint 2)]))
+
+;; A kind's first field and its number of fields
+(define (kindField [kind : uint]) : uint
+  (cond [(= kind (uint 0)) perturbOpacity] [(= kind (uint 1)) perturbRed] [else perturbMeanX]))
+(define (kindFields [kind : uint]) : uint
+  (cond [(= kind (uint 0)) (uint 1)] [(= kind (uint 1)) (uint 3)] [else (uint 2)]))
+
+;; Whether a float is finite (false for NaN, whose comparisons are all false)
+(define (finite [x : float]) : bool (< (abs x) 1e30))
+
+(app GradTest
+  (parameter splatFile path)
+  (parameter cameraFile path)
+  (parameter targetFile path)
+  (parameter splatCount uint)
+  (parameter cameraIndex uint)
+  (parameter width uint)
+  (parameter height uint)
+  (parameter shDegree uint)
+  (parameter near float)
+  (parameter far float)
+  (parameter capacity uint)
+  (parameter maxGroups uint)
+  (parameter targetOffset uint)
+  (parameter backgroundR float)
+  (parameter backgroundG float)
+  (parameter backgroundB float)
+  (parameter l1 bool)
+  (parameter oracle bool)
+  (parameter targetR float)
+  (parameter targetG float)
+  (parameter targetB float)
+  (parameter finiteDifferences bool)
+  (parameter repeats uint)
+  (parameter samples uint)
+  (parameter multiBatch bool)
+  (parameter stops bool)
+  ;; Checks one frame's readbacks (false when they haven't all arrived yet); exits the program on
+  ;; a mismatch. On the web it writes them for grad_test_check instead.
+  (extern (check [splats : (data Splat)] [cameras : (data Camera)] [projected : (data Projected)]
+                 [gradients : (data ProjectedGradient)] [losses : (data float)] [cameraIndex : uint]
+                 [background : vec3] [target : vec3] [l1 : bool] [oracle : bool]) : bool)
+  ;; Whether two frames' gradients are the same, bit for bit
+  (extern (sameGradients [a : (data ProjectedGradient)] [b : (data ProjectedGradient)]) : bool)
+  ;; Exits the program with status 1
+  (extern (fail) : void)
+  (state
+   (splats (data Splat) (empty-data Splat))
+   (cameras (data Camera) (empty-data Camera))
+   (projected (data Projected) (empty-data Projected))
+   (gradients (data ProjectedGradient) (empty-data ProjectedGradient))
+   (losses (data float) (empty-data float))
+   (checked bool #f)
+   (gradientRepeats uint 0)
+   ;; Finite differences': 0 waiting for the unperturbed frames, 1 probing, 2 done
+   (phase uint 0)
+   (baseFrames uint 0)       ; unperturbed frames whose loss arrived
+   (probes (data Probe) (empty-data Probe))
+   (index uint 0)            ; the probe running
+   (side uint 0)             ; 0: +h, 1: -h
+   (failures uint 0)
+   (negligible uint 0)       ; probes whose a and fd were both negligible
+   (checkedOpacity uint 0)   ; probes of each kind that weren't
+   (checkedColour uint 0)
+   (checkedMean uint 0)
+   (worst float 0.0)         ; the largest |a - fd| / max(|a|, |fd|)
+   ;; The most entries a tile's backward walks (to its last pixel's last entry) in the
+   ;; unperturbed frames, for --multi-batch
+   (deepestTile uint 0))
+  (on (read readSplats d) (with state #:splats d))
+  (on (read readCameras d) (with state #:cameras d))
+  (on (read readProjected d) (if (= state.phase 0) (with state #:projected d) state))
+  (on (read readBackwardRanges d)
+    (if (= state.phase 0)
+        (with state #:deepestTile
+              (fold ([m state.deepestTile]) ([t (range (uint 0) (/ (count d) (uint 3)))])
+                (max m (- (at d (+ (* t (uint 3)) (uint 1))) (at d (* t (uint 3)))))))
+        state))
+  (on (read readCounts d)
+    (begin
+      (when (> (at d countTotal) capacity)
+        (print! "grad_test: FAILED, a frame has " (at d countTotal) " tile entries, more than --capacity "
+                capacity)
+        (fail))
+      state))
+  (on (read readSplatGradients d)
+    (cond
+      [finiteDifferences (if (= state.phase 0) (with state #:gradients d) state)]
+      [(and state.checked (> (count state.gradients) 0))
+       (if (sameGradients state.gradients d)
+           (with state #:gradients d #:gradientRepeats (+ state.gradientRepeats 1))
+           (begin
+             (print! "grad_test: FAILED, frame " frameNumber "'s gradients differ from the frame before")
+             (fail)
+             state))]
+      [else (with state #:gradients d)]))
+  (on (read readLosses d)
+    (let* ([probe (uint (at d lossProbe))]
+           [expected (+ (* state.index (uint 2)) state.side (uint 1))])
+      (cond
+        [(not finiteDifferences) (with state #:losses d)]
+        [(= state.phase 0)
+         (if (= probe (uint 0)) (with state #:losses d #:baseFrames (+ state.baseFrames 1)) state)]
+        [(or (not= state.phase 1) (not= probe expected)) state]
+        [(= state.side 0) (with state #:side 1)]
+        [else
+         (let* ([p (at state.probes state.index)]
+                ;; The step float rounding gives, (x + h) - (x - h), not the nominal 2h (it differs by
+                ;; up to ulp(x), about 1% for a mean past 1024 px)
+                [x (fieldValue (at state.projected p.splat) p.field)]
+                [fd (/ (at d lossDelta) (- (+ x p.h) (- x p.h)))]
+                [a p.analytic]
+                [scale (max (abs a) (abs fd))]
+                [error (abs (- a fd))]
+                [finiteBoth (and (finite a) (finite fd))]
+                [small (and finiteBoth (< scale (* 1e-2 p.largest)))]
+                [ok (and finiteBoth (or small (<= error (+ (* 0.02 scale) 1e-5))))]
+                [counted (and ok (not small))]
+                [kind (fieldKind p.field)]
+                [next (+ state.index 1)])
+           (cond
+             [(not ok) (print! "grad_test: MISMATCH splat " p.splat " field " p.field " h " p.h ": analytic " a
+                               ", finite difference " fd)]
+             [small (print! "grad_test: splat " p.splat " field " p.field " h " p.h ": analytic " a
+                            ", finite difference " fd " (negligible)")]
+             [else (print! "grad_test: splat " p.splat " field " p.field " h " p.h ": analytic " a
+                           ", finite difference " fd)])
+           (with state #:index next #:side 0 #:phase (if (>= next (count state.probes)) 2 1)
+                 #:failures (+ state.failures (if ok 0 1))
+                 #:negligible (+ state.negligible (if small 1 0))
+                 #:checkedOpacity (+ state.checkedOpacity (if (and counted (= kind 0)) 1 0))
+                 #:checkedColour (+ state.checkedColour (if (and counted (= kind 1)) 1 0))
+                 #:checkedMean (+ state.checkedMean (if (and counted (= kind 2)) 1 0))
+                 #:worst (if (and ok (not small)) (max state.worst (/ error (max scale 1e-30))) state.worst)))])))
+  (on (frame dt)
+    (cond
+      [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
+       (begin
+         (print! "grad_test: FAILED, " frameLimit " frames weren't enough (phase " state.phase ", probe "
+                 state.index " of " (count state.probes) ", " state.gradientRepeats " repeats)")
+         (fail)
+         state)]
+      [(and finiteDifferences (= state.phase 2))
+       (begin
+         (print! "grad_test: " (count state.probes) " finite differences (" state.checkedOpacity " opacity, "
+                 state.checkedColour " colour, " state.checkedMean " mean checked, " state.negligible
+                 " negligible), " state.failures " mismatches, the largest relative difference " state.worst)
+         (if (and (= state.failures 0) (> state.checkedOpacity 0) (> state.checkedColour 0) (> state.checkedMean 0))
+             (quit!)
+             (begin
+               (print! "grad_test: FAILED, mismatches or a kind without a gradient that isn't negligible")
+               (fail)))
+         state)]
+      [(and finiteDifferences (= state.phase 0))
+       (if (and (>= state.baseFrames 2) (> (count state.gradients) 0)
+                (= (count state.projected) (count state.gradients)) (> (count state.splats) 0)
+                (> (count state.cameras) 0) (> (count state.losses) 0))
+           (let* ([g state.gradients]
+                  [p state.projected]
+                  ;; The finiteness checks first (it exits on a failure)
+                  [checked (check state.splats state.cameras p g state.losses cameraIndex
+                                  (vec3 backgroundR backgroundG backgroundB) (vec3 targetR targetG targetB) l1 #f)]
+                  [visible (collect ([s (range (uint 0) (count g))]) s #:when (> (.tileCount (at p s)) 0))]
+                  [n (count visible)]
+                  ;; The largest |gradient| of each kind among the visible splats
+                  [(o c m)
+                   (fold ([o 0.0] [c 0.0] [m 0.0]) ([j (range (uint 0) n)] [f (range (uint 1) (uint 7))])
+                     (let* ([v (abs (fieldGradient (at g (at visible j)) f))]
+                            [k (fieldKind f)])
+                       (values (if (= k 0) (max o v) o) (if (= k 1) (max c v) c) (if (= k 2) (max m v) m))))]
+                  ;; Of each kind, its n x kindFields fields (splat by splat), all of them or samples
+                  ;; spread evenly
+                  [probes (collect ([kind (range (uint 0) (uint 3))] [k (range (uint 0) samples)])
+                            (let* ([total (* n (kindFields kind))]
+                                   [i (if (<= total samples) k (/ (* k total) samples))]
+                                   [s (at visible (/ i (kindFields kind)))]
+                                   [f (+ (kindField kind) (remainder i (kindFields kind)))])
+                              (Probe s f (fieldGradient (at g s) f) (stepOf (at p s) f)
+                                     (cond [(= kind (uint 0)) o] [(= kind (uint 1)) c] [else m])))
+                            #:when (< k (* n (kindFields kind))))])
+             (if checked
+                 (begin
+                   (print! "grad_test: the deepest tile's backward walks " state.deepestTile " entries")
+                   (when (and multiBatch (<= state.deepestTile (uint 128)))
+                     (print! "grad_test: FAILED, --multi-batch needs a tile past one backward batch (128 entries)")
+                     (fail))
+                   (when stops
+                     ;; The pixels the stop at T < 1e-4 cuts short, from the projections alone (on
+                     ;; the CPU, pixels x splats, so for small scenes): a pixel stops exactly when
+                     ;; the product of 1 - alpha over every splat that blends into it (its tile in
+                     ;; the splat's rectangle, alpha at least alphaMin) is below 1e-4, whatever
+                     ;; the order, since T only falls
+                     (let* ([stopped
+                             (fold ([k (uint 0)]) ([i (range (uint 0) (* width height))])
+                               (let* ([x (remainder i width)]
+                                      [y (/ i width)]
+                                      [centre (+ (vec2 (float x) (float y)) 0.5)]
+                                      [t (fold ([t 1.0]) ([s (range (uint 0) (count p))])
+                                           (let* ([q (at p s)]
+                                                  [tx (/ x tileSize)]
+                                                  [ty (/ y tileSize)]
+                                                  [covers (and (> q.tileCount 0) (>= tx q.tiles.x) (< tx q.tiles.z)
+                                                               (>= ty q.tiles.y) (< ty q.tiles.w))]
+                                                  [d (- q.mean centre)]
+                                                  [power (- (* -0.5 (+ (* q.conic.x d.x d.x) (* q.conic.z d.y d.y)))
+                                                            (* q.conic.y d.x d.y))]
+                                                  [alpha (min alphaMax (* q.opacity (exp power)))])
+                                             (if (and covers (<= power 0.0) (>= alpha alphaMin)) (* t (- 1.0 alpha)) t)))])
+                                 (+ k (if (< t transmittanceMin) (uint 1) (uint 0)))))])
+                       (print! "grad_test: " stopped " pixels stop at T < 1e-4")
+                       (when (= stopped (uint 0))
+                         (print! "grad_test: FAILED, --stops needs a pixel stopped at T < 1e-4")
+                         (fail))))
+                   (print! "grad_test: " (count probes) " gradients to check by finite differences, of "
+                           n " visible splats")
+                   (with state #:probes probes #:phase (if (> (count probes) 0) 1 2)))
+                 state))
+           state)]
+      [finiteDifferences state]
+      [(and state.checked (>= state.gradientRepeats repeats))
+       (begin
+         (print! "grad_test: " repeats " more frames gave the same gradients")
+         (quit!)
+         state)]
+      [state.checked state]
+      [(and (> (count state.splats) 0) (> (count state.cameras) 0) (> (count state.projected) 0)
+            (> (count state.gradients) 0) (> (count state.losses) 0))
+       (with state #:checked
+             (check state.splats state.cameras state.projected state.gradients state.losses cameraIndex
+                    (vec3 backgroundR backgroundG backgroundB) (vec3 targetR targetG targetB) l1 oracle))]
+      [else state]))
+  (run TrainGraph (splatFile splatFile) (cameraFile cameraFile) (targetFile targetFile)
+       (splatCount splatCount) (cameraIndex cameraIndex) (width width) (height height)
+       (shDegree shDegree) (near near) (far far) (maxGroups maxGroups) (inspect #t)
+       (loss (if l1 lossL1 lossL2)) (finiteDifferences finiteDifferences)
+       (capacity capacity) (background (vec3 backgroundR backgroundG backgroundB))
+       (targetOffset targetOffset)
+       (probe (if (= state.phase 1) (+ (* state.index (uint 2)) state.side (uint 1)) (uint 0)))
+       (perturbSplat (if (= state.phase 1) (.splat (at state.probes state.index)) (uint 0)))
+       (perturbField (if (= state.phase 1) (.field (at state.probes state.index)) perturbNone))
+       (perturbDelta (if (= state.phase 1)
+                         (* (.h (at state.probes state.index)) (if (= state.side 0) 1.0 -1.0))
+                         0.0))))
+
+(main GradTest
+  (about "Checks the backward rasterize's gradients against the closed-form oracle or finite differences")
+  (timestep #:max 0.1 #:fixed 0.016)
+  (option splatFile "--splats" "the scene's splats.bin" #:default "splats.bin")
+  (option cameraFile "--cameras" "the scene's cameras.bin" #:default "cameras.bin")
+  (option targetFile "--targets" "the target images (RGBA8, row by row)" #:default "targets.bin")
+  (option splatCount "--splat-count" "the splats in it (the manifest's splatCount)" #:default 1
+          #:range (1 16777216))
+  (option cameraIndex "--camera" "the camera to render" #:default 0)
+  ;; At most 2896 a side, as render_test's
+  (option width "--width" "the camera's image width (at most 2896: the 128 MiB binding budget)" #:default 64
+          #:range (1 2896))
+  (option height "--height" "the camera's image height (at most 2896: the 128 MiB binding budget)" #:default 64
+          #:range (1 2896))
+  (option shDegree "--sh-degree" "the SH bands to evaluate" #:default 3 #:range (0 3))
+  (option near "--near" "the near plane" #:default 0.2)
+  (option far "--far" "the depth keys' far depth" #:default 1000.0)
+  (option capacity "--capacity" "the tile entries' capacity (fixed; a frame needing more fails)"
+          #:default 262144 #:range (1 3145728))
+  (option maxGroups "--max-groups" "the most workgroups a dispatch has (groupLimit, 65535, or less to test the grid-stride loops)"
+          #:default 65535 #:range (1 65535))
+  (option targetOffset "--target-offset" "the camera's first pixel in the targets" #:default 0)
+  (option backgroundR "--background-r" "the background's red" #:default 0.0)
+  (option backgroundG "--background-g" "the background's green" #:default 0.0)
+  (option backgroundB "--background-b" "the background's blue" #:default 0.0)
+  (flag l1 "--l1" "the L1 loss (training's) instead of L2")
+  (flag oracle "--oracle" "compare with the closed-form oracle (S1's gradient variant, a constant target)")
+  (option targetR "--target-r" "the oracle's constant target's red (before the targets' 8-bit rounding)" #:default 0.0)
+  (option targetG "--target-g" "the oracle's constant target's green" #:default 0.0)
+  (option targetB "--target-b" "the oracle's constant target's blue" #:default 0.0)
+  (flag finiteDifferences "--finite-differences" "check by central differences on the GPU instead")
+  (option repeats "--repeats" "how many frames after the checked one must give the same gradients"
+          #:default 3 #:range (1 64))
+  (option samples "--samples" "with --finite-differences, the most fields of each kind (opacity, colour, mean) to probe"
+          #:default 32 #:range (1 1024))
+  (flag multiBatch "--multi-batch" "with --finite-differences, fail unless a tile's backward takes more than one batch (128 entries)")
+  (flag stops "--stops" "with --finite-differences, fail unless a pixel stops at T < 1e-4"))

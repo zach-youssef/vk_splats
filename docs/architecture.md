@@ -13,6 +13,9 @@ The planned layout, filled in as the M1 and M2 tasks land.
     closed-form oracles ([below](#render-graph)). render_test's checks are in `render_check.h`,
     shared by the native program and `web-check/render_test_check.cpp`, which checks a web run's
     readbacks ([web.md](web.md#tests)).
+  - `grad_test`: the training graph's gradients against the closed-form oracle and GPU finite
+    differences ([below](#train-graph)); its checks are in `grad_check.h`, shared with
+    `web-check/grad_test_check.cpp` as render_test's are.
 - `lib/`: ZGAL modules the programs share, imported by relative path:
   `(import "../../lib/<module>.zgal")`. A module's name is a C++ namespace (ZGAL compiles its
   functions to C++ too), so it uses underscores, not hyphens.
@@ -312,6 +315,16 @@ and the splats and cameras once.
   derivative between the jumps: the perturbed splat's blend (α against 1/255, the exponent's
   sign), or the stop at T < 1e-4 moving to another entry (any splat's: the pixel's
   `lastEntries` differ).
+- **Tests** (`programs/grad_test`): with `--oracle` (S1's `gradient` variant: one splat covering
+  the image, a constant target), the GPU's projection gradients and loss must be within 1e-3
+  relative of `projected_gradients` (L2 and L1) on the oracle's projection. With
+  `--finite-differences`, central differences on the GPU must agree within the plan's rule
+  ([building-and-testing.md](building-and-testing.md#gradient-checks)) where the oracle can't
+  reach: S2's cameras (cam_1 is 80×48, non-square), S1's `one-splat-clamped` (the clamp's
+  derivative), S1's `stack` (the stop at T < 1e-4) and S3's cameras 0 and 24 (tiles past one
+  backward batch). The S2 L1 run with `--max-groups 3` (so the grid-stride loops go round) runs
+  twice, and the hashes are compared. Every run checks the gradients are finite; the others also
+  check the next frames' gradients are the same bit for bit.
 
 ## splat_render
 

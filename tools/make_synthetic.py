@@ -182,6 +182,18 @@ S1_VARIANTS: Dict[str, S1Variant] = {
                             [OracleSplat(0.3, 0.25, 4.0, (0.25, 0.08, 0.15), theta=0.9, opacity_logit=0.5)],
                             background=(0.1, 0.2, 0.3), principal_offset=(-3.0, -3.5),
                             note="non-square, principal point off the centre by (dcx, dcy)"),
+    # Not a C++ test's setup: five splats stacked on the axis (sigmas of about 5 px), the front four
+    # near-opaque (sigmoid(4.2) = 0.985: under the clamp, by more than a finite difference's step),
+    # so within about 1.3 px of the centre T would drop below 1e-4 at the third, and the stop leaves
+    # the third or fourth and every later one unblended there (the fourth, out to about 2 px),
+    # while further out all five blend
+    "stack": S1Variant(50.0, 33, 33,
+                       [on_axis(3.0, 0.3, 0.27, 0.2, opacity=4.2, dc=(1.0, 0.0, -1.0)),
+                        on_axis(3.5, 0.35, 0.4, 0.2, theta=0.5, opacity=4.2, dc=(-1.0, 1.0, 0.0)),
+                        on_axis(4.0, 0.45, 0.38, 0.2, theta=1.0, opacity=4.2, dc=(0.0, -1.0, 1.0)),
+                        on_axis(4.5, 0.42, 0.5, 0.2, theta=2.0, opacity=4.2, dc=(0.5, 0.5, 1.0)),
+                        on_axis(6.0, 0.6, 0.6, 0.2, opacity=1.0, dc=(0.5, 0.5, -0.5))],
+                       background=(0.1, 0.2, 0.3), note="the stop at T < 1e-4 near the centre"),
 }
 
 
