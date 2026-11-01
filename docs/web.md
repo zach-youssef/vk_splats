@@ -24,6 +24,7 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | BackwardRasterize | 7 | 1 | 0 | 14912 B (128 × (8 + 16 + 16) for a batch, 9 × 256 × 4 and 9 × 16 × 4 for the reduction) | 16 × 16 |
 | InvertEntries | 6 | 1 | 0 | 0 | 256 |
 | GatherGradients | 6 | 1 | 0 | 0 | 64 |
+| BackwardPreprocess | 6 | 1 | 0 | 0 | 64 |
 | Perturb, LossDelta (grad_test only) | 1, 7 | 1 | 0 | 0 | 1, 256 |
 | ZgalSortCount | 4 | 1 | 0 | 64 B (16 atomic bins) | 256 |
 | ZgalSortOffsets | 1 | 1 | 0 | 260 B with subgroups, 1028 B without (256 lanes and a carry) | 256 |

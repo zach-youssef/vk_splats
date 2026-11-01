@@ -1,11 +1,13 @@
-;; The backward rasterize's test (lib/train_graph.zgal's stages 6 to 8): it runs the training graph
+;; The backward pass's test (lib/train_graph.zgal's stages 6 to 9): it runs the training graph
 ;; for one camera of a scene against a target image, with a fixed capacity (so every frame is
 ;; complete and the same), reads back each splat's gradients with respect to its projection and
-;; the loss, and checks them two ways:
-;;   - `check` (grad_test.cpp, grad_check.h), on every run: every gradient and the loss finite, and
-;;     with --oracle (S1's "gradient" variant: one splat over every pixel, a constant target),
-;;     against the closed-form oracle's (tests/oracle/closed_form.h's projected_gradients, for the
-;;     L2 loss or with --l1 the L1); it prints a hash, which test.sh compares between runs. Then,
+;; its parameters, the densification's statistics and the loss, and checks them two ways:
+;;   - `check` (grad_test.cpp, grad_check.h), on every run: every gradient and the loss finite,
+;;     the parameter gradients the CPU's preprocessBackward of the projected ones, the
+;;     densification's statistics consistent with the frames, and with --oracle (S1's "gradient"
+;;     variant: one splat over every pixel, a constant target), against the closed-form oracle's
+;;     (tests/oracle/closed_form.h's single_splat_gradients, for the L2 loss or with --l1 the L1:
+;;     the projection's gradients and the parameters' it has); it prints a hash, which test.sh compares between runs. Then,
 ;;     without --finite-differences, --repeats more frames' gradients must match it bit for bit
 ;;     (`sameGradients`: the backward pass is deterministic).
 ;;   - with --finite-differences, central differences of the loss on the GPU (the plan's rule).
@@ -104,8 +106,9 @@
   ;; Checks one frame's readbacks (false when they haven't all arrived yet); exits the program on
   ;; a mismatch. On the web it writes them for grad_test_check instead.
   (extern (check [splats : (data Splat)] [cameras : (data Camera)] [projected : (data Projected)]
-                 [gradients : (data ProjectedGradient)] [losses : (data float)] [cameraIndex : uint]
-                 [background : vec3] [target : vec3] [l1 : bool] [oracle : bool]) : bool)
+                 [gradients : (data ProjectedGradient)] [parameterGradients : (data Splat)]
+                 [densify : (data DensifyStat)] [losses : (data float)] [cameraIndex : uint]
+                 [shDegree : uint] [background : vec3] [target : vec3] [l1 : bool] [oracle : bool]) : bool)
   ;; Whether two frames' gradients are the same, bit for bit
   (extern (sameGradients [a : (data ProjectedGradient)] [b : (data ProjectedGradient)]) : bool)
   ;; Exits the program with status 1
@@ -115,6 +118,8 @@
    (cameras (data Camera) (empty-data Camera))
    (projected (data Projected) (empty-data Projected))
    (gradients (data ProjectedGradient) (empty-data ProjectedGradient))
+   (parameterGradients (data Splat) (empty-data Splat))
+   (densify (data DensifyStat) (empty-data DensifyStat))
    (losses (data float) (empty-data float))
    (checked bool #f)
    (gradientRepeats uint 0)
@@ -136,6 +141,8 @@
   (on (read readSplats d) (with state #:splats d))
   (on (read readCameras d) (with state #:cameras d))
   (on (read readProjected d) (if (= state.phase 0) (with state #:projected d) state))
+  (on (read readParameterGradients d) (if (= state.phase 0) (with state #:parameterGradients d) state))
+  (on (read readDensifyStats d) (if (= state.phase 0) (with state #:densify d) state))
   (on (read readBackwardRanges d)
     (if (= state.phase 0)
         (with state #:deepestTile
@@ -224,8 +231,8 @@
            (let* ([g state.gradients]
                   [p state.projected]
                   ;; The finiteness checks first (it exits on a failure)
-                  [checked (check state.splats state.cameras p g state.losses cameraIndex
-                                  (vec3 backgroundR backgroundG backgroundB) (vec3 targetR targetG targetB) l1 #f)]
+                  [checked (check state.splats state.cameras p g state.parameterGradients state.densify
+                                  state.losses cameraIndex shDegree (vec3 backgroundR backgroundG backgroundB) (vec3 targetR targetG targetB) l1 #f)]
                   [visible (collect ([s (range (uint 0) (count g))]) s #:when (> (.tileCount (at p s)) 0))]
                   [n (count visible)]
                   ;; The largest |gradient| of each kind among the visible splats
@@ -292,8 +299,8 @@
       [(and (> (count state.splats) 0) (> (count state.cameras) 0) (> (count state.projected) 0)
             (> (count state.gradients) 0) (> (count state.losses) 0))
        (with state #:checked
-             (check state.splats state.cameras state.projected state.gradients state.losses cameraIndex
-                    (vec3 backgroundR backgroundG backgroundB) (vec3 targetR targetG targetB) l1 oracle))]
+             (check state.splats state.cameras state.projected state.gradients state.parameterGradients
+                    state.densify state.losses cameraIndex shDegree (vec3 backgroundR backgroundG backgroundB) (vec3 targetR targetG targetB) l1 oracle))]
       [else state]))
   (run TrainGraph (splatFile splatFile) (cameraFile cameraFile) (targetFile targetFile)
        (splatCount splatCount) (cameraIndex cameraIndex) (width width) (height height)

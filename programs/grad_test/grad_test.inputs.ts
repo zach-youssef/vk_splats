@@ -5,7 +5,7 @@
 // a path option, hence the variable. `sameGradients` compares bit for bit here, as natively. The
 // finite differences run in the app, so they need nothing here.
 import * as zgal from './zgal/index.ts';
-import { Camera, Projected, ProjectedGradient, Splat, type MainInputs } from './grad_test.zgal.ts';
+import { Camera, DensifyStat, Projected, ProjectedGradient, Splat, type MainInputs } from './grad_test.zgal.ts';
 
 type Fs = typeof import('node:fs');
 
@@ -28,9 +28,13 @@ function same<T>(t: zgal.Type<T>, a: readonly T[], b: readonly T[]): boolean {
 
 export function mainInputs(_context: zgal.Context): MainInputs {
   return {
-    check(splats, cameras, projected, gradients, losses, cameraIndex, background, target, l1, oracle) {
+    check(splats, cameras, projected, gradients, parameterGradients, densify, losses, cameraIndex, shDegree, background,
+      target, l1, oracle) {
       // As grad_check.h's check: a frame whose readbacks disagree isn't complete yet
-      if (gradients.length !== splats.length || projected.length !== splats.length || losses.length !== 3) return false;
+      if (gradients.length !== splats.length || projected.length !== splats.length ||
+        parameterGradients.length !== splats.length || densify.length !== splats.length || losses.length !== 3) {
+        return false;
+      }
       const dir = globalThis.process?.env?.GRAD_TEST_READBACKS;
       if (!dir) throw new Error('GRAD_TEST_READBACKS must name the directory for the readbacks (test.sh sets it)');
       const fs = nodeFs();
@@ -41,10 +45,12 @@ export function mainInputs(_context: zgal.Context): MainInputs {
       write('cameras', Camera, cameras);
       write('projected', Projected, projected);
       write('gradients', ProjectedGradient, gradients);
+      write('parameter-gradients', Splat, parameterGradients);
+      write('densify', DensifyStat, densify);
       write('losses', zgal.float, losses);
       // The floats as doubles' shortest text, which parses back to the same floats
       fs.writeFileSync(`${dir}/check.txt`,
-        `${cameraIndex} ${background.join(' ')} ${target.join(' ')} ${l1 ? 1 : 0} ${oracle ? 1 : 0}\n`);
+        `${cameraIndex} ${shDegree} ${background.join(' ')} ${target.join(' ')} ${l1 ? 1 : 0} ${oracle ? 1 : 0}\n`);
       console.log(`grad_test: wrote the checked frame's readbacks to ${dir}`);
       return true;
     },

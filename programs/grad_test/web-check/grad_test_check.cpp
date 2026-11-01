@@ -5,7 +5,8 @@
 // compares between runs) and exits 1 on a mismatch.
 //
 // The directory holds each readback's elements as std430 bytes, <name>.bin (splats, cameras,
-// projected, gradients, losses), and check.txt: the camera index, the background's r, g and b, the
+// projected, gradients, parameter-gradients, densify, losses), and check.txt: the camera index, the
+// SH degree, the background's r, g and b, the
 // target's r, g and b, and 1 or 0 for --l1 and for --oracle, separated by spaces.
 #include "grad_test_check.zgal.h"
 
@@ -50,16 +51,17 @@ int main(int argc, char** argv) {
     if (argc != 2) fail("usage: grad_test_check <readbacks dir>");
     const std::filesystem::path dir = argv[1];
     std::ifstream parameters(dir / "check.txt");
-    uint32_t cameraIndex = 0, l1 = 2, oracle = 2;
+    uint32_t cameraIndex = 0, shDegree = 0, l1 = 2, oracle = 2;
     glm::vec3 background{}, target{};
-    if (!(parameters >> cameraIndex >> background.x >> background.y >> background.z >> target.x >> target.y >>
+    if (!(parameters >> cameraIndex >> shDegree >> background.x >> background.y >> background.z >> target.x >> target.y >>
           target.z >> l1 >> oracle) ||
         l1 > 1 || oracle > 1) {
         fail("can't read " + (dir / "check.txt").string());
     }
     const bool complete = grad_check::check(read<Splat>(dir, "splats"), read<Camera>(dir, "cameras"),
                                             read<Projected>(dir, "projected"), read<ProjectedGradient>(dir, "gradients"),
-                                            read<float>(dir, "losses"), cameraIndex, background, target, l1 == 1,
+                                            read<Splat>(dir, "parameter-gradients"), read<DensifyStat>(dir, "densify"),
+                                            read<float>(dir, "losses"), cameraIndex, shDegree, background, target, l1 == 1,
                                             oracle == 1);
     // The web run writes a frame only once check() would take it
     if (!complete) fail("the readbacks are of different frames or sizes");

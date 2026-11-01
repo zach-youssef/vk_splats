@@ -9,7 +9,11 @@
 ;;      its splat's projection (the 2D mean, the conic, the activated opacity and the colour);
 ;;   8. the gather: each splat's gradients, the sum of its entries' (InvertEntries finds each of a
 ;;      splat's entries after the sort, GatherGradients sums them in a fixed order), into
-;;      splatGradients.
+;;      splatGradients;
+;;   9. the backward preprocess: each splat's gradients with respect to its parameters
+;;      (BackwardPreprocess, lib/splat_backward.zgal's math), into parameterGradients, and the
+;;      densification's statistics (densifyStats: the 2D mean's gradient norm and the frames that
+;;      saw the splat, accumulated until the app runs resetDensify again).
 ;; No global float atomics anywhere (D4(b)): every entry's gradients are reduced in the tile's
 ;; workgroup and written once, and every splat's summed by one invocation, so the gradients are
 ;; the same, bit for bit, on every run. With finiteDifferences, the graph also perturbs one splat's
@@ -299,6 +303,51 @@
                        (values mean conic opacity colour))))])
          (write! (at splatGradients s) (ProjectedGradient mean conic opacity colour)))))))
 
+;; A splat's densification statistics (8 bytes; Sec. 5.2): accumulated over the frames since
+;; TrainGraph's resetDensify last ran, for the densification to read and reset
+(struct DensifyStat
+  (gradientNorm float)  ; the sum of densifyNorm(dL/dmean) over the frames that saw the splat
+  (visible uint))       ; those frames' number
+
+;; 9. Each splat's gradients with respect to its parameters (parameterGradients, a Splat of
+;; gradients: dL/dposition, dL/d(the opacity logit), dL/dlogScale, dL/d(the quaternion as stored)
+;; and dL/dsh; the padding isn't written) from its gradients with respect to its projection
+;; (splatGradients): lib/splat_backward.zgal's preprocessBackward, one invocation a splat. A culled
+;; splat (tileCount 0) gets gradients of 0 and its statistics stay as they were; a visible one adds
+;; its densifyNorm to densifyStats and counts the frame.
+(compute-material BackwardPreprocess
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat read))
+   (cameras (buffer-array Camera read))
+   (projected (buffer-array Projected read))
+   (splatGradients (buffer-array ProjectedGradient read))
+   (parameterGradients (buffer-array Splat write))
+   (densifyStats (buffer-array DensifyStat read-write)))
+  (push (splatCount uint) (cameraIndex uint) (shDegree uint))
+  (compute
+   (let* ([cam (at cameras cameraIndex)])
+     (for ([i (range globalInvocationId.x splatCount (* splatGroupSize workgroupCount.x))])
+       (let* ([visible (> (.tileCount (at projected i)) (uint 0))]
+              [g (at splatGradients i)]
+              ;; A culled splat's: 0 (preprocessBackward needs a splat projectSplat doesn't cull)
+              [r (if visible
+                     (preprocessBackward (at splats i) cam shDegree g)
+                     (SplatGradient (vec3 0.0) 0.0 (vec3 0.0) (vec4 0.0) (vec3 0.0) (vec3 0.0 0.0 1.0)))])
+         (write! (.position (at parameterGradients i)) r.position)
+         (write! (.opacity (at parameterGradients i)) r.opacity)
+         (write! (.logScale (at parameterGradients i)) r.logScale)
+         (write! (.rotation (at parameterGradients i)) r.rotation)
+         (for ([k (range (uint 0) (uint 16))])
+           (let* ([c (shGradient r k shDegree)])
+             (write! (at (.sh (at parameterGradients i)) (* k (uint 3))) c.x)
+             (write! (at (.sh (at parameterGradients i)) (+ (* k (uint 3)) (uint 1))) c.y)
+             (write! (at (.sh (at parameterGradients i)) (+ (* k (uint 3)) (uint 2))) c.z)))
+         (when visible
+           (let* ([d (at densifyStats i)])
+             (write! (at densifyStats i)
+                     (DensifyStat (+ d.gradientNorm (densifyNorm g.mean cam.size)) (+ d.visible (uint 1)))))))))))
+
 ;; With finiteDifferences: adds delta to one field of one splat's projection (perturbOpacity and
 ;; so on; perturbNone changes nothing), after the preprocess. Its tiles stay as they were, so the
 ;; perturbed frame blends the same entries.
@@ -435,6 +484,11 @@
   (buffer entryGradients float (* (min capacity 3145728) 9) #:frames per-frame)  ; gradientStride
   (buffer entryPositions uint (min capacity 3145728) #:frames per-frame)
   (buffer splatGradients ProjectedGradient splatCount #:frames per-frame)
+  (buffer parameterGradients Splat splatCount #:frames per-frame)
+  ;; Accumulated across frames, so shared: cleared in the graph's first frame and whenever the app
+  ;; runs resetDensify again (run-once!; untested so far, and the frames in flight between the
+  ;; app's readback and the reset are lost: architecture.md's train graph, step 9)
+  (buffer densifyStats DensifyStat splatCount #:frames shared)
   ;; Finite differences': the +h side's, shared, so the -h frames see the last +h frame's
   (buffer plusLosses float pixels #:frames shared #:when finiteDifferences)
   (buffer plusLasts uint pixels #:frames shared #:when finiteDifferences)
@@ -476,6 +530,10 @@
             splatGradients
             #:push ((splatCount splatCount))
             #:invocations ((min splatCount (* (max maxGroups 1) 64))))
+  (material backwardPreprocessing BackwardPreprocess splats cameras projected splatGradients
+            parameterGradients densifyStats
+            #:push ((splatCount splatCount) (cameraIndex cameraIndex) (shDegree shDegree))
+            #:invocations ((min splatCount (* (max maxGroups 1) 64))))
 
   ;; The forward pass: SplatGraph's
   (dispatch preprocess preprocessing)
@@ -499,10 +557,14 @@
   (clear clearPositions entryPositions #:value 4294967295)
   (dispatch invert inverting #:indirect (at commands 0))
   (dispatch gather gathering)
+  (clear resetDensify densifyStats #:once #t)
+  (dispatch backwardPreprocess backwardPreprocessing)
 
   (readback readCounts counts)
   (readback readLosses losses)
   (readback readSplatGradients splatGradients #:when inspect)
+  (readback readParameterGradients parameterGradients #:when inspect)
+  (readback readDensifyStats densifyStats #:when inspect)
   (readback readBackwardRanges backwardRanges #:when inspect)
   (readback readSplats splats #:once #t #:when inspect)
   (readback readCameras cameras #:once #t #:when inspect)

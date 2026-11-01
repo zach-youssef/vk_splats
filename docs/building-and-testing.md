@@ -106,11 +106,22 @@ tests it on its own. When using it:
 ## Gradient checks
 
 `programs/grad_test` checks `TrainGraph`'s gradients
-([architecture.md](architecture.md#train-graph)) two ways:
+([architecture.md](architecture.md#train-graph)) against the closed form and the CPU, and by finite
+differences:
 
 - **Closed form**: S1's `gradient` variant against `projected_gradients()`, L2 and L1, within 1e-3
-  relative (or 1e-2 of the largest gradient of its kind, for one near 0). The targets are 8-bit,
-  so the oracle takes the target rounded as the file has it.
+  relative (or 1e-2 of the largest gradient of its kind, for one near 0), and the parameters'
+  against `single_splat_gradients()` (the in-plane position, the log-scales, the opacity logit
+  and the SH DC; L2 and L1). The targets are 8-bit, so the oracle takes the target rounded as the
+  file has it.
+- **On every run**: the parameter gradients (`parameterGradients`) must match the CPU's
+  `preprocessBackward` (the C++ ZGAL generates from `lib/splat_backward.zgal`) on the read-back
+  projection gradients within 1e-3 relative (to the larger of the value and 1e-2 of the largest of
+  its group: position, opacity, log-scale, quaternion, SH), and the densification's statistics
+  must be consistent: every visible splat seen the same n frames, culled ones none, and each norm
+  n times `densifyNorm` of its 2D-mean gradient within 1e-4. `tests/cpp/splat_backward_test.cpp` checks
+  `preprocessBackward` itself on the CPU, against the oracle and central differences of
+  `projectSplat` (general rotations and cameras, SH degrees 1 to 3, the clamps).
 - **GPU finite differences**, the plan's rule: the smooth L2 loss against a fixed target unlike
   the render (`scenes.py` writes a sin/cos pattern). The probes are the visible splats' opacity,
   colour (standing for SH DC) and 2D mean (standing for position: the preprocess chain's own check

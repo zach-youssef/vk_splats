@@ -456,8 +456,11 @@ struct L2Gradients {
     double log_scale_isotropic;
 };
 
-inline L2Gradients single_splat_l2(const Camera& cam, const Splat& s, const Rgb& target, const Rgb& bg) {
-    const L2Gradients2d sc = projected_l2(cam, project(cam, s), target, bg);
+// The same for either loss (kL1: training's mean absolute error; the chain from the projected
+// gradients is the loss's own)
+inline L2Gradients single_splat_gradients(const Camera& cam, const Splat& s, const Rgb& target, const Rgb& bg,
+                                          Loss loss) {
+    const L2Gradients2d sc = projected_gradients(cam, project(cam, s), target, bg, loss);
     const Cov3dAboutZ v = cov3d(s);
     const double fz = cam.f / s.z, k = fz * fz;
     const double u = s.x / s.z, vv = s.y / s.z;
@@ -481,6 +484,10 @@ inline L2Gradients single_splat_l2(const Camera& cam, const Splat& s, const Rgb&
     }
     g.log_scale_isotropic = g.log_scale[0] + g.log_scale[1] + g.log_scale[2];
     return g;
+}
+
+inline L2Gradients single_splat_l2(const Camera& cam, const Splat& s, const Rgb& target, const Rgb& bg) {
+    return single_splat_gradients(cam, s, target, bg, Loss::kL2);
 }
 
 }  // namespace oracle

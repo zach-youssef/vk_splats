@@ -40,7 +40,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
 ## Pipeline
 
 The planned pipeline (M1 renders, M2 trains). Steps 1 to 5 are `lib/render_graph.zgal`
-([below](#render-graph)), and steps 6 to 8 are `lib/train_graph.zgal` ([below](#train-graph)).
+([below](#render-graph)), and steps 6 to 9 are `lib/train_graph.zgal` ([below](#train-graph)),
+with step 9's math in `lib/splat_backward.zgal`.
 The rest of training is to come.
 
 Data is converted offline: the programs read std430 `buffer-file` data and a `manifest.json`, the
@@ -69,9 +70,12 @@ Training's backward pass so far:
 7. **Backward rasterize**: each tile's entries walked back to front, from each pixel's last
    blended entry, giving each entry's gradients with respect to its splat's projection.
 8. **Gather**: each splat's projection gradients, the sum of its entries'.
+9. **Backward preprocess**: each splat's gradients with respect to its parameters (Appendix A's
+   chain back through the conic, J·W, M = RS and the quaternion, the mean's projection and the SH
+   colour), and the densification's statistics: its 2D-mean gradient norm and visible frames,
+   accumulated.
 
-Training will add the preprocess chain (the projection's gradients back to the splat's
-parameters), Adam, and densification and pruning on a fixed capacity, compacted by scan.
+Training will add Adam, and densification and pruning on a fixed capacity, compacted by scan.
 
 ## Conventions
 
@@ -253,7 +257,7 @@ rather than in the program.
 
 `lib/train_graph.zgal`'s `TrainGraph` runs the render graph's stages 1 to 5 for one camera per
 frame (the same kernels and nodes, repeated: ZGAL has no graph composition, so there is no window
-or capture), then pipeline steps 6 to 8. `splatGradients` (a `ProjectedGradient` per splat: the 2D
+or capture), then pipeline steps 6 to 9. `splatGradients` (a `ProjectedGradient` per splat: the 2D
 mean, the conic, the activated opacity and the colour) is overwritten every frame, so nothing
 clears it.
 
@@ -283,10 +287,30 @@ clears it.
    tile). `GatherGradients` (one invocation per splat) then sums its entries' gradients in tile
    order into `splatGradients`. Places no entry maps to (only after a wrapped total) keep the
    clear's 0xFFFFFFFF and are skipped, as are entries past the capacity.
+9. `BackwardPreprocess` (64-wide, grid stride over the splats) runs `preprocessBackward`
+   (`lib/splat_backward.zgal`) on each visible splat's `splatGradients`, recomputing its forward
+   pass rather than storing it, into `parameterGradients`: a `Splat` of gradients (dL/dposition,
+   the opacity logit's, the log-scale's, the stored quaternion's, and the 48 SH coefficients' up
+   to `shDegree`, 0 past it; the padding isn't written), per frame and overwritten each frame. A
+   culled splat gets zeros. The chain (the header of `preprocessBackward` has every formula):
+   the conic's inverse to Σ′, Σ′ = J W Σ Wᵀ Jᵀ to Σ and to the camera-space mean through J (with
+   x/z and y/z's clamp's exact derivative), Σ = M Mᵀ with M = R S (Eq. 11's dL/dM = 2 G M) to the
+   log-scales and through R(q/|q|) to the stored quaternion, the mean's pinhole projection, and
+   the SH colour (degrees 0 to 3, its clamp at 0, and its view direction's dependence on the
+   position). `densifyStats` (a `DensifyStat` a splat, `#:frames shared`) accumulates over frames:
+   each visible splat adds `densifyNorm` of its 2D-mean gradient (its norm in NDC units,
+   |(W/2·∂L/∂x, H/2·∂L/∂y)|, the reference's) and 1 to its frame count. Nothing else writes it:
+   the `#:once` clear `resetDensify` zeroes it in the first frame, and the densification reruns
+   it (`run-once!`) after reading it. Two gaps, for the densification to close: the rerun is
+   untested (grad_test only checks that every visible splat has the same count), and reading back
+   then resetting in a later frame drops the frames in flight between the read and the reset
+   from both intervals (1–2 frames of a 100-iteration interval; consuming and resetting in the
+   same frame on the GPU would drop none). `tests/cpp/splat_backward_test.cpp` checks
+   `preprocessBackward` on the CPU (the oracle and central differences of `projectSplat`).
 
 `losses` holds (the loss, the probe, the loss's change) and is read back every frame, with
-`counts`. With `inspect` (tests), so are `splatGradients`, the projections and `backwardRanges`,
-and the splats and cameras once.
+`counts`. With `inspect` (tests), so are `splatGradients`, `parameterGradients`, `densifyStats`,
+the projections and `backwardRanges`, and the splats and cameras once.
 
 - **Determinism**: every sum has a fixed order (the per-entry reduction, the per-splat gather, ZGAL's
   `reduce`), so a frame's gradients are the same bit for bit on every run and every frame. The
@@ -378,4 +402,8 @@ here with their offsets.
   (colour vec3)            ; 32: the SH colour for this camera's view direction
   (tileCount uint)         ; 44: (maxX − minX)(maxY − minY); 0 when culled
   (tiles uvec4))           ; 48: the tile rectangle (minX, minY, maxX, maxY), max exclusive
+
+(struct DensifyStat        ; 8 bytes: a splat's densification statistics (train graph)
+  (gradientNorm float)     ; 0: the sum of densifyNorm(dL/dmean) over the frames that saw it
+  (visible uint))          ; 4: those frames' number
 ```
