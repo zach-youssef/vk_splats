@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""check.py <out dir> <splat_render> --min-psnr <dB> --min-ratio <r> --min-skipped <n>: checks test.sh's
-splat_train run, from its log (<out dir>/train.log) and its PLY (<out dir>/trained.ply).
+"""check.py <out dir> <splat_render> --min-psnr <dB> --min-ratio <r> --min-skipped <n> [--grow]: checks
+a test.sh splat_train run, from its log (<out dir>/train.log) and its PLY (<out dir>/trained.ply).
 
 - the held-out PSNR splat_train reports is at least --min-psnr, and the first epoch's mean L1
   is at least --min-ratio times the last's;
 - at least --min-skipped iterations were skipped for overflowing (test.sh starts the capacity
   small to cover the skip);
-- the PLY holds the scene's splat count of finite splats;
-- the PLY, written into a copy of the start scene and rendered by splat_render from each
+- the splats in use, as splat_train reports them, are at most --max-splats, and with --grow more
+  than the start's, after at least one densification;
+- the PLY holds the splats in use, all finite;
+- the PLY, written into a copy of the start scene (its manifest's splatCount the PLY's) and rendered by splat_render from each
   held-out camera, scores within 0.5 dB of the PSNR splat_train reported for that view against
   the ground truth's PNG (the capture is 8-bit, splat_train's render float, so they differ a
   little). This checks the readback, the PSNR and the export independently of the program.
@@ -47,6 +49,8 @@ def main():
     parser.add_argument("--min-psnr", type=float, required=True)
     parser.add_argument("--min-ratio", type=float, required=True)
     parser.add_argument("--min-skipped", type=int, required=True)
+    parser.add_argument("--grow", action="store_true",
+                        help="require densification to have grown the splats")
     args = parser.parse_args()
     with open(os.path.join(args.out, "train.log")) as f:
         log = f.read()
@@ -68,9 +72,19 @@ def main():
     start = os.path.join(args.out, "start")
     with open(os.path.join(start, "manifest.json")) as f:
         manifest = json.load(f)
+    in_use, start_count, most, densifications, dropped = (int(x) for x in number(
+        r"(\d+) splats in use \(from (\d+), at most (\d+)\), (\d+) densifications, (\d+) additions dropped", log))
+    print(f"check: {in_use} splats in use (from {start_count}, at most {most}) after {densifications} "
+          f"densifications, {dropped} additions dropped")
+    if start_count != manifest["splatCount"]:
+        errors.append(f"splat_train started from {start_count} splats, not the scene's {manifest['splatCount']}")
+    if in_use > most:
+        errors.append(f"{in_use} splats are in use, more than --max-splats {most}")
+    if args.grow and not (in_use > start_count and densifications > 0):
+        errors.append(f"densification didn't grow the splats ({start_count} to {in_use}, {densifications} densifications)")
     trained = splats.read_ply(os.path.join(args.out, "trained.ply"))
-    if len(trained) != manifest["splatCount"]:
-        errors.append(f"the PLY holds {len(trained)} splats, not {manifest['splatCount']}")
+    if len(trained) != in_use:
+        errors.append(f"the PLY holds {len(trained)} splats, not the {in_use} in use")
     fields = [trained.position, trained.log_scale, trained.rotation, trained.opacity_logit, trained.sh]
     if not all(np.all(np.isfinite(f)) for f in fields):
         errors.append("the PLY has a splat that isn't finite")
@@ -82,6 +96,8 @@ def main():
     shutil.copytree(start, rerender)
     with open(os.path.join(rerender, manifest["files"]["splats"]), "wb") as f:
         f.write(splats.to_std430(trained))
+    with open(os.path.join(rerender, "manifest.json"), "w") as f:
+        json.dump({**manifest, "splatCount": len(trained)}, f, indent=1)
     for i in manifest["test"]:
         png = os.path.join(args.out, f"trained-camera-{i}.png")
         command = renderer_command(args.renderer) + ["--validation", "--frames", "8", "--capture", png]

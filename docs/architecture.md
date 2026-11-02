@@ -80,7 +80,8 @@ Training's backward pass so far:
    colour), and the densification's statistics: its 2D-mean gradient norm and visible frames,
    accumulated.
 
-Training will add Adam, and densification and pruning on a fixed capacity, compacted by scan.
+Training adds Adam, and densification and pruning on a fixed capacity, compacted by scan
+([Train graph](#train-graph)).
 
 ## Conventions
 
@@ -455,8 +456,13 @@ fails.
 
 ```
 build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) --max-splats 100000 \
-    --iterations 2000 --frames 2100
+    --max-screen-size 20 --iterations 2000 --frames 2100
 ```
+
+`--max-screen-size` is required too: the screen-space prune's radius in pixels after the first
+reset, 20 as the reference's code means to or 0 (none) as it does, since it clears the radii
+before reading them ([departure 13](paper-conformance.md#departures)). A run without it fails
+while loading.
 
 `--max-splats` is required (it has no default, since it trades memory for how far the scene may
 grow): the capacity of every per-splat buffer, at least `--splat-count` and at most 559240 (the
@@ -477,14 +483,29 @@ Its phases, in one graph:
    min(`--sh-degree`, t / `--sh-interval`). The position's learning rate decays log-linearly from
    `--position-lr` to `--position-lr-final` over `--position-lr-steps`, times `--extent`; the
    others are constant ([paper-conformance.md](paper-conformance.md#values-from-the-reference-code)
-   has the defaults). Record writes the loss into `history[t − 1]`.
+   has the defaults). Record writes the loss into `history[t − 1]`. Densification follows the
+   reference's schedule: iteration t densifies when `--densify-from` < t < `--densify-until` and
+   t is a multiple of `--densify-interval` (500, 15000, 100), with the threshold
+   `--densify-threshold` (0.0002), the clone scale `--percent-dense` (0.01) × `--extent`, the
+   prune scale 0.1 × `--extent` and radius `--max-screen-size`, the size prunes once
+   t > `--reset-interval` and a new seed each
+   time (`pcgHash(pcgHash(seed + 1) + t)`). A densifying frame doesn't step Adam (the reference's
+   step finds no gradients on the new tensors, so it does nothing), and Adam's bias corrections
+   count the steps taken (t less the densifications). When t < `--densify-until` is a multiple of
+   `--reset-interval` (3000), or t = `--densify-from` with a white background, the frame also
+   resets the opacity. The app prints each densification's counts as `readSplatCounts` brings
+   them (`splat_train: densification K: N splats (P pruned, A added; O dropped for --max-splats
+   so far)`). A run ending on a reset scores the reset opacities (about 13 dB on S3), as the
+   reference would.
 3. **Evaluating**: each test view renders once with `lossEval` (the MSE of the clamped render, at
    the final SH degree; backward and Adam off) into `history[iterations + k]`.
 4. **Reading**: the history and the trained splats are read back (a readback event sees only the
    newest copy, so the losses accumulate on the GPU and are read once). The app prints each test
    view's PSNR (10 log₁₀(1/MSE)) and their mean, the first and last epochs' mean training L1 (an
-   epoch is as many iterations as there are training views) and their ratio, and the iterations
-   skipped; then writes the PLY, and fails if a loss or a splat isn't finite.
+   epoch is as many iterations as there are training views) and their ratio, the iterations
+   skipped, and the splats in use (`splatCounts[splatActive]`, once the counts read back show
+   every densification), the densifications and the additions dropped for `--max-splats`; then
+   writes the splats in use as the PLY, and fails if a loss or a splat isn't finite.
 
 The tile entries' capacity starts at `--initial-entries` and grows (`grownTrainCapacity`) after a
 frame that needed more, from the counts read back after iteration 1's frame (loading's frames
@@ -500,20 +521,34 @@ more entries than any training view grew the capacity to fails the run after its
 the `--initial-entries` to rerun with (the most a frame was seen to need, grown). Retrying the
 view once the growth arrives would need the evaluation to wait on the counts' readback per view; a
 follow-up if real scenes hit it. The splats train in place in the splat buffer (the file isn't
-written). Densification (T14) and D-SSIM (T15) aren't in yet: the loss is L1 alone, and
-`--max-splats` is only checked.
+written). D-SSIM (T15) isn't in yet: the loss is L1 alone.
 
 Its `test.sh` gives the committed S3 scene a ground truth with splat_render
-(`make_synthetic.py render-gt --sh-degree 0`, the same build: native or web), perturbs its splats
-(`make_synthetic.py perturb`), and fits them back for 2000 iterations with the reference's
-learning rates, the SH degree rising every 500, from a capacity of 256 entries, which the first
-iterations overflow. `check.py` then requires a held-out PSNR of at least 30 dB (32.0 on MoltenVK
-and Dawn, from 20 at the start), a loss falling at least 5 times from the first epoch to the last
-(7.7), at least one skipped iteration (2 or 3: covering Adam's skip, Record's −1 and the report),
-a finite PLY with every splat, and the PLY, rendered again by
-splat_render from each held-out camera, scoring within 0.5 dB of what splat_train reported, which
-checks the readback, the PSNR and the export independently. It takes about 7 s on the M4 with
-validation. From perturb's start training converges slowly: 300 iterations reach about 26 dB
+(`make_synthetic.py render-gt --sh-degree 0`, the same build: native or web) and trains twice on
+it at 128×128 with the reference's learning rates and densification schedule (`--max-screen-size
+20`), the SH degree rising every 500, but densifying until 1500 only (`--densify-until`), so each
+run ends with a few hundred plain Adam steps, as the reference's (densifying until 15000 of 30000)
+does: a run ending on a densification scores fresh clones and halves that never trained. `check.py` checks each run: a held-out PSNR and a fall of the loss from the
+first epoch to the last, a finite PLY of exactly the splats in use, at most `--max-splats`, and
+the PLY, rendered again by splat_render from each held-out camera, scoring within 0.5 dB of what
+splat_train reported, which checks the readback, the PSNR, the count and the export independently.
+
+- **perturb**: the splats perturbed (`make_synthetic.py perturb`) and fitted back for 2000
+  iterations from a capacity of 256 entries, which the first iterations overflow, with
+  `--reset-interval 900` (a reset at 900, size prunes after it) and `--max-splats 4096`,
+  which densification fills by iteration 800, so later additions are dropped (the overflow
+  path). It requires 32 dB (35.9 on MoltenVK, from 20 at the start), a loss falling 8
+  times (16.3) and at least one skipped iteration (9: covering Adam's skip, Record's −1 and the
+  report).
+- **sparse**: 200 splats initialized from a tenth of the positions as the converter initializes
+  COLMAP points (`make_synthetic.py sparse`), trained for 1800 iterations with `--max-splats
+  12288` and SH degree 0. Densification must grow the count (`check.py --grow`: to 5384, none
+  dropped) and the held-out PSNR reach 28 dB (32.9 on MoltenVK).
+
+Each run prints its held-out PSNR and splat count (and check.py its checks), so CI's log shows
+the margins on lavapipe.
+
+The test takes about 13 s on the M4 with validation (9 s on the web). From perturb's start training converges slowly: 300 iterations reach about 26 dB
 (29 with a 10× `--feature-lr`: Adam moves a parameter about its learning rate a step, and perturb's
 random colours are up to 3.5 off), and a degree-3 ground truth about 29 dB after 5000 (22 views don't pin the random view-dependent
 colours down for the held-out ones), hence the degree-0 target and 2000 iterations.

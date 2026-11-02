@@ -3,10 +3,12 @@
 ;; PLY. ZGAL can't read the manifest or join paths, so tools/scene_args.py prints the arguments:
 ;;
 ;;     build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) --max-splats 100000 \
-;;         --iterations 2000 --frames 2100
+;;         --max-screen-size 20 --iterations 2000 --frames 2100
 ;;
 ;; --max-splats (required) is the splat buffers' capacity, at least the scene's splats: the graph
-;; holds the count in use on the GPU, and only the first ones are trained and written.
+;; holds the count in use on the GPU (densification changes it), and only the first ones are
+;; trained and written. --max-screen-size (required) is the screen-space prune's radius in pixels
+;; (20, as the reference's code means to; 0, none, as it does: its prune never fires).
 ;; The phases, one graph throughout:
 ;;   0. loading: the graph's first frames read the cameras back (Adam and the loss history off;
 ;;      they render camera 0 at 16x16, or less within --max-width x --max-height);
@@ -18,13 +20,22 @@
 ;;      t, the same on every platform), takes its L1 loss's gradients and steps Adam with the
 ;;      reference's learning rates (the position's decays log-linearly from --position-lr to
 ;;      --position-lr-final over --position-lr-steps, times --extent) at SH degree
-;;      min(--sh-degree, t / --sh-interval). Record writes its loss into history[t - 1];
+;;      min(--sh-degree, t / --sh-interval). Record writes its loss into history[t - 1].
+;;      Densification, as the reference's schedule: when --densify-from < t < --densify-until and
+;;      t is a multiple of --densify-interval, the frame densifies (lib/train_graph.zgal's stage
+;;      12: threshold --densify-threshold, clone scale --percent-dense x --extent, prune scale
+;;      0.1 x --extent and radius --max-screen-size; the size prunes once t > --reset-interval;
+;;      a new seed each time) instead of stepping Adam (the reference's step finds no gradients on
+;;      the new tensors, so it does nothing), and Adam's bias corrections count the steps taken. When t < --densify-until is
+;;      a multiple of --reset-interval (or t = --densify-from with a white background), the
+;;      frame also resets the opacity. Each densification's counts are printed as they're read.
 ;;   2. evaluating: each test view renders once with lossEval (its MSE on the clamped render) and
 ;;      the backward pass and Adam off, into history[iterations + k];
-;;   3. reading: with Adam and Record off, the history and the trained splats are read back; the
-;;      app prints the first and last epochs' mean training loss (an epoch is as many iterations
-;;      as there are training views), each test view's PSNR and their mean, and writes the PLY
-;;      (exportPly: to $SPLAT_TRAIN_PLY, splat_train.ply by default), then quits.
+;;   3. reading: with Adam and Record off, the history, the splat counts (once they show every
+;;      densification) and the trained splats are read back; the app prints the first and last
+;;      epochs' mean training loss (an epoch is as many iterations as there are training views),
+;;      each test view's PSNR and their mean and the splats in use, and writes those splats as
+;;      the PLY (exportPly: to $SPLAT_TRAIN_PLY, splat_train.ply by default), then quits.
 ;; The tile entries' capacity starts at --initial-entries and grows (grownTrainCapacity) after a
 ;; frame that needed more, from the counts read back after iteration 1's frame (counting); Adam
 ;; skips a frame that overflowed (its gradients are incomplete), so that iteration is lost (its
@@ -49,6 +60,15 @@
 ;; step yet)
 (define (iterating [phase : uint] [t : uint]) : bool
   (and (= phase phaseTraining) (> t (uint 0))))
+
+;; Whether iteration t densifies (the reference's: from < t < until, every interval)
+(define (densifying [t : uint] [from : uint] [until : uint] [interval : uint]) : bool
+  (and (> t from) (< t until) (= (remainder t (max interval (uint 1))) (uint 0))))
+
+;; Whether iteration t resets the opacity (the reference's: every interval before until, and at
+;; from with a white background)
+(define (resetting [t : uint] [from : uint] [until : uint] [interval : uint] [white : bool]) : bool
+  (and (> t (uint 0)) (< t until) (or (= (remainder t (max interval (uint 1))) (uint 0)) (and white (= t from)))))
 
 ;; Whether the entry counts read back now are acted on: not until training's first iteration is
 ;; under way, so loading's frames (which train nothing) don't grow the capacity and iteration 1 runs
@@ -110,6 +130,14 @@
   (parameter opacityLr float)
   (parameter scalingLr float)
   (parameter rotationLr float)
+  (parameter densifyFrom uint)
+  (parameter densifyUntil uint)
+  (parameter densifyInterval uint)
+  (parameter densifyThreshold float)
+  (parameter percentDense float)
+  (parameter resetInterval uint)
+  (parameter maxScreenSize uint)
+  (parameter maxScreenSizeGiven bool)
   ;; Writes the splats as an INRIA PLY (to $SPLAT_TRAIN_PLY, or splat_train.ply)
   (extern (exportPly [splats : (data Splat)]) : void)
   ;; Exits the program with status 1
@@ -128,7 +156,12 @@
    (capacity uint (grownTrainCapacity initialEntries 0))
    (mostEntries uint 0)
    (history (data float) (empty-data float))
-   (trained (data Splat) (empty-data Splat)))
+   (trained (data Splat) (empty-data Splat))
+   ;; The densifications run so far (Adam's steps are the iterations less these), the newest
+   ;; splat counts read, and the densifications already printed
+   (densifications uint 0)
+   (counts (data uint) (empty-data uint))
+   (reported uint 0))
   (on (read readCameras d)
     (if (= state.phase phaseLoading) (with state #:cameras d) state))
   (on (read readCounts d)
@@ -148,6 +181,13 @@
     (if (= state.phase phaseReading) (with state #:history d) state))
   (on (read readTrained d)
     (if (= state.phase phaseReading) (with state #:trained d) state))
+  (on (read readSplatCounts d)
+    (begin
+      (when (> (at d splatDensifies) state.reported)
+        (print! "splat_train: densification " (at d splatDensifies) ": " (at d splatActive) " splats ("
+                (at d splatPruned) " pruned, " (at d splatAdded) " added; " (at d splatOverflow)
+                " dropped for --max-splats so far)"))
+      (with state #:counts d #:reported (max state.reported (at d splatDensifies)))))
   (on (frame dt)
     (cond
       [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
@@ -180,6 +220,10 @@
                [(< maxSplats splatCount)
                 (begin (print! "splat_train: FAILED, --max-splats " maxSplats " is below --splat-count " splatCount)
                        (fail) state)]
+               [(not maxScreenSizeGiven)
+                (begin (print! "splat_train: FAILED, --max-screen-size is required: 20 prunes as the reference "
+                               "means to, 0 as it does (paper-conformance.md, departure 13)")
+                       (fail) state)]
                [(not batched)
                 (begin (print! "splat_train: FAILED, the images span several batches (images_<k>.bin); training reads one")
                        (fail) state)]
@@ -201,17 +245,23 @@
               [pool (if (= (count state.stack) (uint 0)) state.train state.stack)]
               [pick (remainder (pcgHash (+ (pcgHash seed) t)) (count pool))])
          (with state #:iteration t #:camera (at pool pick)
+               #:densifications (+ state.densifications
+                                   (if (densifying t densifyFrom densifyUntil densifyInterval) (uint 1) (uint 0)))
                #:stack (collect ([j (range (uint 0) (count pool))]) (at pool j) #:when (not= j pick))))]
       [(and (or (= state.phase phaseTraining) (= state.phase phaseEvaluating))
             (< (if (= state.phase phaseTraining) (uint 0) (+ state.view (uint 1))) (count state.test)))
        (let* ([view (if (= state.phase phaseTraining) (uint 0) (+ state.view (uint 1)))])
          (with state #:phase phaseEvaluating #:view view #:camera (at state.test view)))]
       [(not= state.phase phaseReading) (with state #:phase phaseReading)]
-      ;; 3: once the history and the splats have arrived, report and write them
-      [(and (= (count state.history) (+ iterations cameraCount)) (>= (count state.trained) splatCount))
+      ;; 3: once the history, the counts after every densification and the splats have arrived,
+      ;; report and write them
+      [(and (= (count state.history) (+ iterations cameraCount)) (> (count state.counts) splatAdded)
+            (= (at state.counts splatDensifies) state.densifications)
+            (>= (count state.trained) (at state.counts splatActive)))
        (let* ([h state.history]
               ;; The buffer holds --max-splats; the splats in use are its first ones
-              [trained (collect ([i (range (uint 0) splatCount)]) (at state.trained i))]
+              [inUse (at state.counts splatActive)]
+              [trained (collect ([i (range (uint 0) inUse)]) (at state.trained i))]
               [epoch (min (count state.train) iterations)]
               [first (meanOf (fold ([a 0.0]) ([i (range (uint 0) epoch)]) (+ a (heldLoss (at h i))))
                              (fold ([a 0.0]) ([i (range (uint 0) epoch)]) (+ a (held (at h i)))))]
@@ -236,6 +286,9 @@
          (print! "splat_train: held-out PSNR " meanPsnr " dB over " (count state.test) " views")
          (print! "splat_train: " skipped " iterations skipped (overflowed), the most tile entries a frame needed "
                  state.mostEntries)
+         (print! "splat_train: " inUse " splats in use (from " splatCount ", at most " maxSplats "), "
+                 state.densifications " densifications, " (at state.counts splatOverflow)
+                 " additions dropped for --max-splats")
          (exportPly trained)
          (cond
            [(not (and lossesFinite splatsFinite))
@@ -262,22 +315,40 @@
        (probe 0) (perturbSplat 0) (perturbField perturbNone) (perturbDelta 0.0)
        (train #t) (historySize (+ iterations cameraCount))
        (historySlot (if (= state.phase phaseTraining) (- state.iteration (uint 1)) (+ iterations state.view)))
-       (bias1 (- 1.0 (pow 0.9 (float state.iteration))))
-       (bias2 (- 1.0 (pow 0.999 (float state.iteration))))
+       ;; Adam's steps so far: the iterations less the densifications (which don't step)
+       (bias1 (- 1.0 (pow 0.9 (float (max (- state.iteration state.densifications) (uint 1))))))
+       (bias2 (- 1.0 (pow 0.999 (float (max (- state.iteration state.densifications) (uint 1))))))
        (positionLr (* (decayedLr state.iteration positionLrInit positionLrFinal positionLrSteps) extent))
        (dcLr featureLr) (restLr (/ featureLr 20.0)) (opacityLr opacityLr) (scalingLr scalingLr)
        (rotationLr rotationLr)
-       ;; The densification's (its nodes stay off for now)
-       (densifyThreshold 0.0002) (cloneScale (* 0.01 extent)) (pruneScale (* 0.1 extent))
-       (screenPrune 0) (maxScreenSize 0) (densifySeed 0)
+       ;; The densification's: the reference's percent_dense x extent and 0.1 x extent; the size
+       ;; prunes after the first reset; a seed for each densification
+       (densifyThreshold densifyThreshold) (cloneScale (* percentDense extent)) (pruneScale (* 0.1 extent))
+       (screenPrune (if (> state.iteration resetInterval) (uint 1) (uint 0))) (maxScreenSize maxScreenSize)
+       (densifySeed (pcgHash (+ (pcgHash (+ seed (uint 1))) state.iteration)))
        #:enabled ((findLasts (iterating state.phase state.iteration))
                   (backwardRasterize (iterating state.phase state.iteration))
                   (clearPositions (iterating state.phase state.iteration))
                   (invert (iterating state.phase state.iteration))
                   (gather (iterating state.phase state.iteration))
                   (backwardPreprocess (iterating state.phase state.iteration))
-                  (adam (iterating state.phase state.iteration))
+                  (adam (and (iterating state.phase state.iteration)
+                             (not (densifying state.iteration densifyFrom densifyUntil densifyInterval))))
                   (record (or (iterating state.phase state.iteration) (= state.phase phaseEvaluating)))
+                  (densifyPrepare (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyMark (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyScan (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyCopySplats (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyScatter (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyCopyFirstMoments (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyScatterFirst (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyCopySecondMoments (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyScatterSecond (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyFinish (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyClear (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (resetOpacity (and (iterating state.phase state.iteration)
+                                     (resetting state.iteration densifyFrom densifyUntil resetInterval
+                                                (>= background 1.0))))
                   (readHistory (= state.phase phaseReading))
                   (readTrained (= state.phase phaseReading)))))
 
@@ -325,4 +396,20 @@
           #:default 0.0025)
   (option opacityLr "--opacity-lr" "the opacity logit's learning rate" #:default 0.025)
   (option scalingLr "--scaling-lr" "the log-scales' learning rate" #:default 0.005)
-  (option rotationLr "--rotation-lr" "the quaternion's learning rate" #:default 0.001))
+  (option rotationLr "--rotation-lr" "the quaternion's learning rate" #:default 0.001)
+  (option densifyFrom "--densify-from" "densify after this iteration (the reference's 500)" #:default 500
+          #:range (0 1000000))
+  (option densifyUntil "--densify-until" "densify and reset the opacity before this iteration (the reference's 15000; 0 never)"
+          #:default 15000 #:range (0 1000000))
+  (option densifyInterval "--densify-interval" "the iterations between densifications (the reference's 100)"
+          #:default 100 #:range (1 1000000))
+  (option densifyThreshold "--densify-threshold" "the mean 2D-mean gradient norm a splat densifies at (the reference's 0.0002)"
+          #:default 0.0002)
+  (option percentDense "--percent-dense" "the largest scale a clone has, times --extent (larger ones split; the reference's 0.01)"
+          #:default 0.01)
+  (option resetInterval "--reset-interval" "the iterations between opacity resets (the reference's 3000); the size prunes start after the first"
+          #:default 3000 #:range (1 1000000))
+  ;; Required: the reference's code means to prune splats past 20 px on screen after the first
+  ;; reset but never does (it clears the radii first), so neither value is the obvious default
+  (option maxScreenSize "--max-screen-size" "required: after the first reset, prune a splat whose radius passed this many pixels (the reference's intent, 20; 0 none, what it does)"
+          #:default 0 #:range (0 65535) #:given maxScreenSizeGiven))

@@ -145,16 +145,20 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
 12. **Skipped iterations**: a frame whose tile entries overflow the current capacity loses
     splats, so its gradients are incomplete; Adam skips it (the iteration is counted and reported,
     and the capacity grows for the next). The reference allocates per frame and never truncates.
-    Adam's step count t still advances on a skipped frame, so its bias corrections run one step
-    ahead of the reference's per skip, which is negligible past the first iterations.
+    Adam's step count still advances on a skipped frame, so its bias corrections run one step
+    ahead of the reference's per skip, which is negligible past the first iterations. A
+    densifying frame doesn't step Adam and isn't counted, as in the reference (its step finds no
+    gradients on the new tensors, so it does nothing): the count is the iterations less the
+    densifications.
 13. **Screen-space prune, a choice** (`maxScreenSize`): after the first opacity reset, a splat
     whose largest radius since the last densification passed `maxScreenSize` pixels is pruned, as
     the reference code means to with its `max_screen_size` of 20; 0 prunes none. The reference's
     never fires: `densification_postfix` zeroes `max_radii2D` before `prune` reads it, so its
     published results are 0's (large background and near-camera splats survive), while 20 is what
-    it was written to do. Neither is hidden as a default: the app chooses. A split's halves aren't
-    checked by radius (their radii aren't known; the reference's world-space check at the halves'
-    scale applies to them, as it does to every splat after the first reset, with either choice).
+    it was written to do. Neither is hidden as a default: the app chooses (splat_train's
+    `--max-screen-size` is required). A split's halves aren't checked by radius (their radii
+    aren't known; the reference's world-space check at the halves' scale applies to them, as it
+    does to every splat after the first reset, with either choice).
 14. **Densification order**: the splats are compacted in place by a scan (survivors in order, a
     split's first half in its parent's place), then the additions (clones' copies and splits'
     second halves) in their parents' order. The reference appends the clones, then the halves
@@ -165,6 +169,15 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
 16. **Split sampling**: the halves' offsets are standard normals from a PCG hash of the
     densification's seed, the splat's index and the half (Box-Muller), not torch's generator, so
     runs are deterministic on every backend but don't match the reference's samples.
+17. **Opacity reset and Adam**: a resetting frame steps Adam, opacity included, and then resets
+    the opacity (and zeroes its moments). The reference resets first, and its step then skips
+    the opacity (the new tensor has no gradient) and leaves the opacity's step count behind the
+    others'. A reset on a densifying frame steps nothing in either, and with the default schedule
+    the periodic resets (multiples of 3000) all do. The others differ: the white-background reset
+    at `--densify-from` (not a densifying frame, which needs t past it), any reset at or before
+    `--densify-from`, and every reset when `--reset-interval` isn't a multiple of
+    `--densify-interval`. On those the opacity takes one more step before the reset's clamp to
+    0.01, and its bias corrections count that frame.
 
 ## How correctness is checked
 
