@@ -82,12 +82,32 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
   - `pending` marks each commit's `test` status pending;
   - `test` runs `test.yml` for them (the newest 50 beyond main);
   - `statuses` posts each commit's `test` status from its job's outcome.
-- `test.yml` runs one job per commit (`test <sha>`) on ubuntu-24.04, set up by the wrapper's
-  `setup-zgal` action (native toolchain: lavapipe, the Vulkan SDK with its validation layers,
-  clang through ccache, Racket and Node), plus pytest, numpy, scipy and Pillow from Ubuntu's archive (7.4, 1.26, 1.11 and 10.2 on 24.04). It
-  runs `make all web`, then `test-tools`, `test-cpp`, `test-programs` (native, on lavapipe, with
-  validation) and `test-web` (Node with Dawn on lavapipe), each running even if an earlier test
-  failed, and with `make -k`, so one failing program doesn't stop the others. On failure it uploads `build/test` and `build/test-web`.
+- `test.yml` runs one job per commit and suite (`test <sha> <suite>`) on ubuntu-24.04, set up by
+  the wrapper's `setup-zgal` action (native toolchain: lavapipe, the Vulkan SDK with its
+  validation layers, clang through ccache, Racket and Node). The suites are the entries of its
+  matrix's `suite` list, each with the make targets it builds and runs, so a new shard is one
+  entry:
+  - `native`: `make all`, then `test-tools` (pytest, with numpy, scipy and Pillow from Ubuntu's
+    archive: 7.4, 1.26, 1.11 and 10.2 on 24.04), `test-cpp` and `test-programs` (on lavapipe,
+    with validation). The data tools' and the C++ tests need no program, so only this shard runs
+    them (`cpu-tests`); every other shard would repeat them.
+  - `web`: `make web`, then `test-web` (Node with Dawn on lavapipe).
+  Each test step runs even if an earlier one failed, and the program tests with `make -k`, so one
+  failing program doesn't stop the others. On failure or cancellation a job uploads `build/test`
+  and `build/test-web` (each program's logs, as `test-outputs-<sha>-<suite>`); the program tests'
+  step has a 20-min timeout of its own, so it fails before the job's 30 and the upload still runs.
+  `ci.yml` posts a commit's status from all its jobs: success only if every suite succeeded.
+- Why shards: in one job the program tests ran one after the other and took 17.7 min of a
+  24.2-min job (run 41460382408), and D-SSIM adds per-step cost to every training test. Running
+  native and web together with `make -j2` was no faster (the program-test step took 15 to 21 min
+  across runs, within the runners' +-25% variance), since lavapipe spreads its rasterizing over
+  every vCPU of the 4-vCPU runner, so the two tests contend. Separate jobs run on separate
+  runners: the suite's program tests are expected to take about 6 to 8 min (native) and 8 to 11
+  min (web) against the 20-min step timeout, which is what the timeouts are sized from. A stack
+  of N commits is 2N jobs, against GitHub's 20 concurrent. A program's tests must not share files
+  with another program's or with the other build's (each writes only to its output directory,
+  `build/test/<name>` or `build/test-web/<name>`). Watch the slowest job's time when adding a
+  test.
 - Permissions: the jobs that run code (the repository's, the wrapper's or third-party actions)
   have a read-only `contents: read` token and check out without persisting credentials; only
   `pending` and `statuses`, which check nothing out, can write commit statuses.

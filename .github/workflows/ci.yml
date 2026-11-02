@@ -90,9 +90,10 @@ jobs:
       wrapper-repository: ${{ needs.commits.outputs.wrapper-repository }}
       wrapper-sha: ${{ needs.commits.outputs.wrapper-sha }}
 
-  # Posts each commit's test status from the conclusion of its job ("test / test <sha>") in this
-  # run: success and failure as they are, anything else (cancelled, timed out, skipped, never run,
-  # or unreadable) as an error, so no commit stays pending. Each call is tried three times, and a
+  # Posts each commit's test status from the conclusions of its jobs in this run ("test / test <sha>
+  # <suite>", one per suite of test.yml's matrix): failure if any failed, success if all succeeded,
+  # and anything else (cancelled, timed out, skipped, never run, or unreadable) as an error, so no
+  # commit stays pending. Each call is tried three times, and a
   # failure doesn't stop the other commits' statuses.
   statuses:
     needs: [commits, pending, test]
@@ -111,7 +112,7 @@ jobs:
         run: |
           failed=0 listed=1
           api() { for try in 1 2 3; do gh api "$@" && return; sleep 5; done; return 1; }
-          # The latest attempt of each of the run's jobs, the test ones named "test / test <sha>"
+          # The latest attempt of each of the run's jobs, the test ones named "test / test <sha> <suite>"
           if jobs=$(api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
             --jq '.jobs[] | {name, conclusion, html_url}'); then
             jobs=$(jq -cs . <<< "$jobs")
@@ -121,7 +122,9 @@ jobs:
           fi
           for sha in $(jq -r '.[]' <<< "$COMMITS"); do
             if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then echo "::error::Not a commit SHA: '$sha'"; failed=1; continue; fi
-            job=$(jq -c --arg name "test / test $sha" 'map(select(.name == $name)) | last // {}' <<< "$jobs")
+            # The commit's shards: failure if any failed, success if all did, else the first other
+            shards=$(jq -c --arg prefix "test / test $sha " 'map(select(.name | startswith($prefix)))' <<< "$jobs")
+            job=$(jq -c '. as $s | ($s | map(select(.conclusion == "failure")) + map(select(.conclusion != "success")) | first) // ($s | last) // {}' <<< "$shards")
             conclusion=$(jq -r '.conclusion // "missing"' <<< "$job")
             [ "$listed" = 1 ] || conclusion=unreadable
             url=$(jq -r --arg run "$RUN_URL" '.html_url // $run' <<< "$job")

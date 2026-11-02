@@ -2,8 +2,10 @@
 # (pytest, with numpy, scipy and Pillow), the C++ tests and the programs' headless tests natively on
 # lavapipe with validation (including synchronization validation), and the programs' web tests
 # under Node with Dawn (on lavapipe).
-# Each commit's job runs with a read-only token: ci.yml's pending and statuses jobs post its "test"
-# commit status from the job's conclusion (the job is named "test <sha>").
+# Each commit is sharded: one job per (commit, suite), the suites listed in the matrix below. Each
+# job runs with a read-only token; ci.yml's pending and statuses jobs post the commit's "test"
+# status from its jobs' conclusions (named "test <sha> <suite>"), success only if every suite's
+# job succeeded.
 name: test
 on:
   workflow_call:
@@ -30,8 +32,13 @@ defaults:
 
 jobs:
   test:
-    name: test ${{ matrix.sha }}
+    name: test ${{ matrix.sha }} ${{ matrix.suite.name }}
     runs-on: ubuntu-24.04
+    # Measured on run 41546766016 (4-vCPU runner), one suite alone is expected to take about 6-8
+    # min (native) and 8-11 min (web) of program tests, plus about 6.5 min of setup, build and
+    # the CPU tests (run 41460382408: a 24.2-min job of which 17.7 were program tests). The step
+    # timeout below leaves about 2x the web suite; the job's covers it plus that setup, with the
+    # step failing first so the upload of the outputs still runs. Runner times vary by +-25%.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -39,6 +46,19 @@ jobs:
       fail-fast: false
       matrix:
         sha: ${{ fromJSON(inputs.commits) }}
+        # A shard is one entry: add one (and nothing else) for a new suite. build: the make
+        # targets that build what the suite runs; tests: its make targets; cpu-tests: whether the
+        # shard also runs the data tools' and the C++ tests (they need no program, so one shard
+        # runs them once per commit instead of every shard repeating them).
+        suite:
+          - name: native
+            build: all
+            tests: test-programs
+            cpu-tests: true
+          - name: web
+            build: web
+            tests: test-web
+            cpu-tests: false
     steps:
       - uses: actions/checkout@v7
         with:
@@ -74,33 +94,42 @@ jobs:
 
       - name: Build
         id: build
-        run: make -j"$(nproc)" all web
+        env:
+          TARGETS: ${{ matrix.suite.build }}
+        run: |
+          # shellcheck disable=SC2086 # several targets, split on purpose
+          make -j"$(nproc)" $TARGETS
 
       # The test steps run whatever an earlier one's outcome, once the build has succeeded (the
       # data tools' tests need no build), and `make -k` keeps going past a failing program, so one
       # failure doesn't hide another
       - name: Data tool tests (pytest)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.suite.cpu-tests }}
         run: make test-tools
 
       - name: C++ tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.suite.cpu-tests && steps.build.outcome == 'success' }}
         run: make -j"$(nproc)" test-cpp
 
-      - name: Program tests (native, lavapipe)
+      # The suite's program tests: native on lavapipe with validation, or web under Node with
+      # Dawn on lavapipe. Each program's logs are files under build/test or build/test-web; the
+      # step's own timeout fails it before the job's, so they are still uploaded.
+      - name: Program tests (${{ matrix.suite.name }})
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: make -k test-programs
+        timeout-minutes: 20
+        env:
+          TARGETS: ${{ matrix.suite.tests }}
+        run: |
+          # shellcheck disable=SC2086 # several targets, split on purpose
+          make -k $TARGETS
 
-      - name: Program tests (web, Dawn on lavapipe)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: make -k test-web
-
-      # The programs' test outputs (captures, differences), for a failure's review
+      # The programs' test outputs (logs, captures, differences), for a failure's or a timeout's
+      # review
       - name: Upload the test outputs
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: test-outputs-${{ matrix.sha }}
+          name: test-outputs-${{ matrix.sha }}-${{ matrix.suite.name }}
           path: |
             build/test
             build/test-web
