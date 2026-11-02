@@ -37,6 +37,9 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   `test.sh <binary> <output dir>`. It runs the program headless with `--validation` (which fails
   unless validation and synchronization validation are both available) and exits non-zero on any
   failure; a validation message is a failure.
+  A test that runs another program (splat_train's renders its ground truth with splat_render)
+  names that build in its `program.mk`: `test-<name>: $(OUT)/<other>/<other>` and
+  `test-web-<name>: $(OUT)/web/<other>`.
 - **A web test**: `programs/<name>/test-web.sh`, run from the repository's root as
   `test-web.sh <main.js> <output dir> <web-check dir>` (`node <main.js> ...` runs the program
   under Node with Dawn, where WebGPU validation errors fail a `--validation` run). The programs'

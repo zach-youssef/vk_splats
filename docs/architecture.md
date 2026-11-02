@@ -9,6 +9,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
   one needs no Makefile change ([building-and-testing.md](building-and-testing.md)).
   - `splat_render`: renders a camera of a scene in a window, or headless with a PNG capture
     ([below](#splat_render)).
+  - `splat_train`: trains a scene's splats against its images, headless, scores the held-out
+    views and writes an INRIA PLY ([below](#splat_train)).
   - `tile_test` and `render_test`: the render graph's GPU tests against the CPU and the
     closed-form oracles ([below](#render-graph)). render_test's checks are in `render_check.h`,
     shared by the native program and `web-check/render_test_check.cpp`, which checks a web run's
@@ -343,8 +345,8 @@ are read too, and `history` and the trained splats when the app enables `readHis
   price is in BackwardRasterize: every entry up to the tile's last costs the workgroup two
   barriers and a 9-value reduction, whether or not a given pixel blends it (the forward pass
   costs one barrier per 256 entries). `TileLasts` cuts the walk at the last entry any pixel
-  blended, so a saturated tile's tail past every pixel's stop costs only its zero writes. Not yet
-  measured against the forward pass on a real scene (T13's profiling).
+  blended, so a saturated tile's tail past every pixel's stop costs only its zero writes. On a
+  real scene it costs 4× the forward rasterize ([splat_train](#splat_train)'s numbers).
 - **Capacity**: the entry buffers are capped at 3·2²⁰ entries (`trainEntryCapacityMax`; a larger
   `capacity` counts as that), so `entryGradients` (36 B an entry) stays within one binding's 128 MiB
   (108 MiB). The rest of the render graph's capacity rules apply, but an app grows the capacity
@@ -353,7 +355,8 @@ are read too, and `history` and the trained splats when the app enables `readHis
   gradients lost, so a trainer must fail on it rather than step. **Open limit**: a real scene at
   full resolution can need 10M+ entries. Splitting `entryGradients` can't reach 2²⁵ within
   WebGPU's 8 storage buffers (BackwardRasterize binds 7); processing the tiles in chunks past the
-  cap is left for when the trainer's profiling shows real scenes need it.
+  cap is left for when a real scene needs it (splat_train fails on it; the COLMAP scene at 748×748
+  needs at most 910k, before densification).
 - **Finite differences** (`finiteDifferences`, for grad_test): `Perturb` adds `perturbDelta` to
   one field (`perturbField`: opacity, a colour channel, the mean's x or y) of one splat's
   projection after the preprocess, so the tiles stay the same; or, with `perturbField` =
@@ -383,6 +386,85 @@ are read too, and `history` and the trained splats when the app enables `readHis
   S3's camera 0. The S2 L1 run with `--max-groups 3` (so the grid-stride loops go round) runs
   twice, and the hashes are compared. Every run checks the gradients are finite; the others also
   check the next frames' gradients are the same bit for bit.
+
+## splat_train
+
+`programs/splat_train` runs `TrainGraph` (with `train`) headless, one Adam iteration a frame, for
+`--iterations` iterations, then scores the held-out views and writes the trained splats as an
+INRIA PLY (to `$SPLAT_TRAIN_PLY`, `splat_train.ply` by default, through the `exportPly` extern:
+the `.cpp` natively, Node's `fs` on the web). `tools/scene_args.py --train <scene dir>` prints the
+scene's options, and refuses a scene older than format version 2 or whose camera buffer's split
+disagrees with its manifest (splat_train reads the split from the buffer, so a version-1 scene
+would train on every camera and silently report no held-out views); `--frames` must cover the
+iterations, the held-out views and a few frames of loading and readback latency, or the program
+fails.
+
+```
+build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) --iterations 2000 --frames 2100
+```
+
+Its phases, in one graph:
+
+1. **Loading**: the first frames read the cameras back (Adam and Record off; they render camera 0
+   at 16×16, or smaller within `--max-width` × `--max-height`). The app checks them
+   against the options (the camera count, `--max-width` × `--max-height`, a single image batch,
+   the targets' size, `--max-splats` ≥ `--splat-count`) and splits them by `heldOut` into
+   training and test views (a camera without an image is neither).
+2. **Training**: iteration t (1-based) renders a training camera popped from a stack of them,
+   refilled when empty (the reference's order; the pick is `pcgHash(pcgHash(seed) + t)` modulo the
+   stack's size, so every platform trains the same order), takes the L1 loss's gradients, and
+   steps Adam (bias corrections 1 − 0.9ᵗ and 1 − 0.999ᵗ, computed by the app) at SH degree
+   min(`--sh-degree`, t / `--sh-interval`). The position's learning rate decays log-linearly from
+   `--position-lr` to `--position-lr-final` over `--position-lr-steps`, times `--extent`; the
+   others are constant ([paper-conformance.md](paper-conformance.md#values-from-the-reference-code)
+   has the defaults). Record writes the loss into `history[t − 1]`.
+3. **Evaluating**: each test view renders once with `lossEval` (the MSE of the clamped render, at
+   the final SH degree; backward and Adam off) into `history[iterations + k]`.
+4. **Reading**: the history and the trained splats are read back (a readback event sees only the
+   newest copy, so the losses accumulate on the GPU and are read once). The app prints each test
+   view's PSNR (10 log₁₀(1/MSE)) and their mean, the first and last epochs' mean training L1 (an
+   epoch is as many iterations as there are training views) and their ratio, and the iterations
+   skipped; then writes the PLY, and fails if a loss or a splat isn't finite.
+
+The tile entries' capacity starts at `--initial-entries` and grows (`grownTrainCapacity`) after a
+frame that needed more, from the counts read back after iteration 1's frame (loading's frames
+train nothing, and this way iteration 1 runs at `--initial-entries` whether a platform delivers a
+frame's reads before or after its frame event). On the web a tick's reads apply before its frame
+event, so iteration 1's own counts are dropped: with `--iterations 1`, an overflowing or over-cap
+iteration 1 neither grows the capacity nor fails the run, it is only reported as skipped (a later
+pick of the same view is checked, so any longer run is covered). Adam skips a frame whose entries overflowed (its
+gradients are incomplete), so that iteration is lost (history −1) and counted in the report. A
+frame needing more than `trainEntryCapacityMax` entries, which no growth can hold, fails the
+program, and so does an overflowing test view: each renders once, so a held-out camera needing
+more entries than any training view grew the capacity to fails the run after its training, with
+the `--initial-entries` to rerun with (the most a frame was seen to need, grown). Retrying the
+view once the growth arrives would need the evaluation to wait on the counts' readback per view; a
+follow-up if real scenes hit it. The splats train in place in the splat buffer (the file isn't
+written). Densification (T14) and D-SSIM (T15) aren't in yet: the loss is L1 alone, and
+`--max-splats` is only checked.
+
+Its `test.sh` gives the committed S3 scene a ground truth with splat_render
+(`make_synthetic.py render-gt --sh-degree 0`, the same build: native or web), perturbs its splats
+(`make_synthetic.py perturb`), and fits them back for 2000 iterations with the reference's
+learning rates, the SH degree rising every 500, from a capacity of 256 entries, which the first
+iterations overflow. `check.py` then requires a held-out PSNR of at least 30 dB (32.0 on MoltenVK
+and Dawn, from 20 at the start), a loss falling at least 5 times from the first epoch to the last
+(7.7), at least one skipped iteration (2 or 3: covering Adam's skip, Record's −1 and the report),
+a finite PLY with every splat, and the PLY, rendered again by
+splat_render from each held-out camera, scoring within 0.5 dB of what splat_train reported, which
+checks the readback, the PSNR and the export independently. It takes about 7 s on the M4 with
+validation. From perturb's start training converges slowly: 300 iterations reach about 26 dB
+(29 with a 10× `--feature-lr`: Adam moves a parameter about its learning rate a step, and perturb's
+random colours are up to 3.5 off), and a degree-3 ground truth about 29 dB after 5000 (22 views don't pin the random view-dependent
+colours down for the held-out ones), hence the degree-0 target and 2000 iterations.
+
+**Cost** (`--timings`, MoltenVK on the M4, the COLMAP scene converted at 748×748: 12,900 splats
+from its points, up to 910k tile entries a frame, 500 iterations; medians): `backwardRasterize`
+11.2 ms against the forward `rasterize`'s 2.8 ms (4.0×), the sort 1.4 ms, `gather` 1.1 ms, Adam
+0.08 ms. The backward's deterministic per-entry reduction (two barriers and a 9-value reduction
+per entry up to the tile's last, against the forward's one barrier per 256) is the training
+frame's largest cost, about 12 ns per entry across the GPU. Worth optimizing once densified
+scenes show it dominating (a follow-up).
 
 ## splat_render
 

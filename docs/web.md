@@ -57,6 +57,9 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 
 - **splat_render**: S3 cameras 0 and 24 captured and compared with the same goldens at the same
   PSNR (45 dB). It has no externs, so unlike render_test it needs no `.inputs.ts`.
+- **splat_train**: the native test, its ground truth rendered by splat_render's web build and its
+  re-renders too, at the same thresholds (32.0 dB on Dawn, as natively). Its `.inputs.ts` writes
+  the PLY with Node's `fs`, so the web build's export works only under Node.
 - **render_test**: every run of the native test (S1 with the oracle, the off-centre variant, S2
   twice with the hashes compared, S3). Its checks are C++ (`render_check.h` with
   `tests/oracle/closed_form.h`), so rather than port them, the web build's `check` writes the
@@ -75,4 +78,5 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 - **The window**: splat_render's present path runs only in a page (`splat_render.zgal.html`), and
   no test covers it; the tests are headless under Node.
 - **Paths in externs**: a ZGAL extern can't take a `path` (or string) parameter, so
-  render_test's and grad_test's readback directories are environment variables rather than options.
+  render_test's and grad_test's readback directories and splat_train's PLY are environment
+  variables rather than options.

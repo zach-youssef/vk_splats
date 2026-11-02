@@ -78,10 +78,23 @@ Rendering, from diff-gaussian-rasterization's `forward.cu` (the closed-form orac
   instead ([(−cx − 0.15 W)/fx, (1.15 W − cx)/fx]), which is the same for a centred one.
 - The SH basis's constants, signs and coefficient order (`computeColorFromSH`).
 
-Training, to be checked against the reference repository when training lands:
+Training, from the reference repository's `arguments/__init__.py`, `train.py` and
+`gaussian_model.py` at its latest release (182afc9, October 2024; splat_train's defaults,
+[architecture.md](architecture.md#splat_train)):
 
-- Learning rates: position 1.6e-4 decaying to 1.6e-6, scaled by the scene extent; SH DC 2.5e-3,
-  the other bands 1/20 of that; opacity 0.05; scale 5e-3; rotation 1e-3.
+- Learning rates: position 1.6e-4 decaying log-linearly to 1.6e-6 over 30,000 iterations
+  (`get_expon_lr_func`; its delay multiplier has no effect with the default 0 delay steps), times
+  the scene extent; SH DC 2.5e-3, the other bands 1/20 of that; opacity 0.025 (the 2023 release's,
+  from the paper's time, was 0.05, until the August 2024 release, 2130164; the others haven't
+  changed since July 2023); scale 5e-3; rotation 1e-3.
+- Adam: β = (0.9, 0.999), ε = 1e-15, one state per parameter group, with bias correction.
+- The SH degree: one band added every 1000 iterations up to the scene's, the iteration counted
+  from 1 (iteration 1000 renders with degree 1).
+- The cameras: one per iteration, popped at random from a stack refilled when empty (each epoch
+  sees every training view once). splat_train picks with `pcgHash` of the seed and the iteration
+  instead of Python's `random`, the same order on every platform.
+- A black background (`white_background` off) and no random background.
+- Evaluation: PSNR on the render clamped to [0, 1], averaged over the test views.
 - `percent_dense` 0.01 (the clone/split size threshold, relative to the scene extent).
 - Pruning below opacity 0.005, and above 20 px on screen after the first opacity reset.
 
@@ -125,6 +138,15 @@ Training, to be checked against the reference repository when training lands:
     gradient there, but its z derivative uses the unclamped formula, as if the clamped x were
     fixed rather than the ratio times z: twice the exact derivative of J's third column. Only
     splats far outside the view (past 1.3·tan(fov/2)) are affected.
+
+11. **L1 loss only, for now**: splat_train trains on L1 alone until D-SSIM lands (T15); the
+    paper's loss adds 0.2 · D-SSIM.
+12. **Skipped iterations**: a frame whose tile entries overflow the current capacity loses
+    splats, so its gradients are incomplete; Adam skips it (the iteration is counted and reported,
+    and the capacity grows for the next). The reference allocates per frame and never truncates.
+    Adam's step count t still advances on a skipped frame, so its bias corrections run one step
+    ahead of the reference's per skip, which is negligible past the first iterations.
+13. **No densification yet** (T14): the splat count stays at the start's.
 
 ## How correctness is checked
 
