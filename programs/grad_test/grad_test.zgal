@@ -386,6 +386,7 @@
       [else state]))
   (run TrainGraph (splatFile splatFile) (cameraFile cameraFile) (targetFile targetFile)
        (splatCount splatCount) (cameraIndex cameraIndex) (width width) (height height)
+       (maxWidth width) (maxHeight height)
        (shDegree shDegree) (near near) (far far) (maxGroups maxGroups) (inspect #t)
        (loss (if l1 lossL1 lossL2)) (finiteDifferences finiteDifferences)
        (capacity capacity) (background (vec3 backgroundR backgroundG backgroundB))

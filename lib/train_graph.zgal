@@ -473,13 +473,19 @@
 ;; ---------------------------------------------------------------------------------------------
 ;; SplatGraph's forward pass (ZGAL has no graph composition, so its nodes are repeated here,
 ;; without the window and capture) and the backward pass. Its parameters and inputs are
-;; SplatGraph's (render_graph.zgal says what they are), and the training's.
+;; SplatGraph's (render_graph.zgal says what they are), and the training's. The camera, its size
+;; and the SH degree are per-frame inputs, so a trainer renders a different camera each frame: the
+;; buffers are sized to the largest camera (maxWidth x maxHeight, at least every camera's width and
+;; height), and the grid, tile and pixel counts are computed each frame in the push constants,
+;; invocations and counts that use them (a graph constant is computed once, when it's built).
 (graph TrainGraph
   (parameter splatCount uint)
-  (parameter cameraIndex uint)
-  (parameter width uint)
-  (parameter height uint)
-  (parameter shDegree uint)
+  (input cameraIndex (per-frame uint))
+  (input width (per-frame uint))
+  (input height (per-frame uint))
+  (input shDegree (per-frame uint))
+  (parameter maxWidth uint)
+  (parameter maxHeight uint)
   (input splatFile path)
   (input cameraFile path)
   (parameter near float)
@@ -509,10 +515,9 @@
   (input perturbField (per-frame uint))
   (input perturbDelta (per-frame float))
 
-  (constant gridWidth (/ (+ width 15) 16))
-  (constant gridHeight (/ (+ height 15) 16))
-  (constant tileCount (* gridWidth gridHeight))
-  (constant pixels (* width height))
+  ;; The buffers' sizes; this frame's are (/ (+ width 15) 16) and so on, written out where used
+  (constant maxTileCount (* (/ (+ maxWidth 15) 16) (/ (+ maxHeight 15) 16)))
+  (constant maxPixels (* maxWidth maxHeight))
 
   (buffer-file splats Splat splatFile)
   (buffer-file cameras Camera cameraFile)
@@ -524,14 +529,14 @@
   (buffer commands DispatchCommand 1 #:frames per-frame)
   (buffer entryKeys uint (min capacity 3145728) #:frames per-frame)
   (buffer entrySplats uint (min capacity 3145728) #:frames per-frame)
-  (buffer ranges uint (* tileCount 2) #:frames per-frame)
-  (buffer backwardRanges uint (* tileCount 3) #:frames per-frame)
-  (buffer colours vec4 pixels #:frames per-frame)
-  (buffer lastEntries uint pixels #:frames per-frame)
-  (image rendered rgba8 (fixed width height) #:frames per-frame)
+  (buffer ranges uint (* maxTileCount 2) #:frames per-frame)
+  (buffer backwardRanges uint (* maxTileCount 3) #:frames per-frame)
+  (buffer colours vec4 maxPixels #:frames per-frame)
+  (buffer lastEntries uint maxPixels #:frames per-frame)
+  (image rendered rgba8 (fixed maxWidth maxHeight) #:frames per-frame)
   ;; The backward pass's
-  (buffer pixelGrads vec4 pixels #:frames per-frame)
-  (buffer pixelLosses float pixels #:frames per-frame)
+  (buffer pixelGrads vec4 maxPixels #:frames per-frame)
+  (buffer pixelLosses float maxPixels #:frames per-frame)
   (buffer losses float 3 #:frames per-frame)  ; lossTotal, lossProbe, lossDelta
   (buffer entryGradients float (* (min capacity 3145728) 9) #:frames per-frame)  ; gradientStride
   (buffer entryPositions uint (min capacity 3145728) #:frames per-frame)
@@ -542,10 +547,10 @@
   ;; app's readback and the reset are lost: architecture.md's train graph, step 9)
   (buffer densifyStats DensifyStat splatCount #:frames shared)
   ;; Finite differences': the +h side's, shared, so the -h frames see the last +h frame's
-  (buffer plusLosses float pixels #:frames shared #:when finiteDifferences)
-  (buffer plusLasts uint pixels #:frames shared #:when finiteDifferences)
+  (buffer plusLosses float maxPixels #:frames shared #:when finiteDifferences)
+  (buffer plusLasts uint maxPixels #:frames shared #:when finiteDifferences)
   (buffer plusProjected Projected 1 #:frames shared #:when finiteDifferences)
-  (buffer lossDeltas float pixels #:frames per-frame #:when finiteDifferences)
+  (buffer lossDeltas float maxPixels #:frames per-frame #:when finiteDifferences)
 
   (material preprocessing Preprocess splats cameras projected tileCounts
             #:push ((splatCount splatCount) (cameraIndex cameraIndex) (near near) (shDegree shDegree))
@@ -555,31 +560,31 @@
                     (cameraIndex cameraIndex) (near near) (shDegree shDegree))
             #:invocations (1) #:when finiteDifferences)
   (material planning PlanEntries counts commands
-            #:push ((capacity (min capacity 3145728)) (tileCount tileCount) (near near) (far far)
+            #:push ((capacity (min capacity 3145728)) (tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16))) (near near) (far far)
                     (maxGroups maxGroups))
             #:invocations (1))
   (material emitting EmitEntries projected offsets counts entryKeys entrySplats
-            #:push ((splatCount splatCount) (gridWidth gridWidth) (near near) (far far)))
-  (material ranging TileRanges entryKeys counts ranges #:push ((tileCount tileCount)))
+            #:push ((splatCount splatCount) (gridWidth (/ (+ width 15) 16)) (near near) (far far)))
+  (material ranging TileRanges entryKeys counts ranges #:push ((tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16)))))
   (material rasterizing Rasterize projected entrySplats ranges colours lastEntries rendered
             #:push ((width width) (height height) (background background))
-            #:invocations ((* gridWidth 16) (* gridHeight 16)))  ; 16: tileSize, a workgroup a tile
+            #:invocations ((* (/ (+ width 15) 16) 16) (* (/ (+ height 15) 16) 16)))  ; 16: tileSize, a workgroup a tile
   (material scoring Loss colours targets pixelGrads pixelLosses
-            #:push ((pixels pixels) (targetOffset targetOffset) (targetPixels targetPixels) (loss loss))
-            #:invocations ((min pixels (* (max maxGroups 1) 256))))  ; 256: its workgroup size
+            #:push ((pixels (* width height)) (targetOffset targetOffset) (targetPixels targetPixels) (loss loss))
+            #:invocations ((min (* width height) (* (max maxGroups 1) 256))))  ; 256: its workgroup size
   (material differencing LossDelta projected pixelLosses lastEntries plusLosses plusLasts plusProjected
             lossDeltas losses
-            #:push ((pixels pixels) (width width) (probe probe) (splatCount splatCount) (splat perturbSplat))
-            #:invocations ((min pixels (* (max maxGroups 1) 256))) #:when finiteDifferences)
+            #:push ((pixels (* width height)) (width width) (probe probe) (splatCount splatCount) (splat perturbSplat))
+            #:invocations ((min (* width height) (* (max maxGroups 1) 256))) #:when finiteDifferences)
   (material lasting TileLasts ranges lastEntries backwardRanges
-            #:push ((width width) (height height) (gridWidth gridWidth) (tileCount tileCount))
-            #:invocations ((min tileCount (* (max maxGroups 1) 64))))  ; 64: its workgroup size
+            #:push ((width width) (height height) (gridWidth (/ (+ width 15) 16)) (tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16))))
+            #:invocations ((min (* (/ (+ width 15) 16) (/ (+ height 15) 16)) (* (max maxGroups 1) 64))))  ; 64: its workgroup size
   (material backward BackwardRasterize projected entrySplats backwardRanges colours lastEntries pixelGrads
             entryGradients
             #:push ((width width) (height height) (background background))
-            #:invocations ((* gridWidth 16) (* gridHeight 16)))
+            #:invocations ((* (/ (+ width 15) 16) 16) (* (/ (+ height 15) 16) 16)))
   (material inverting InvertEntries projected offsets counts entryKeys entrySplats entryPositions
-            #:push ((gridWidth gridWidth)))
+            #:push ((gridWidth (/ (+ width 15) 16))))
   (material gathering GatherGradients projected offsets counts entryPositions entryGradients
             splatGradients
             #:push ((splatCount splatCount))
@@ -602,9 +607,9 @@
   (dispatch rasterize rasterizing)
   ;; The loss
   (dispatch score scoring)
-  (reduce totalLoss pixelLosses (at losses 0) #:op add #:count pixels)  ; lossTotal
+  (reduce totalLoss pixelLosses (at losses 0) #:op add #:count (* width height))  ; lossTotal
   (dispatch difference differencing #:when finiteDifferences)
-  (reduce totalDelta lossDeltas (at losses 2) #:op add #:count pixels #:when finiteDifferences)
+  (reduce totalDelta lossDeltas (at losses 2) #:op add #:count (* width height) #:when finiteDifferences)
   ;; The backward pass
   (dispatch findLasts lasting)
   (dispatch backwardRasterize backward)

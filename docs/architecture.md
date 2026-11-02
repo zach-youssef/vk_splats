@@ -261,6 +261,13 @@ or capture), then pipeline steps 6 to 9. `splatGradients` (a `ProjectedGradient`
 mean, the conic, the activated opacity and the colour) is overwritten every frame, so nothing
 clears it.
 
+The camera (`cameraIndex`), its size (`width`, `height`) and `shDegree` are per-frame inputs, so a
+trainer renders another camera every frame. The per-pixel and per-tile buffers are sized once, to
+`maxWidth` × `maxHeight` (at least every camera's size), and this frame's grid, tile and pixel
+counts are computed in the push constants, `#:invocations` and `reduce` counts that use them
+(a graph `constant` is computed once, when the graph is built, so it can't follow a per-frame
+input).
+
 6. `Loss` (256-wide, grid stride): per pixel, I = C + T·bg (the rasterizer's `colours`, unclamped)
    against the target, an RGBA8 pixel at `targetOffset` + the pixel's index in `targetFile`
    (an `images_<k>.bin`: [data-format.md](data-format.md)), which holds `targetPixels` pixels: a
