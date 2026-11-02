@@ -50,9 +50,12 @@
 ;; reduction's scratch) fits in 16 KB; BackwardRasterize's shared arrays say 128 too
 (define backwardBatch (uint 128))
 
-;; Graph parameter values: which loss
+;; The loss input's values
 (define lossL1 (uint 0))  ; mean |I - t| over the image's channels (Sec. 7's L1 term)
 (define lossL2 (uint 1))  ; sum (I - t)^2 over them (smooth: the gradient tests')
+;; The mean (clamp(I, 0, 1) - t)^2 over the channels: the evaluation's MSE, for the PSNR (the
+;; reference clamps the render to [0, 1] before its PSNR); its dL/dI is 0, so nothing trains on it
+(define lossEval (uint 2))
 
 ;; The field Perturb changes (0: none): one of the projection's, or perturbParameter plus a
 ;; parameter's float offset in Splat (0-2 the position, 3 the opacity logit, 4-6 the log-scale,
@@ -80,7 +83,8 @@
 ;; 6. Each pixel's loss and dL/dI, against its target (RGBA8, the red in the low byte, at
 ;; targetOffset + the pixel's index: docs/data-format.md's images): with lossL2, (I - t)^2 summed
 ;; over the channels and 2 (I - t); with lossL1, |I - t| / (3 pixels) and sign(I - t) / (3 pixels),
-;; so the sum is the mean. I is the rasterizer's C + T bg, unclamped. A pixel past the targets'
+;; so the sum is the mean; with lossEval, (clamp(I, 0, 1) - t)^2 summed over the channels / (3
+;; pixels) (the MSE) and 0. I is the rasterizer's C + T bg, unclamped. A pixel past the targets'
 ;; targetPixels reads black instead of past the buffer: the app must check the camera's pixels fit
 ;; (grad_test does, up front); this only keeps a wrong offset from reading out of bounds.
 (compute-material Loss
@@ -94,11 +98,17 @@
   (compute
    (let* ([scale (/ 1.0 (* 3.0 (float pixels)))])
      (for ([i (range globalInvocationId.x pixels (* entryGroupSize workgroupCount.x))])
-       (let* ([r (- (.rgb (at colours i)) (if (< (+ targetOffset i) targetPixels) (unpackRgb (at targets (+ targetOffset i))) (vec3 0.0)))])
+       (let* ([colour (.rgb (at colours i))]
+              [t (if (< (+ targetOffset i) targetPixels) (unpackRgb (at targets (+ targetOffset i))) (vec3 0.0))]
+              [r (- colour t)])
          (when (= loss lossL2)
            (write! (at pixelGrads i) (vec4 (* 2.0 r) 0.0))
            (write! (at pixelLosses i) (dot r r)))
-         (when (not= loss lossL2)
+         (when (= loss lossEval)
+           (let* ([e (- (clamp colour 0.0 1.0) t)])
+             (write! (at pixelGrads i) (vec4 0.0))
+             (write! (at pixelLosses i) (* (dot e e) scale))))
+         (when (= loss lossL1)
            (write! (at pixelGrads i) (vec4 (* (sign r) scale) 0.0))
            (write! (at pixelLosses i) (* (+ (abs r.x) (abs r.y) (abs r.z)) scale))))))))
 
@@ -468,6 +478,103 @@
                                       (blends other.mean other.conic other.opacity centre))))])
            (write! (at lossDeltas i) (if flips 0.0 (- (at plusLosses i) (at pixelLosses i))))))))))
 
+;; Adam (Kingma and Ba 2015) as the reference trains with it: torch.optim.Adam with betas (0.9,
+;; 0.999) and eps 1e-15 (gaussian_model.py's training_setup), so with bias corrections b1 = 1 -
+;; 0.9^t and b2 = 1 - 0.999^t at step t: m = 0.9 m + 0.1 g, v = 0.999 v + 0.001 g^2,
+;; p = p - lr (m / b1) / (sqrt(v / b2) + eps)
+(define adamBeta1 0.9)
+(define adamBeta2 0.999)
+(define adamEpsilon 1e-15)
+
+;; Four parameters' next values and moments
+(struct AdamStep (parameter vec4) (m vec4) (v vec4))
+
+(define (adamStep [p : vec4] [g : vec4] [m : vec4] [v : vec4] [lr : vec4] [bias1 : float] [bias2 : float]) : AdamStep
+  (let* ([m2 (+ (* adamBeta1 m) (* (- 1.0 adamBeta1) g))]
+         [v2 (+ (* adamBeta2 v) (* (- 1.0 adamBeta2) (* g g)))])
+    (AdamStep (- p (/ (* lr (/ m2 bias1)) (+ (sqrt (/ v2 bias2)) adamEpsilon))) m2 v2)))
+
+;; 10. One Adam step on every splat's parameters (Splat's fields, the padding left alone) from this
+;; frame's parameterGradients, with the moments in adamM and adamV (Splats of moments, shared
+;; between frames and cleared in the first). Every splat steps, a culled one too (its gradient is
+;; 0, so its moments decay and it keeps moving: torch's Adam does the same). The learning rates are
+;; the reference's groups: the position's (decayed by the app), the SH DC's (feature lr), the
+;; higher SH coefficients' (feature lr / 20), the opacity logit's, the log-scale's and the
+;; quaternion's. A frame whose entries didn't fit (counts' total past its capacity) has lost some
+;; entries' gradients, so it doesn't step at all (the app counts such frames: Record marks them).
+(compute-material Adam
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat read-write))
+   (parameterGradients (buffer-array Splat read))
+   (adamM (buffer-array Splat read-write))
+   (adamV (buffer-array Splat read-write))
+   (counts (buffer-array uint read)))
+  (push (splatCount uint) (bias1 float) (bias2 float) (positionLr float) (dcLr float) (restLr float)
+        (opacityLr float) (scalingLr float) (rotationLr float))
+  (compute
+   (when (<= (at counts countTotal) (at counts countCapacity))
+     (for ([i (range globalInvocationId.x splatCount (* splatGroupSize workgroupCount.x))])
+       (let* ([s (at splats i)]
+              [g (at parameterGradients i)]
+              [m (at adamM i)]
+              [v (at adamV i)]
+              ;; The position and the opacity logit together, the log-scale with its padding
+              ;; (whose gradient is 0) not written back, and the quaternion
+              [a (adamStep (vec4 s.position s.opacity) (vec4 g.position g.opacity) (vec4 m.position m.opacity)
+                           (vec4 v.position v.opacity) (vec4 positionLr positionLr positionLr opacityLr) bias1 bias2)]
+              [b (adamStep (vec4 s.logScale 0.0) (vec4 g.logScale 0.0) (vec4 m.logScale 0.0) (vec4 v.logScale 0.0)
+                           (vec4 scalingLr scalingLr scalingLr 0.0) bias1 bias2)]
+              [r (adamStep s.rotation g.rotation m.rotation v.rotation (vec4 rotationLr) bias1 bias2)])
+         (write! (.position (at splats i)) a.parameter.xyz)
+         (write! (.opacity (at splats i)) a.parameter.w)
+         (write! (.position (at adamM i)) a.m.xyz)
+         (write! (.opacity (at adamM i)) a.m.w)
+         (write! (.position (at adamV i)) a.v.xyz)
+         (write! (.opacity (at adamV i)) a.v.w)
+         (write! (.logScale (at splats i)) b.parameter.xyz)
+         (write! (.logScale (at adamM i)) b.m.xyz)
+         (write! (.logScale (at adamV i)) b.v.xyz)
+         (write! (.rotation (at splats i)) r.parameter)
+         (write! (.rotation (at adamM i)) r.m)
+         (write! (.rotation (at adamV i)) r.v)
+         ;; The SH coefficients four floats at a time: the first three are the DC's (sh[0..2])
+         (for ([j (range (uint 0) (uint 12))])
+           (let* ([k (* j (uint 4))]
+                  [c (adamStep (vec4 (at s.sh k) (at s.sh (+ k (uint 1))) (at s.sh (+ k (uint 2))) (at s.sh (+ k (uint 3))))
+                               (vec4 (at g.sh k) (at g.sh (+ k (uint 1))) (at g.sh (+ k (uint 2))) (at g.sh (+ k (uint 3))))
+                               (vec4 (at m.sh k) (at m.sh (+ k (uint 1))) (at m.sh (+ k (uint 2))) (at m.sh (+ k (uint 3))))
+                               (vec4 (at v.sh k) (at v.sh (+ k (uint 1))) (at v.sh (+ k (uint 2))) (at v.sh (+ k (uint 3))))
+                               (if (= j (uint 0)) (vec4 dcLr dcLr dcLr restLr) (vec4 restLr))
+                               bias1 bias2)])
+             (write! (at (.sh (at splats i)) k) c.parameter.x)
+             (write! (at (.sh (at splats i)) (+ k (uint 1))) c.parameter.y)
+             (write! (at (.sh (at splats i)) (+ k (uint 2))) c.parameter.z)
+             (write! (at (.sh (at splats i)) (+ k (uint 3))) c.parameter.w)
+             (write! (at (.sh (at adamM i)) k) c.m.x)
+             (write! (at (.sh (at adamM i)) (+ k (uint 1))) c.m.y)
+             (write! (at (.sh (at adamM i)) (+ k (uint 2))) c.m.z)
+             (write! (at (.sh (at adamM i)) (+ k (uint 3))) c.m.w)
+             (write! (at (.sh (at adamV i)) k) c.v.x)
+             (write! (at (.sh (at adamV i)) (+ k (uint 1))) c.v.y)
+             (write! (at (.sh (at adamV i)) (+ k (uint 2))) c.v.z)
+             (write! (at (.sh (at adamV i)) (+ k (uint 3))) c.v.w))))))))
+
+;; 11. The frame's loss into history[slot] (shared between frames, so the app reads every frame's
+;; at the end, though a read event skips older copies), or -1 when the frame's entries didn't fit
+;; (counts' total past its capacity: Adam skipped it, and an evaluation frame's loss is wrong)
+(compute-material Record
+  (workgroup 1)
+  (bindings
+   (losses (buffer-array float read))
+   (counts (buffer-array uint read))
+   (history (buffer-array float write)))
+  (push (slot uint) (historySize uint))
+  (compute
+   (when (< slot historySize)
+     (write! (at history slot)
+             (if (<= (at counts countTotal) (at counts countCapacity)) (at losses lossTotal) -1.0)))))
+
 ;; ---------------------------------------------------------------------------------------------
 ;; The graph
 ;; ---------------------------------------------------------------------------------------------
@@ -502,8 +609,8 @@
   (input targetFile path)
   (input targetPixels (per-frame uint))
   (input targetOffset (per-frame uint))
-  ;; lossL1 or lossL2
-  (parameter loss uint)
+  ;; lossL1, lossL2 or lossEval (per frame: a trainer scores its held-out views with lossEval)
+  (input loss (per-frame uint))
   ;; Whether the graph perturbs a projection (Perturb) and sums the loss's change (LossDelta) for
   ;; finite differences: probe 0 is unperturbed, any other perturbs field perturbField
   ;; (perturbOpacity and so on, or perturbParameter plus a parameter's offset) of splat
@@ -514,6 +621,21 @@
   (input perturbSplat (per-frame uint))
   (input perturbField (per-frame uint))
   (input perturbDelta (per-frame float))
+  ;; Whether the graph trains (splat_train): Adam steps the splats in place after the backward pass
+  ;; (adamM and adamV its moments), and Record writes each frame's loss into history[historySlot]
+  ;; (historySize slots); the app passes Adam's bias corrections (1 - 0.9^t and 1 - 0.999^t at
+  ;; step t) and the learning rates
+  (parameter train bool)
+  (parameter historySize uint)
+  (input historySlot (per-frame uint))
+  (input bias1 (per-frame float))
+  (input bias2 (per-frame float))
+  (input positionLr (per-frame float))
+  (input dcLr (per-frame float))
+  (input restLr (per-frame float))
+  (input opacityLr (per-frame float))
+  (input scalingLr (per-frame float))
+  (input rotationLr (per-frame float))
 
   ;; The buffers' sizes; this frame's are (/ (+ width 15) 16) and so on, written out where used
   (constant maxTileCount (* (/ (+ maxWidth 15) 16) (/ (+ maxHeight 15) 16)))
@@ -551,6 +673,10 @@
   (buffer plusLasts uint maxPixels #:frames shared #:when finiteDifferences)
   (buffer plusProjected Projected 1 #:frames shared #:when finiteDifferences)
   (buffer lossDeltas float maxPixels #:frames per-frame #:when finiteDifferences)
+  ;; Training's, across frames
+  (buffer adamM Splat splatCount #:frames shared #:when train)
+  (buffer adamV Splat splatCount #:frames shared #:when train)
+  (buffer history float (max historySize 1) #:frames shared #:when train)
 
   (material preprocessing Preprocess splats cameras projected tileCounts
             #:push ((splatCount splatCount) (cameraIndex cameraIndex) (near near) (shDegree shDegree))
@@ -593,6 +719,13 @@
             parameterGradients densifyStats
             #:push ((splatCount splatCount) (cameraIndex cameraIndex) (shDegree shDegree))
             #:invocations ((min splatCount (* (max maxGroups 1) 64))))
+  (material stepping Adam splats parameterGradients adamM adamV counts
+            #:push ((splatCount splatCount) (bias1 bias1) (bias2 bias2) (positionLr positionLr) (dcLr dcLr)
+                    (restLr restLr) (opacityLr opacityLr) (scalingLr scalingLr) (rotationLr rotationLr))
+            #:invocations ((min splatCount (* (max maxGroups 1) 64))) #:when train)
+  (material recording Record losses counts history
+            #:push ((slot historySlot) (historySize historySize))
+            #:invocations (1) #:when train)
 
   ;; The forward pass: SplatGraph's
   (dispatch preprocess preprocessing)
@@ -618,6 +751,12 @@
   (dispatch gather gathering)
   (clear resetDensify densifyStats #:once #t)
   (dispatch backwardPreprocess backwardPreprocessing)
+  ;; Training
+  (clear resetFirstMoments adamM #:once #t #:when train)
+  (clear resetSecondMoments adamV #:once #t #:when train)
+  (clear resetHistory history #:once #t #:when train)
+  (dispatch adam stepping #:when train)
+  (dispatch record recording #:when train)
 
   (readback readCounts counts)
   (readback readLosses losses)
@@ -626,5 +765,7 @@
   (readback readDensifyStats densifyStats #:when inspect)
   (readback readBackwardRanges backwardRanges #:when inspect)
   (readback readSplats splats #:once #t #:when inspect)
-  (readback readCameras cameras #:once #t #:when inspect)
+  (readback readCameras cameras #:once #t #:when (or inspect train))
+  (readback readHistory history #:when train)
+  (readback readTrained splats #:when train)
   (readback readProjected projected #:when inspect))

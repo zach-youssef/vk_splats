@@ -25,6 +25,8 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | InvertEntries | 6 | 1 | 0 | 0 | 256 |
 | GatherGradients | 6 | 1 | 0 | 0 | 64 |
 | BackwardPreprocess | 6 | 1 | 0 | 0 | 64 |
+| Adam | 5 | 1 | 0 | 0 | 64 |
+| Record | 3 | 1 | 0 | 0 | 1 |
 | Perturb, LossDelta (grad_test only) | 3, 8 (at the limit) | 1 | 0 | 0 | 1, 256 |
 | ZgalSortCount | 4 | 1 | 0 | 64 B (16 atomic bins) | 256 |
 | ZgalSortOffsets | 1 | 1 | 0 | 260 B with subgroups, 1028 B without (256 lanes and a carry) | 256 |

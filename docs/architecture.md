@@ -272,11 +272,12 @@ input).
    against the target, an RGBA8 pixel at `targetOffset` + the pixel's index in `targetFile`
    (an `images_<k>.bin`: [data-format.md](data-format.md)), which holds `targetPixels` pixels: a
    pixel past them reads black rather than past the buffer, and the app must check up front that
-   `targetOffset` + W·H ≤ `targetPixels` (grad_test fails otherwise). With `loss` = `lossL2`, the
+   `targetOffset` + W·H ≤ `targetPixels` (grad_test fails otherwise). With `loss` (per frame) = `lossL2`, the
    loss is Σ(I − t)² over the channels (the gradient tests' smooth loss) and dL/dI = 2(I − t); with
    `lossL1`, |I − t| / 3WH and sign(I − t) / 3WH, so the image's loss is the mean (training's L1
-   term). Per-pixel values go to `pixelLosses` and `pixelGrads`, and a `reduce` sums the loss into
-   `losses[0]`.
+   term); with `lossEval` (a held-out view's score), (clamp(I, 0, 1) − t)² / 3WH and no gradient,
+   so the image's loss is its MSE on the clamped render (PSNR's). Per-pixel values go to
+   `pixelLosses` and `pixelGrads`, and a `reduce` sums the loss into `losses[0]`.
 7. `TileLasts` (64-wide, grid stride over the tiles) writes each tile's start, last and end into
    `backwardRanges` (3 uints a tile), the last being the largest of its pixels' `lastEntries`.
    `BackwardRasterize`: one 16×16 workgroup per tile, as Rasterize. Each pixel starts at its
@@ -316,10 +317,25 @@ input).
    from both intervals (1–2 frames of a 100-iteration interval; consuming and resetting in the
    same frame on the GPU would drop none). `tests/cpp/splat_backward_test.cpp` checks
    `preprocessBackward` on the CPU (the oracle and central differences of `projectSplat`).
+10. `Adam` (64-wide, grid stride over the splats; only with the `train` parameter) steps every
+    splat's parameters with `parameterGradients` (`adamStep`, four floats at a time: β₁ = 0.9,
+    β₂ = 0.999, ε = 1e-15, the reference's), keeping the moments in `adamM` and `adamV` (a `Splat`
+    each, `#:frames shared`, zeroed by `#:once` clears in the first frame). The app pushes the
+    bias corrections (1 − β₁ᵗ, 1 − β₂ᵗ, computed by the app, so every backend steps the
+    same) and the learning rates per group: the position's, the SH DC's, the rest of the SH's,
+    the opacity logit's, the log-scales' and the quaternion's. The padding isn't stepped. A frame
+    whose entries overflowed (`counts`' total past its capacity, so gradients were lost) steps
+    nothing; the app grows the capacity and the next frame steps.
+11. `Record` (one invocation, with `train`) writes `losses[0]` into `history[historySlot]` (−1
+    for a frame Adam skipped; `historySize` floats, `#:frames shared`, zeroed once), so the app
+    reads every iteration's loss once at the end: a readback event sees only the newest frame's
+    copy, and a trainer runs frames back to back.
 
 `losses` holds (the loss, the probe, the loss's change) and is read back every frame, with
 `counts`. With `inspect` (tests), so are `splatGradients`, `parameterGradients`, `densifyStats`,
-the projections and `backwardRanges`, and the splats and cameras once.
+the projections and `backwardRanges`, and the splats and cameras once. With `train`, the cameras
+are read too, and `history` and the trained splats when the app enables `readHistory` and
+`readTrained`.
 
 - **Determinism**: every sum has a fixed order (the per-entry reduction, the per-splat gather, ZGAL's
   `reduce`), so a frame's gradients are the same bit for bit on every run and every frame. The
