@@ -18,6 +18,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
   - `grad_test`: the training graph's gradients against the closed-form oracle and GPU finite
     differences ([below](#train-graph)); its checks are in `grad_check.h`, shared with
     `web-check/grad_test_check.cpp` as render_test's are.
+  - `densify_test`: one densification frame (clone, split, prune, compaction, the counts, the
+    opacity reset) against the CPU, every check in the app ([below](#train-graph)).
 - `lib/`: ZGAL modules the programs share, imported by relative path:
   `(import "../../lib/<module>.zgal")`. A module's name is a C++ namespace (ZGAL compiles its
   functions to C++ too), so it uses underscores, not hyphens.
@@ -387,7 +389,8 @@ input).
 
 `losses` holds (the loss, the probe, the loss's change) and is read back every frame, with
 `counts` and `splatCounts`. With `inspect` (tests), so are `splatGradients`, `parameterGradients`, `densifyStats`,
-the projections and `backwardRanges`, and the splats and cameras once. With `train`, the cameras
+the projections and `backwardRanges`, and the splats and cameras once; with `inspect` and `train`,
+`adamM`, `adamV`, `actions` and `slots` (densify_test's). With `train`, the cameras
 are read too, and `history` and the trained splats when the app enables `readHistory` and
 `readTrained`.
 

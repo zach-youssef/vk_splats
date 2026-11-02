@@ -1,0 +1,386 @@
+;; The densification's test (lib/train_graph.zgal's stage 12) on the GPU, with every check in the app
+;; (so the same on the web): it trains a scene's splats for --train-frames frames (the L2 loss
+;; against a target, Adam on, so the moments and the densification's statistics aren't zero),
+;; idles (the backward pass and Adam off, so nothing changes) until the readbacks show an idle
+;; frame, runs one densification frame, idles again, and compares what it read before and after:
+;;   - each splat's action (the GPU's actions) with densifyAction on the CPU, but where a value is
+;;     within float rounding of a boundary (the GPU's exp and log needn't round as the CPU's do);
+;;   - the slots: the exclusive scan of the actions' flags (the kept places, then the additions);
+;;   - each splat where its slots say: a kept or cloned splat and a clone's copy bit for bit, with
+;;     their Adam moments (the copy's zero), a split's halves (when its second fits) as the CPU's
+;;     splitPosition and splitLogScale within float rounding and the rest bit for bit, with zero
+;;     moments, and a split whose second half doesn't fit (past --max-splats) as it was;
+;;   - the counts: in use min(total, capacity), the overflow the dropped additions, one more
+;;     densification, the pruned and added numbers; and every statistic zero (densifyClear).
+;; With --reset the frame also resets the opacity (ResetOpacity, after the densification): every
+;; splat's opacity logit at most resetOpacityLogit and its opacity moments zero. The thresholds come
+;; from the statistics read before: the gradient's is their mean over the visible splats, the
+;; clone's scale the mean largest scale of those reaching it (so some clone and some split), and
+;; with --screen-prune the world-space prune's 1.25 times the mean largest scale of all. Every action
+;; must occur (test.sh fades some splats, so the opacity prune does), with --screen-prune more
+;; opaque splats pruned than by their radius alone (so a size prune fired) and, with
+;; --max-screen-size too, one by its radius alone, and with --overflow a dropped addition (none
+;; without) and a split not done. It fails on a mismatch, an overflowing tile-entry frame (raise
+;; --capacity) or when the frames run out first.
+
+(import "../../lib/train_graph.zgal")
+
+(define phaseTraining (uint 0))
+(define phaseBefore (uint 1))
+(define phaseDensifying (uint 2))
+(define phaseAfter (uint 3))
+
+;; Bit-for-bit float equality (NaN never equals)
+(define (sameVec3 [a : vec3] [b : vec3]) : bool
+  (and (= a.x b.x) (= a.y b.y) (= a.z b.z)))
+(define (sameVec4 [a : vec4] [b : vec4]) : bool
+  (and (= a.x b.x) (= a.y b.y) (= a.z b.z) (= a.w b.w)))
+(define (sameSh [a : Splat] [b : Splat]) : bool
+  (fold ([ok #t]) ([k (range (uint 0) (uint 48))]) (and ok (= (at a.sh k) (at b.sh k)))))
+
+;; A splat's opacity logit after the frame: the reset caps it
+(define (expectedOpacity [o : float] [reset : bool]) : float
+  (if reset (min o resetOpacityLogit) o))
+
+;; Whether x is b after the frame, bit for bit (a kept or cloned splat, a clone's copy)
+(define (sameSplat [x : Splat] [b : Splat] [reset : bool]) : bool
+  (and (sameVec3 x.position b.position) (= x.opacity (expectedOpacity b.opacity reset))
+       (sameVec3 x.logScale b.logScale) (sameVec4 x.rotation b.rotation) (sameSh x b)))
+
+;; Whether x is a moment m after the frame (the reset zeroes the opacity's)
+(define (sameMoment [x : Splat] [m : Splat] [reset : bool]) : bool
+  (and (sameVec3 x.position m.position) (= x.opacity (if reset 0.0 m.opacity))
+       (sameVec3 x.logScale m.logScale) (sameVec4 x.rotation m.rotation) (sameSh x m)))
+
+;; Whether a moment is zero
+(define (zeroMoment [x : Splat]) : bool
+  (and (sameVec3 x.position (vec3 0.0)) (= x.opacity 0.0) (sameVec3 x.logScale (vec3 0.0))
+       (sameVec4 x.rotation (vec4 0.0))
+       (fold ([ok #t]) ([k (range (uint 0) (uint 48))]) (and ok (= (at x.sh k) 0.0)))))
+
+;; |a - b| within tol per component
+(define (closeVec3 [a : vec3] [b : vec3] [tol : float]) : bool
+  (and (<= (abs (- a.x b.x)) tol) (<= (abs (- a.y b.y)) tol) (<= (abs (- a.z b.z)) tol)))
+
+;; Whether x is the half of b that key samples: its position and log-scale the CPU's within float
+;; rounding (the sample's offset is up to a few scales, so 1e-3 of the largest scale is far below
+;; it), the rest bit for bit
+(define (splitHalf [x : Splat] [b : Splat] [key : uint] [reset : bool]) : bool
+  (let* ([p (splitPosition b key)]
+         [l (splitLogScale b.logScale)])
+    (and (closeVec3 x.position p (+ (* 1e-3 (maxScale b)) (* 1e-5 (+ 1.0 (length p)))))
+         (closeVec3 x.logScale l (* 1e-5 (+ 1.0 (length l))))
+         (= x.opacity (expectedOpacity b.opacity reset)) (sameVec4 x.rotation b.rotation) (sameSh x b))))
+
+;; Whether a and b are within float rounding of each other (relative)
+(define (near [a : float] [b : float]) : bool
+  (<= (abs (- a b)) (* 1e-5 (max (abs a) (abs b)))))
+
+;; Whether a splat's action may differ between the CPU and the GPU: a value within rounding of a
+;; boundary densifyAction compares it with
+(define (onBoundary [s : Splat] [d : DensifyStat] [threshold : float] [cloneScale : float]
+                    [pruneScale : float]) : bool
+  (let* ([scale (maxScale s)])
+    (or (near (densifyGradient d) threshold) (near scale cloneScale) (near scale pruneScale)
+        (near (/ scale splitScaleDivisor) pruneScale) (near (sigmoid s.opacity) pruneOpacity))))
+
+(define (flag [b : bool]) : uint (if b (uint 1) (uint 0)))
+
+;; Whether a read is an idle phase's (before or after the densification): it is once the phase has
+;; run for more than the frames in flight + 1 (a read handled in a frame is at most that much older)
+(define (settled [phase : uint] [since : uint] [frame : uint] [inFlight : uint]) : bool
+  (and (or (= phase phaseBefore) (= phase phaseAfter)) (>= frame (+ since inFlight (uint 3)))))
+
+(app DensifyTest
+  (parameter splatFile path)
+  (parameter cameraFile path)
+  (parameter targetFile path)
+  (parameter splatCount uint)
+  (parameter maxSplats uint)
+  (parameter cameraIndex uint)
+  (parameter width uint)
+  (parameter height uint)
+  (parameter shDegree uint)
+  (parameter near float)
+  (parameter far float)
+  (parameter capacity uint)
+  (parameter targetOffset uint)
+  (parameter targetPixels uint)
+  (parameter backgroundR float)
+  (parameter backgroundG float)
+  (parameter backgroundB float)
+  (parameter trainFrames uint)
+  (parameter seed uint)
+  (parameter screenPrune bool)
+  (parameter maxScreenSize uint)
+  (parameter reset bool)
+  (parameter overflow bool)
+  ;; Exits the program with status 1
+  (extern (fail) : void)
+  (state
+   (phase uint phaseTraining)
+   (iteration uint 0)       ; Adam's steps so far
+   (since uint 0)           ; the phase's first frame
+   ;; The thresholds, from the statistics read before
+   (threshold float 0.0)
+   (cloneScale float 0.0)
+   (pruneScale float 0.0)
+   ;; Before the densification, and after
+   (splats (data Splat) (empty-data Splat))
+   (firstMoments (data Splat) (empty-data Splat))
+   (secondMoments (data Splat) (empty-data Splat))
+   (stats (data DensifyStat) (empty-data DensifyStat))
+   (counts (data uint) (empty-data uint))
+   (afterSplats (data Splat) (empty-data Splat))
+   (afterFirst (data Splat) (empty-data Splat))
+   (afterSecond (data Splat) (empty-data Splat))
+   (afterStats (data DensifyStat) (empty-data DensifyStat))
+   (afterCounts (data uint) (empty-data uint))
+   (actions (data uint) (empty-data uint))
+   (slots (data uint) (empty-data uint)))
+  (on (read readTrained d)
+    (cond [(not (settled state.phase state.since frameNumber framesInFlight)) state]
+          [(= state.phase phaseBefore) (with state #:splats d)]
+          [else (with state #:afterSplats d)]))
+  (on (read readFirstMoments d)
+    (cond [(not (settled state.phase state.since frameNumber framesInFlight)) state]
+          [(= state.phase phaseBefore) (with state #:firstMoments d)]
+          [else (with state #:afterFirst d)]))
+  (on (read readSecondMoments d)
+    (cond [(not (settled state.phase state.since frameNumber framesInFlight)) state]
+          [(= state.phase phaseBefore) (with state #:secondMoments d)]
+          [else (with state #:afterSecond d)]))
+  (on (read readDensifyStats d)
+    (cond [(not (settled state.phase state.since frameNumber framesInFlight)) state]
+          [(= state.phase phaseBefore) (with state #:stats d)]
+          [else (with state #:afterStats d)]))
+  (on (read readSplatCounts d)
+    (cond [(not (settled state.phase state.since frameNumber framesInFlight)) state]
+          [(= state.phase phaseBefore) (with state #:counts d)]
+          [else (with state #:afterCounts d)]))
+  (on (read readActions d) (if (and (= state.phase phaseAfter) (settled state.phase state.since frameNumber framesInFlight)) (with state #:actions d) state))
+  (on (read readSlots d) (if (and (= state.phase phaseAfter) (settled state.phase state.since frameNumber framesInFlight)) (with state #:slots d) state))
+  (on (read readCounts d)
+    (begin
+      (when (> (at d countTotal) capacity)
+        (print! "densify_test: FAILED, a frame has " (at d countTotal) " tile entries, more than --capacity "
+                capacity)
+        (fail))
+      state))
+  (on (frame dt)
+    (cond
+      [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
+       (begin
+         (print! "densify_test: FAILED, " frameLimit " frames weren't enough (phase " state.phase ")")
+         (fail)
+         state)]
+      [(< maxSplats splatCount)
+       (begin (print! "densify_test: FAILED, --max-splats " maxSplats " is below --splat-count " splatCount)
+              (fail) state)]
+      [(or (> targetOffset targetPixels) (> (* width height) (- targetPixels targetOffset)))
+       (begin (print! "densify_test: FAILED, the camera's pixels don't fit in --target-pixels " targetPixels)
+              (fail) state)]
+      [(= state.phase phaseTraining)
+       (if (< state.iteration trainFrames)
+           (with state #:iteration (+ state.iteration (uint 1)))
+           (with state #:phase phaseBefore #:since frameNumber))]
+      ;; Once the idle state has arrived, the thresholds from it, and the densification's frame
+      [(= state.phase phaseBefore)
+       (if (and (> (count state.splats) 0) (> (count state.firstMoments) 0) (> (count state.secondMoments) 0)
+                (> (count state.stats) 0) (> (count state.counts) 0))
+           (let* ([n (at state.counts splatActive)]
+                  [visible (fold ([k 0.0]) ([i (range (uint 0) n)])
+                             (+ k (if (> (.visible (at state.stats i)) (uint 0)) 1.0 0.0)))]
+                  [threshold (/ (fold ([a 0.0]) ([i (range (uint 0) n)]) (+ a (densifyGradient (at state.stats i))))
+                                (max visible 1.0))]
+                  [reaching (fold ([k 0.0]) ([i (range (uint 0) n)])
+                              (+ k (if (>= (densifyGradient (at state.stats i)) threshold) 1.0 0.0)))]
+                  [cloneScale (/ (fold ([a 0.0]) ([i (range (uint 0) n)])
+                                   (+ a (if (>= (densifyGradient (at state.stats i)) threshold)
+                                            (maxScale (at state.splats i)) 0.0)))
+                                 (max reaching 1.0))]
+                  [pruneScale (* 1.25 (/ (fold ([a 0.0]) ([i (range (uint 0) n)]) (+ a (maxScale (at state.splats i))))
+                                        (float (max n (uint 1)))))])
+             (print! "densify_test: " n " splats, " visible " visible; threshold " threshold ", clone scale "
+                     cloneScale ", prune scale " pruneScale)
+             (with state #:phase phaseDensifying #:threshold threshold #:cloneScale cloneScale
+                   #:pruneScale (if screenPrune pruneScale 0.0)))
+           state)]
+      [(= state.phase phaseDensifying) (with state #:phase phaseAfter #:since frameNumber)]
+      ;; Once the state after has arrived, the checks
+      [(and (> (count state.afterSplats) 0) (> (count state.afterFirst) 0) (> (count state.afterSecond) 0)
+            (> (count state.afterStats) 0) (> (count state.afterCounts) 0) (> (count state.actions) 0)
+            (> (count state.slots) 0))
+       (let* ([n (at state.counts splatActive)]
+              [b state.splats]
+              [a state.actions]
+              [s state.slots]
+              ;; The actions' tallies, and the CPU's disagreements off a boundary
+              [pruned (fold ([k (uint 0)]) ([i (range (uint 0) n)]) (+ k (flag (= (at a i) densifyPrune))))]
+              [kept (fold ([k (uint 0)]) ([i (range (uint 0) n)]) (+ k (flag (= (at a i) densifyKeep))))]
+              [cloned (fold ([k (uint 0)]) ([i (range (uint 0) n)]) (+ k (flag (= (at a i) densifyClone))))]
+              [split (fold ([k (uint 0)]) ([i (range (uint 0) n)]) (+ k (flag (= (at a i) densifySplit))))]
+              [opaquePruned (fold ([k (uint 0)]) ([i (range (uint 0) n)])
+                              (+ k (flag (and (= (at a i) densifyPrune) (>= (sigmoid (.opacity (at b i))) pruneOpacity)))))]
+              ;; The prunes by radius alone (none without the screen-space prune)
+              [radiusPruned (fold ([k (uint 0)]) ([i (range (uint 0) n)])
+                              (+ k (flag (and (= (at a i) densifyPrune)
+                                              (not= (densifyAction (at b i) (at state.stats i) state.threshold
+                                                                   state.cloneScale state.pruneScale screenPrune (uint 0))
+                                                    densifyPrune)))))]
+              [actionErrors (fold ([k (uint 0)]) ([i (range (uint 0) n)])
+                              (let* ([cpu (densifyAction (at b i) (at state.stats i) state.threshold state.cloneScale
+                                                         state.pruneScale screenPrune maxScreenSize)])
+                                (+ k (flag (and (not= cpu (at a i))
+                                                (not (onBoundary (at b i) (at state.stats i) state.threshold
+                                                                 state.cloneScale state.pruneScale)))))))]
+              [onBoundaries (fold ([k (uint 0)]) ([i (range (uint 0) n)])
+                              (+ k (flag (onBoundary (at b i) (at state.stats i) state.threshold state.cloneScale
+                                                     state.pruneScale))))]
+              ;; The slots: the exclusive scan of the kept flags, then (from K) of the additions'
+              [keptScan (fold ([acc (uvec2 0 0)]) ([i (range (uint 0) n)])
+                          (uvec2 (+ acc.x (flag (not= (at a i) densifyPrune)))
+                                 (+ acc.y (flag (not= (at s i) acc.x)))))]
+              [k0 keptScan.x]
+              [addScan (fold ([acc (uvec2 0 0)]) ([i (range (uint 0) n)])
+                         (uvec2 (+ acc.x (flag (> (at a i) densifyKeep)))
+                                (+ acc.y (flag (not= (at s (+ n (uint 1) i)) (+ k0 acc.x))))))]
+              [total (+ k0 addScan.x)]
+              [slotErrors (+ keptScan.y addScan.y (flag (not= (at s n) k0))
+                             (flag (not= (at s (+ (* n (uint 2)) (uint 1))) total)))]
+              [inUse (min total maxSplats)]
+              [dropped (- total inUse)]
+              ;; The splits whose second half doesn't fit (so not done)
+              [splitsDropped (fold ([k (uint 0)]) ([i (range (uint 0) n)])
+                               (+ k (flag (and (= (at a i) densifySplit) (>= (at s (+ n (uint 1) i)) maxSplats)))))]
+              ;; Each splat where its slots say
+              ;; The splats and moments wrong, and the first such splat
+              [splatCheck
+               (if (> slotErrors (uint 0))
+                   (uvec2 0 0)
+                   (fold ([errors (uvec2 0 0)]) ([i (range (uint 0) n)])
+                     (let* ([act (at a i)]
+                            [k (at s i)]
+                            [e (at s (+ n (uint 1) i))]
+                            [fits (< e maxSplats)]
+                            [halves (and (= act densifySplit) fits)]
+                            [bs (at b i)]
+                            [mainOk (or (= act densifyPrune)
+                                        (and (if halves
+                                                 (splitHalf (at state.afterSplats k) bs (splitKey seed i (uint 0)) reset)
+                                                 (sameSplat (at state.afterSplats k) bs reset))
+                                             (if halves
+                                                 (and (zeroMoment (at state.afterFirst k)) (zeroMoment (at state.afterSecond k)))
+                                                 (and (sameMoment (at state.afterFirst k) (at state.firstMoments i) reset)
+                                                      (sameMoment (at state.afterSecond k) (at state.secondMoments i) reset)))))]
+                            [extraOk (or (<= act densifyKeep) (not fits)
+                                         (and (if halves
+                                                  (splitHalf (at state.afterSplats e) bs (splitKey seed i (uint 1)) reset)
+                                                  (sameSplat (at state.afterSplats e) bs reset))
+                                              (zeroMoment (at state.afterFirst e)) (zeroMoment (at state.afterSecond e))))])
+                       (uvec2 (+ errors.x (flag (not mainOk)) (flag (not extraOk)))
+                              (if (and (= errors.x (uint 0)) (not (and mainOk extraOk))) i errors.y)))))]
+              [splatErrors splatCheck.x]
+              [c state.afterCounts]
+              [countErrors (+ (flag (not= (at c splatActive) inUse))
+                              (flag (not= (at c splatOverflow) (+ (at state.counts splatOverflow) dropped)))
+                              (flag (not= (at c splatDensifies) (+ (at state.counts splatDensifies) (uint 1))))
+                              (flag (not= (at c splatPruned) (- n k0)))
+                              (flag (not= (at c splatAdded) (- inUse k0))))]
+              [statErrors (fold ([k (uint 0)]) ([i (range (uint 0) (count state.afterStats))])
+                            (let* ([d (at state.afterStats i)])
+                              (+ k (flag (or (not= d.gradientNorm 0.0) (not= d.visible (uint 0))
+                                             (not= d.maxRadius (uint 0)))))))]
+              [missing (+ (flag (= pruned (uint 0))) (flag (= kept (uint 0))) (flag (= cloned (uint 0)))
+                          (flag (= split (uint 0))) (flag (and screenPrune (<= opaquePruned radiusPruned)))
+                          (flag (and screenPrune (> maxScreenSize (uint 0)) (= radiusPruned (uint 0))))
+                          (flag (not= overflow (> dropped (uint 0))))
+                          (flag (and overflow (= splitsDropped (uint 0)))))])
+         (print! "densify_test: actions: " pruned " pruned (" opaquePruned " opaque, " radiusPruned " by radius), " kept
+                 " kept, " cloned " cloned, " split " split (" onBoundaries " on a boundary); " k0 " kept places, "
+                 total " in all, " inUse " in use, " dropped " dropped (" splitsDropped " splits not done)")
+         (print! "densify_test: counts after: " (at c splatActive) " active, " (at c splatOverflow) " overflowed, "
+                 (at c splatDensifies) " densifications, " (at c splatPruned) " pruned, " (at c splatAdded) " added")
+         (print! "densify_test: " actionErrors " actions unlike the CPU's, " slotErrors " slots wrong, " splatErrors
+                 " splats or moments wrong, " countErrors " counts wrong, " statErrors " statistics not cleared")
+         (when (> splatErrors (uint 0))
+           (print! "densify_test: MISMATCH from splat " splatCheck.y ", action " (at a splatCheck.y) ", slots "
+                   (at s splatCheck.y) " and " (at s (+ n (uint 1) splatCheck.y))))
+         (if (= (+ actionErrors slotErrors splatErrors countErrors statErrors missing) (uint 0))
+             (begin (print! "densify_test: passed") (quit!))
+             (begin
+               (when (> missing (uint 0))
+                 (print! "densify_test: FAILED, an action didn't occur (each must; with --screen-prune more opaque "
+                         "prunes than by radius alone, and with --max-screen-size a prune by radius), or the overflow "
+                         "isn't what --overflow says (with it, a split not done)")
+                 (fail))
+               (print! "densify_test: FAILED")
+               (fail)))
+         state)]
+      [else state]))
+  (run TrainGraph (splatFile splatFile) (cameraFile cameraFile) (targetFile targetFile)
+       (splatCount splatCount) (maxSplats maxSplats) (cameraIndex cameraIndex) (width width) (height height)
+       (maxWidth width) (maxHeight height) (shDegree shDegree) (near near) (far far) (maxGroups groupLimit)
+       (inspect #t) (finiteDifferences #f) (capacity capacity)
+       (background (vec3 backgroundR backgroundG backgroundB)) (targetPixels targetPixels)
+       (targetOffset targetOffset) (loss lossL2)
+       (probe 0) (perturbSplat 0) (perturbField perturbNone) (perturbDelta 0.0)
+       (train #t) (historySize 1) (historySlot 0)
+       (bias1 (- 1.0 (pow 0.9 (float (max state.iteration (uint 1))))))
+       (bias2 (- 1.0 (pow 0.999 (float (max state.iteration (uint 1))))))
+       ;; The reference's learning rates (an extent of 1)
+       (positionLr 0.00016) (dcLr 0.0025) (restLr 0.000125) (opacityLr 0.025) (scalingLr 0.005)
+       (rotationLr 0.001)
+       (densifyThreshold state.threshold) (cloneScale state.cloneScale) (pruneScale state.pruneScale)
+       (screenPrune (if screenPrune (uint 1) (uint 0))) (maxScreenSize maxScreenSize) (densifySeed seed)
+       #:enabled ((findLasts (= state.phase phaseTraining))
+                  (backwardRasterize (= state.phase phaseTraining))
+                  (clearPositions (= state.phase phaseTraining))
+                  (invert (= state.phase phaseTraining))
+                  (gather (= state.phase phaseTraining))
+                  (backwardPreprocess (= state.phase phaseTraining))
+                  (adam (= state.phase phaseTraining))
+                  (record #f)
+                  (densifyPrepare (= state.phase phaseDensifying))
+                  (densifyMark (= state.phase phaseDensifying))
+                  (densifyScan (= state.phase phaseDensifying))
+                  (densifyCopySplats (= state.phase phaseDensifying))
+                  (densifyScatter (= state.phase phaseDensifying))
+                  (densifyCopyFirstMoments (= state.phase phaseDensifying))
+                  (densifyScatterFirst (= state.phase phaseDensifying))
+                  (densifyCopySecondMoments (= state.phase phaseDensifying))
+                  (densifyScatterSecond (= state.phase phaseDensifying))
+                  (densifyFinish (= state.phase phaseDensifying))
+                  (densifyClear (= state.phase phaseDensifying))
+                  (resetOpacity (and reset (= state.phase phaseDensifying))))))
+
+(main DensifyTest
+  (about "Checks a densification frame (clone, split, prune, compaction, counts, opacity reset) against the CPU")
+  (timestep #:max 0.1 #:fixed 0.016)
+  (option splatFile "--splats" "the scene's splats.bin" #:default "splats.bin")
+  (option cameraFile "--cameras" "the scene's cameras.bin" #:default "cameras.bin")
+  (option targetFile "--targets" "the target images (RGBA8, row by row)" #:default "targets.bin")
+  (option splatCount "--splat-count" "the splats in it (the manifest's splatCount)" #:default 1
+          #:range (1 559240))
+  (option maxSplats "--max-splats" "the splat capacity (at least --splat-count; the densification's cap)"
+          #:default 4096 #:range (1 559240))
+  (option cameraIndex "--camera" "the camera to render" #:default 0)
+  (option width "--width" "the camera's image width" #:default 64 #:range (1 2896))
+  (option height "--height" "the camera's image height" #:default 64 #:range (1 2896))
+  (option shDegree "--sh-degree" "the SH bands to evaluate" #:default 3 #:range (0 3))
+  (option near "--near" "the near plane" #:default 0.2)
+  (option far "--far" "the depth keys' far depth" #:default 1000.0)
+  (option capacity "--capacity" "the tile entries' capacity (fixed; a frame needing more fails)"
+          #:default 1000000 #:range (1 3145728))
+  (option targetOffset "--target-offset" "the camera's first pixel in the targets" #:default 0)
+  (option targetPixels "--target-pixels" "the pixels the targets hold (required: the camera's must fit)" #:default 0)
+  (option backgroundR "--background-r" "the background's red" #:default 0.0)
+  (option backgroundG "--background-g" "the background's green" #:default 0.0)
+  (option backgroundB "--background-b" "the background's blue" #:default 0.0)
+  (option trainFrames "--train-frames" "the Adam steps before the densification" #:default 20 #:range (1 10000))
+  (option seed "--seed" "the split's seed" #:default 1)
+  (flag screenPrune "--screen-prune" "prune by size too (the world-space prune, and the screen-space one with --max-screen-size)")
+  (option maxScreenSize "--max-screen-size" "with --screen-prune, the largest radius in pixels a splat keeps (0: no screen-space prune)"
+          #:default 0 #:range (0 65535))
+  (flag reset "--reset" "reset the opacity in the densification's frame")
+  (flag overflow "--overflow" "require a dropped addition (past --max-splats); without, require none"))

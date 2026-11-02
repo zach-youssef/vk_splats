@@ -874,10 +874,10 @@
   ;; frame, and resetOpacity in a reset's): densifyAction's gradient threshold, the largest scale
   ;; a clone has and the largest a splat keeps, whether the size prunes apply (0 or 1), the
   ;; largest radius in pixels a splat keeps then (0: no screen-space prune), and the split's seed
-  ;; (a new one each densification)
-  (parameter densifyThreshold float)
-  (parameter cloneScale float)
-  (parameter pruneScale float)
+  ;; (a new one each densification). Per frame, so a test can set them from the statistics it read
+  (input densifyThreshold (per-frame float))
+  (input cloneScale (per-frame float))
+  (input pruneScale (per-frame float))
   (input screenPrune (per-frame uint))
   (input maxScreenSize (per-frame uint))
   (input densifySeed (per-frame uint))
@@ -1051,4 +1051,9 @@
   (readback readHistory history #:when train)
   (readback readTrained splats #:when train)
   (readback readSplatCounts splatCounts)
+  ;; The densification's, for its test (programs/densify_test)
+  (readback readFirstMoments adamM #:when (and inspect train))
+  (readback readSecondMoments adamV #:when (and inspect train))
+  (readback readActions actions #:when (and inspect train))
+  (readback readSlots slots #:when (and inspect train))
   (readback readProjected projected #:when inspect))

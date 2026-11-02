@@ -76,6 +76,7 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 - **grad_test**: every run of the native test, in the same way: `$GRAD_TEST_READBACKS` and
   `build/web-check/grad_test_check`, and a copy with the opacity gradients raised by 1% must fail.
   The finite differences themselves run in the app, the same on both.
+- **densify_test**: every run of the native test; its checks are in the app.
 
 ## Not supported on the web
 

@@ -180,6 +180,30 @@ differences:
   hashes. The runs without `--finite-differences` also check that the next `--repeats` frames
   give the same bits.
 
+## Densification check
+
+`programs/densify_test` checks one densification frame ([architecture.md](architecture.md#train-graph))
+on the GPU, every check in the app (so the web runs them too). On S3 with every 16th splat faded
+(opacity logit −7), from camera 0, it trains 20 Adam steps (L2 against `scenes.py`'s target),
+idles until the reads show an idle frame (from the frames in flight + 3 after the phase starts), reads
+the splats, moments, statistics and counts, runs the densification (thresholds from those
+statistics: the gradient's mean, the mean largest scale of the splats reaching it, and with
+`--screen-prune` 1.25 times the mean largest scale), idles again and compares:
+
+- each splat's action with `densifyAction` on the CPU (except within 1e-5 relative of a boundary),
+  and the slots with the exclusive scan of the actions' flags;
+- every kept or cloned splat and clone copy bit for bit at its slot, with its moments (a copy's
+  zero), and a split's halves against `splitPosition` (within 1e-3 of the largest scale) and
+  `splitLogScale` (1e-5), the rest bit for bit and their moments zero; a split whose second half
+  is past the capacity unchanged;
+- the counts (in use, overflow, densifications, pruned, added) and the cleared statistics.
+
+`test.sh` runs it three ways: `--max-splats 8192`; at the splat count with `--overflow` (some
+additions dropped, at least one of them a split's, which must stay undone); and with
+`--screen-prune --max-screen-size 5 --reset` (more opaque splats pruned than by their radius alone,
+so a size prune fires, and at least one by its radius alone; the reset leaves every opacity logit
+at most logit(0.01) with its moments zero). Each must see every action.
+
 ## Synthetic scenes
 
 `tools/make_synthetic.py` writes test scenes in the converter's format (`docs/data-format.md`),
