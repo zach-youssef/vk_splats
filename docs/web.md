@@ -21,6 +21,8 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | TileRanges | 3 | 1 | 0 | 0 | 256 |
 | Rasterize | 5 | 1 | 1 (`rgba8unorm`) | 10240 B (256 × (8 + 16 + 16): a batch's means, conics and opacities, colours) | 16 × 16 |
 | Loss | 4 | 1 | 0 | 0 | 256 |
+| SsimRows, SsimGradRows, SsimGradColumns | 6 | 1 | 0 | 0 | 256 |
+| SsimColumns | 8 (at the limit) | 1 | 0 | 0 | 256 |
 | TileLasts | 3 | 1 | 0 | 0 | 64 |
 | BackwardRasterize | 7 | 1 | 0 | 14912 B (128 × (8 + 16 + 16) for a batch, 9 × 256 × 4 and 9 × 16 × 4 for the reduction) | 16 × 16 |
 | InvertEntries | 6 | 1 | 0 | 0 | 256 |
@@ -33,6 +35,7 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | DensifyScatter, DensifyScatterMoments | 5 | 1 | 0 | 0 | 64 |
 | ResetOpacity | 4 | 0 | 0 | 0 | 64 |
 | Perturb, LossDelta (grad_test only) | 3, 8 (at the limit) | 1 | 0 | 0 | 1, 256 |
+| Prepare, Difference (ssim_test only) | 5, 3 | 1 | 0 | 0 | 256 |
 | ZgalSortCount | 4 | 1 | 0 | 64 B (16 atomic bins) | 256 |
 | ZgalSortOffsets | 1 | 1 | 0 | 260 B with subgroups, 1028 B without (256 lanes and a carry) | 256 |
 | ZgalSortScatter | 6 | 1 | 0 | 8320 B with subgroups (2048 subgroup counts), 1152 B without (256 digits, 16 next, 16 bins) | 256 |
@@ -77,6 +80,7 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   `build/web-check/grad_test_check`, and a copy with the opacity gradients raised by 1% must fail.
   The finite differences themselves run in the app, the same on both.
 - **densify_test**: every run of the native test; its checks are in the app.
+- **ssim_test**: every run of the native test; its checks are in the app.
 
 ## Not supported on the web
 

@@ -231,6 +231,32 @@ additions dropped, at least one of them a split's, which must stay undone); and 
 so a size prune fires, and at least one by its radius alone; the reset leaves every opacity logit
 at most logit(0.01) with its moments zero). Each must see every action.
 
+## SSIM check
+
+`programs/ssim_test` runs `lib/ssim.zgal`'s four kernels alone (λ = 1) on an image pair, every
+check in the app (so the web runs them too). `make_pair.py <case> <out dir> [--width W]
+[--height H]` writes a pair (32×32 by default; ssim_test requires at least 11×11, the window; the
+render as vec4 floats, the target RGBA8; numpy's `default_rng`, so the pair doesn't depend on the
+C++ library) and prints ssim_test's arguments, with `--expected-ssim` the pair's SSIM in
+float64 numpy (the same definition: zero padding, C1, C2). The app checks:
+
+- the SSIM (1 − the reduced loss) within `--tolerance` (1e-5) of `--expected-ssim`, which is
+  required (a `#:given` option);
+- with `--interior-ssim`, every pixel whose window lies inside the image has S within the
+  tolerance of it (the constant pair's closed-form luminance term);
+- with `--zero-gradients`, every |dL/dx| ≤ 1e-7 (an image against itself);
+- with `--finite-differences`, `--probes` (32) central differences at `--step` h (0.01) and 2h,
+  Richardson-extrapolated ((4·D(h) − D(2h)) / 3, so the h² error cancels), against the analytic
+  gradient within 1e-2 relative plus 1e-3 of the largest |dL/dx|. The probes are the four corners
+  (the padding's edge), then `pcgHash(seed + k)` pixels and channels;
+- every value finite.
+
+`test.sh` runs the three cases with validation: `identity --zero-gradients`, `constant` (at
+`--tolerance 2e-4`: a constant image's variance G∗x² − μ² cancels in float to about 1e-7·x²,
+which against C2 = 9e-4 moves S by up to about 1e-4, as in the reference's float32 SSIM) and
+`random --finite-differences` at 40×24 (non-square, so a kernel swapping the width and height
+fails).
+
 ## Synthetic scenes
 
 `tools/make_synthetic.py` writes test scenes in the converter's format (`docs/data-format.md`),

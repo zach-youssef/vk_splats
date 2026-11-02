@@ -20,6 +20,9 @@ The planned layout, filled in as the M1 and M2 tasks land.
     `web-check/grad_test_check.cpp` as render_test's are.
   - `densify_test`: one densification frame (clone, split, prune, compaction, the counts, the
     opacity reset) against the CPU, every check in the app ([below](#train-graph)).
+  - `ssim_test`: the SSIM kernels against a float64 numpy reference (an image against itself,
+    constant images, a random pair) and GPU finite differences, every check in the app
+    ([below](#train-graph)).
 - `lib/`: ZGAL modules the programs share, imported by relative path:
   `(import "../../lib/<module>.zgal")`. A module's name is a C++ namespace (ZGAL compiles its
   functions to C++ too), so it uses underscores, not hyphens.
@@ -30,7 +33,10 @@ The planned layout, filled in as the M1 and M2 tasks land.
     `splat_math.zgal`.
   - `train_graph.zgal`: `TrainGraph`, the render graph's forward pass followed by the loss and the
     backward rasterize, giving each splat's gradients with respect to its projection
-    ([below](#train-graph)); it imports `render_graph.zgal`.
+    ([below](#train-graph)); it imports `render_graph.zgal` and `ssim.zgal`.
+  - `ssim.zgal`: the D-SSIM term's forward and backward kernels (a separable 11×11 Gaussian
+    window), which add to the Loss kernel's per-pixel losses and gradients
+    ([below](#train-graph)).
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
   programs' inputs, the synthetic scene generator (which also renders a scene's ground truth with
   splat_render), and `scene_args.py`, which prints splat_render's arguments for a scene and a
@@ -441,6 +447,13 @@ are read too, and `history` and the trained splats when the app enables `readHis
   S3's camera 0. The S2 L1 run with `--max-groups 3` (so the grid-stride loops go round) runs
   twice, and the hashes are compared. Every run checks the gradients are finite; the others also
   check the next frames' gradients are the same bit for bit.
+- **SSIM tests** (`programs/ssim_test`): the four SSIM kernels alone (λ = 1) on pairs from its
+  `make_pair.py`, against the float64 numpy SSIM: an image against itself (32×32, within 1e-5;
+  SSIM 1 and every gradient 0), constant images (32×32, within 2e-4; every pixel whose window lies inside the image has the
+  closed-form luminance term (2ab + C1) / (a² + b² + C1)) and a random 40×24 pair (within 1e-5; non-square, so a
+  kernel swapping the width and height fails) whose gradients must
+  agree with GPU central differences, Richardson-extrapolated from h and 2h (32 probes, the
+  corners first, then `pcgHash`-seeded pixels and channels, so every platform probes the same).
 
 ## splat_train
 

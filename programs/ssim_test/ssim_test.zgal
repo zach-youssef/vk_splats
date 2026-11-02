@@ -1,0 +1,301 @@
+;; The D-SSIM term's test (lib/ssim.zgal's four kernels) on the GPU, with every check in the app (so
+;; the same on the web). Its graph runs the kernels alone (weight 1, so the loss is D-SSIM itself,
+;; 1 - SSIM) on a render (--render: vec4 floats a pixel, the .rgb read) against a target (--targets:
+;; RGBA8, as the training's images), both --width x --height, after a Prepare kernel that copies the
+;; render in, perturbs one channel of one pixel by the frame's delta and zeroes pixelGrads and
+;; pixelLosses (as the training graph's Loss kernel writes them before the kernels add to them). The
+;; first frames are unperturbed (probe 0); their readbacks give the per-pixel losses, the loss and
+;; dL/dx, which it checks:
+;;   - the SSIM, 1 - the loss, within --tolerance of --expected-ssim (test.sh's float64 reference,
+;;     tools-free numpy: the same window, zero-padded): an image against itself must give 1;
+;;   - with --interior-ssim, each pixel whose window lies inside the image (5 from every edge) has
+;;     the mean over the channels of S, 1 - N its loss (N the pixels), within --tolerance of it
+;;     (test.sh's constant images: there S is the closed-form luminance term
+;;     (2 a b + C1) / (a^2 + b^2 + C1), the variances and covariance being 0);
+;;   - with --zero-gradients, every |dL/dx| at most 1e-7 (an image against itself: SSIM's maximum,
+;;     where the terms making up dL/dx, about 4e-3 each on test.sh's image, cancel);
+;;   - with --finite-differences, central differences of the loss, Richardson-extrapolated:
+;;     --probes probes, each a pixel (the four corners first, where the window is clipped most, then
+;;     pcgHash-picked ones) and a channel (k mod 3), perturbed by +h, -h, +2h and -2h in four
+;;     frames. The graph sums each frame's per-pixel losses' change from the first frame's
+;;     (Difference, then a reduce: only the probe's window's pixels change, so the sum's float noise
+;;     is the changed pixels', not the image's), so D(h) = (L(+h) - L(-h)) / 2h and
+;;     fd = (4 D(h) - D(2h)) / 3, whose error is O(h^4). h is --step (the nominal step: float
+;;     rounding of x + h moves it by at most 6e-8, a 6e-6 relative error at test.sh's 0.01). With a
+;;     the analytic dL/dx, |a - fd| must be within 1e-2 max(|a|, |fd|) + 1e-3 of the largest |a|.
+;;     Every frame reads back which probe it ran, so a frame's change is matched with its probe
+;;     however late its readback arrives.
+;; It fails on a mismatch or when the frames run out first.
+
+(import "../../lib/ssim.zgal")
+(import random)  ; pcgHash: the probes' pixels
+
+;; `losses`, element by element
+(define lossTotal (uint 0))  ; the loss: the pixels' sum
+(define lossProbe (uint 1))  ; the probe this frame ran (a float)
+(define lossDelta (uint 2))  ; the sum of the pixels' losses less the first frame's
+
+;; Copies the render into colours, perturbing channel `channel` of pixel `pixel` by delta (0 for
+;; none), zeroes pixelGrads and pixelLosses, and writes the probe into losses
+(compute-material Prepare
+  (workgroup 256)
+  (bindings
+   (source (buffer-array vec4 read))
+   (colours (buffer-array vec4 write))
+   (pixelGrads (buffer-array vec4 write))
+   (pixelLosses (buffer-array float write))
+   (losses (buffer-array float write)))
+  (push (pixels uint) (probe uint) (pixel uint) (channel uint) (delta float))
+  (compute
+   (when (= globalInvocationId.x (uint 0))
+     (write! (at losses lossProbe) (float probe)))
+   (for ([i (range globalInvocationId.x pixels (* 256 workgroupCount.x))])
+     (let* ([d (if (= i pixel) delta 0.0)])
+       (write! (at colours i)
+               (+ (at source i) (vec4 (if (= channel (uint 0)) d 0.0) (if (= channel (uint 1)) d 0.0)
+                                      (if (= channel (uint 2)) d 0.0) 0.0)))
+       (write! (at pixelGrads i) (vec4 0.0))
+       (write! (at pixelLosses i) 0.0)))))
+
+;; Each pixel's loss less the first frame's
+(compute-material Difference
+  (workgroup 256)
+  (bindings
+   (pixelLosses (buffer-array float read))
+   (baseLosses (buffer-array float read))
+   (lossDeltas (buffer-array float write)))
+  (push (pixels uint))
+  (compute
+   (for ([i (range globalInvocationId.x pixels (* 256 workgroupCount.x))])
+     (write! (at lossDeltas i) (- (at pixelLosses i) (at baseLosses i))))))
+
+(graph SsimTestGraph
+  (parameter width uint)
+  (parameter height uint)
+  (input renderFile path)
+  (input targetFile path)
+  (input probe (per-frame uint))
+  (input pixel (per-frame uint))
+  (input channel (per-frame uint))
+  (input delta (per-frame float))
+
+  (constant pixels (* width height))
+  (buffer-file source vec4 renderFile)
+  (buffer-file targets uint targetFile)
+  (buffer colours vec4 pixels #:frames per-frame)
+  (buffer pixelGrads vec4 pixels #:frames per-frame)
+  (buffer pixelLosses float pixels #:frames per-frame)
+  (buffer baseLosses float pixels #:frames shared)
+  (buffer lossDeltas float pixels #:frames per-frame)
+  (buffer losses float 3 #:frames per-frame)  ; lossTotal, lossProbe, lossDelta
+  (buffer rowsR vec4 pixels #:frames shared)
+  (buffer rowsG vec4 pixels #:frames shared)
+  (buffer rowsB vec4 pixels #:frames shared)
+  (buffer rowsCross vec4 pixels #:frames shared)
+  (buffer partialsR vec4 pixels #:frames shared)
+  (buffer partialsG vec4 pixels #:frames shared)
+  (buffer partialsB vec4 pixels #:frames shared)
+
+  (material preparing Prepare source colours pixelGrads pixelLosses losses
+            #:push ((pixels pixels) (probe probe) (pixel pixel) (channel channel) (delta delta))
+            #:invocations (pixels))
+  (material rowing SsimRows colours targets rowsR rowsG rowsB rowsCross
+            #:push ((width width) (height height) (targetOffset 0) (targetPixels pixels) (weight 1.0))
+            #:invocations (pixels))
+  (material columning SsimColumns rowsR rowsG rowsB rowsCross partialsR partialsG partialsB pixelLosses
+            #:push ((width width) (height height) (weight 1.0))
+            #:invocations (pixels))
+  (material gradRowing SsimGradRows partialsR partialsG partialsB rowsR rowsG rowsB
+            #:push ((width width) (height height) (weight 1.0))
+            #:invocations (pixels))
+  (material gradColumning SsimGradColumns rowsR rowsG rowsB colours targets pixelGrads
+            #:push ((width width) (height height) (targetOffset 0) (targetPixels pixels) (weight 1.0))
+            #:invocations (pixels))
+  (material differencing Difference pixelLosses baseLosses lossDeltas
+            #:push ((pixels pixels)) #:invocations (pixels))
+
+  (dispatch prepare preparing)
+  (dispatch rows rowing)
+  (dispatch columns columning)
+  (dispatch gradRows gradRowing)
+  (dispatch gradColumns gradColumning)
+  (reduce totalLoss pixelLosses (at losses 0) #:op add #:count pixels)  ; lossTotal
+  ;; The first frame (unperturbed: the app's first probe is 0) keeps its pixels' losses
+  (copy keepBase pixelLosses baseLosses #:once #t)
+  (dispatch difference differencing)
+  (reduce totalDelta lossDeltas (at losses 2) #:op add #:count pixels)  ; lossDelta
+  (readback readLosses losses)
+  (readback readPixelLosses pixelLosses)
+  (readback readPixelGrads pixelGrads))
+
+;; Probe k's pixel: the four corners, then pcgHash's picks
+(define (probePixel [k : uint] [width : uint] [height : uint] [seed : uint]) : uint
+  (cond [(= k (uint 0)) (uint 0)]
+        [(= k (uint 1)) (- width (uint 1))]
+        [(= k (uint 2)) (* (- height (uint 1)) width)]
+        [(= k (uint 3)) (- (* width height) (uint 1))]
+        [else (remainder (pcgHash (+ seed k)) (* width height))]))
+
+;; A probe frame's delta: side 0 to 3 are +h, -h, +2h, -2h
+(define (sideDelta [side : uint] [h : float]) : float
+  (cond [(= side (uint 0)) h]
+        [(= side (uint 1)) (- h)]
+        [(= side (uint 2)) (* 2.0 h)]
+        [else (* -2.0 h)]))
+
+;; A vec4 with component i replaced by v
+(define (setComponent [x : vec4] [i : uint] [v : float]) : vec4
+  (vec4 (if (= i (uint 0)) v x.x) (if (= i (uint 1)) v x.y) (if (= i (uint 2)) v x.z) (if (= i (uint 3)) v x.w)))
+
+;; Whether x is finite (NaN fails too)
+(define (finite [x : float]) : bool (< (abs x) 1e30))
+
+;; A colour's channel c
+(define (channelOf [x : vec4] [c : uint]) : float
+  (cond [(= c (uint 0)) x.x] [(= c (uint 1)) x.y] [else x.z]))
+
+(define phaseBase (uint 0))
+(define phaseProbing (uint 1))
+(define phaseDone (uint 2))
+
+(app SsimTest
+  (parameter renderFile path)
+  (parameter targetFile path)
+  (parameter width uint)
+  (parameter height uint)
+  (parameter expectedSsim float)
+  (parameter expectedGiven bool)
+  (parameter tolerance float)
+  (parameter interiorSsim float)
+  (parameter interiorGiven bool)
+  (parameter zeroGradients bool)
+  (parameter finiteDifferences bool)
+  (parameter probes uint)
+  (parameter fdStep float)
+  (parameter seed uint)
+  ;; Exits the program with status 1
+  (extern (fail) : void)
+  (state
+   (phase uint phaseBase)
+   (baseRead bool #f)      ; whether baseLoss is in (an identical pair's can round below 0)
+   (baseLoss float 0.0)
+   (pixelLosses (data float) (empty-data float))
+   (pixelGrads (data vec4) (empty-data vec4))
+   (largest float 0.0)     ; the largest |dL/dx|
+   (index uint 0)          ; the probe
+   (side uint 0)           ; its frame: +h, -h, +2h, -2h
+   (changes vec4 (vec4 0.0))
+   (failures uint 0)
+   (worst float 0.0))      ; the largest relative difference of a probe that isn't negligible
+  (on (read readPixelLosses d) (if (= state.phase phaseBase) (with state #:pixelLosses d) state))
+  (on (read readPixelGrads d) (if (= state.phase phaseBase) (with state #:pixelGrads d) state))
+  (on (read readLosses d)
+    (let* ([probe (uint (at d lossProbe))])
+      (cond
+        [(= state.phase phaseBase) (if (= probe (uint 0)) (with state #:baseRead #t #:baseLoss (at d lossTotal)) state)]
+        [(or (not= state.phase phaseProbing) (not= probe (+ (* state.index (uint 4)) state.side (uint 1)))) state]
+        [(< state.side (uint 3))
+         (with state #:side (+ state.side 1) #:changes (setComponent state.changes state.side (at d lossDelta)))]
+        [else
+         (let* ([c (setComponent state.changes state.side (at d lossDelta))]
+                [pixel (probePixel state.index width height seed)]
+                [channel (remainder state.index (uint 3))]
+                [d1 (/ (- c.x c.y) (* 2.0 fdStep))]
+                [d2 (/ (- c.z c.w) (* 4.0 fdStep))]
+                [fd (/ (- (* 4.0 d1) d2) 3.0)]
+                [a (channelOf (at state.pixelGrads pixel) channel)]
+                [scale (max (abs a) (abs fd))]
+                [error (abs (- a fd))]
+                [ok (and (finite a) (finite fd) (<= error (+ (* 1e-2 scale) (* 1e-3 state.largest))))]
+                [counted (> scale (* 1e-2 state.largest))]
+                [next (+ state.index 1)])
+           (if ok
+               (print! "ssim_test: pixel " (remainder pixel width) ", " (/ pixel width) " channel " channel
+                       ": analytic " a ", finite difference " fd " (h " d1 ", 2h " d2 ")")
+               (print! "ssim_test: MISMATCH pixel " (remainder pixel width) ", " (/ pixel width) " channel " channel
+                       ": analytic " a ", finite difference " fd " (h " d1 ", 2h " d2 ")"))
+           (with state #:index next #:side 0 #:phase (if (>= next probes) phaseDone phaseProbing)
+                 #:failures (+ state.failures (if ok 0 1))
+                 #:worst (if (and ok counted) (max state.worst (/ error scale)) state.worst)))])))
+  (on (frame dt)
+    (cond
+      [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
+       (begin
+         (print! "ssim_test: FAILED, " frameLimit " frames weren't enough (phase " state.phase ", probe "
+                 state.index " of " probes ")")
+         (fail)
+         state)]
+      [(not expectedGiven)
+       (begin (print! "ssim_test: FAILED, --expected-ssim is required") (fail) state)]
+      ;; Once the first frames' readbacks are in, the checks on them
+      [(= state.phase phaseBase)
+       (if (and state.baseRead (= (count state.pixelLosses) (* width height))
+                (= (count state.pixelGrads) (* width height)))
+           (let* ([n (* width height)]
+                  [ssim (- 1.0 state.baseLoss)]
+                  [ssimOk (<= (abs (- ssim expectedSsim)) tolerance)]
+                  ;; The interior pixels' mean S over the channels, 1 - N loss, off --interior-ssim
+                  [interior (fold ([acc (vec2 0.0 0.0)]) ([y (range (uint 5) (- height (uint 5)))]
+                                                          [x (range (uint 5) (- width (uint 5)))])
+                              (let* ([s (- 1.0 (* (float n) (at state.pixelLosses (+ (* y width) x))))]
+                                     [e (abs (- s interiorSsim))])
+                                (vec2 (+ acc.x (if (<= e tolerance) 0.0 1.0)) (max acc.y e))))]
+                  [interiorOk (or (not interiorGiven) (= interior.x 0.0))]
+                  [largest (fold ([m 0.0]) ([i (range (uint 0) n)])
+                             (let* ([g (at state.pixelGrads i)])
+                               (max m (max (abs g.x) (max (abs g.y) (abs g.z))))))]
+                  [finiteAll (fold ([ok #t]) ([i (range (uint 0) n)])
+                               (let* ([g (at state.pixelGrads i)])
+                                 (and ok (finite g.x) (finite g.y) (finite g.z) (finite (at state.pixelLosses i)))))]
+                  [zeroOk (or (not zeroGradients) (<= largest 1e-7))]
+                  [ok (and ssimOk interiorOk zeroOk finiteAll)])
+             (print! "ssim_test: SSIM " ssim " (expected " expectedSsim "), the largest |dL/dx| " largest)
+             (when interiorGiven
+               (print! "ssim_test: interior pixels' S off " interiorSsim " by at most " interior.y ", "
+                       interior.x " past " tolerance))
+             (cond
+               [(not ok)
+                (begin
+                  (print! "ssim_test: FAILED (SSIM, interior S, zero gradients, all finite: " ssimOk ", " interiorOk
+                          ", " zeroOk ", " finiteAll ")")
+                  (fail)
+                  state)]
+               [(and finiteDifferences (> probes (uint 0)))
+                (with state #:phase phaseProbing #:largest largest)]
+               [else (begin (print! "ssim_test: passed") (quit!) state)]))
+           state)]
+      [(= state.phase phaseDone)
+       (begin
+         (print! "ssim_test: " probes " finite differences, " state.failures
+                 " mismatches, the largest relative difference " state.worst)
+         (if (= state.failures 0)
+             (begin (print! "ssim_test: passed") (quit!))
+             (begin (print! "ssim_test: FAILED, finite differences disagree") (fail)))
+         state)]
+      [else state]))
+  (run SsimTestGraph (renderFile renderFile) (targetFile targetFile) (width width) (height height)
+       (probe (if (= state.phase phaseProbing) (+ (* state.index (uint 4)) state.side (uint 1)) (uint 0)))
+       (pixel (if (= state.phase phaseProbing) (probePixel state.index width height seed) (uint 0)))
+       (channel (remainder state.index (uint 3)))
+       (delta (if (= state.phase phaseProbing) (sideDelta state.side fdStep) 0.0))
+       #:enabled ((readPixelLosses (= state.phase phaseBase))
+                  (readPixelGrads (= state.phase phaseBase)))))
+
+(main SsimTest
+  (about "Checks the D-SSIM kernels: the SSIM against a reference, and dL/dx against finite differences")
+  (timestep #:max 0.1 #:fixed 0.016)
+  (option renderFile "--render" "the render: vec4 floats a pixel, row by row" #:default "render.bin")
+  (option targetFile "--targets" "the target: RGBA8 pixels, row by row" #:default "targets.bin")
+  (option width "--width" "the images' width (at least the window's 11)" #:default 32 #:range (11 2896))
+  (option height "--height" "the images' height (at least the window's 11)" #:default 32 #:range (11 2896))
+  (option expectedSsim "--expected-ssim" "the SSIM the images must have (required)" #:default 0.0
+          #:given expectedGiven)
+  (option tolerance "--tolerance" "how far from --expected-ssim (and --interior-ssim) the SSIM may be"
+          #:default 1e-5)
+  (option interiorSsim "--interior-ssim" "check every pixel 5 from the edges has this S, the channels' mean"
+          #:default 0.0 #:given interiorGiven)
+  (flag zeroGradients "--zero-gradients" "require every dL/dx to be 0 (within 1e-7)")
+  (flag finiteDifferences "--finite-differences" "check dL/dx by central differences on the GPU")
+  (option probes "--probes" "the finite differences' probes (the corners first)" #:default 32 #:range (0 4096))
+  (option fdStep "--step" "the finite differences' step" #:default 0.01)
+  (option seed "--seed" "the probes' seed" #:default 1))

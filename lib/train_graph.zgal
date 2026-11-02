@@ -23,6 +23,7 @@
 
 (import "render_graph.zgal")
 (import "splat_backward.zgal")  ; ProjectedGradient, preprocessBackward
+(import "ssim.zgal")            ; unpackRgb
 (import random)                 ; pcgHash: the split's samples
 
 ;; ---------------------------------------------------------------------------------------------
@@ -75,12 +76,6 @@
 ;; ---------------------------------------------------------------------------------------------
 ;; Kernels
 ;; ---------------------------------------------------------------------------------------------
-;; An RGBA8 pixel's colour (the red in the low byte), in [0, 1]
-(define (unpackRgb [rgba : uint]) : vec3
-  (/ (vec3 (float (bitand rgba (uint 255))) (float (bitand (shr rgba (uint 8)) (uint 255)))
-           (float (bitand (shr rgba (uint 16)) (uint 255))))
-     255.0))
-
 ;; 6. Each pixel's loss and dL/dI, against its target (RGBA8, the red in the low byte, at
 ;; targetOffset + the pixel's index: docs/data-format.md's images): with lossL2, (I - t)^2 summed
 ;; over the channels and 2 (I - t); with lossL1, |I - t| / (3 pixels) and sign(I - t) / (3 pixels),

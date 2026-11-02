@@ -1,0 +1,211 @@
+;; D-SSIM (Kerbl et al. 2023, Sec. 7: the loss (1 - lambda) L1 + lambda D-SSIM, lambda 0.2), as the
+;; reference computes SSIM (its utils/loss_utils.py, after Wang et al. 2004): per channel, the
+;; 11x11 Gaussian window (sigma 1.5, normalized) blurs x, y, x^2, y^2 and xy, zero-padded at the
+;; image's edges (conv2d's padding 5), giving at each pixel the means mx, my, the variances
+;; sx = G*x^2 - mx^2, sy and the covariance sxy = G*xy - mx my, and
+;;     S = (2 mx my + C1) (2 sxy + C2) / ((mx^2 + my^2 + C1) (sx + sy + C2)),
+;; C1 = 0.01^2, C2 = 0.03^2; SSIM is S's mean over the pixels and channels, and D-SSIM 1 - SSIM.
+;; x is the render (the rasterizer's C + T bg, unclamped, as the reference's), y the target.
+;;
+;; The window is separable (its weights are g_i g_j), so the blurs are a row pass then a column
+;; pass, 22 taps a pixel instead of 121. Four kernels, over the image's pixels (a grid-stride loop,
+;; 256 an invocation group, as the Loss kernel's):
+;;   1. SsimRows: each pixel's row blurs (11 taps along x) of the five quantities of each channel,
+;;      into rowsR, rowsG, rowsB ((x, y, x^2, y^2) of that channel) and rowsCross ((xy).rgb);
+;;   2. SsimColumns: their column blurs, S of each channel, the pixel's share of the loss
+;;      lambda sum_c (1 - S_c) / (3N), added to pixelLosses, and the loss's partial derivatives
+;;      with respect to the pixel's mx, G*x^2 and G*xy (ssimPartials', times -lambda / (3N)), into
+;;      partialsR, partialsG, partialsB;
+;;   3. SsimGradRows: the partials' row blurs, into rowsR, rowsG, rowsB again (dead by then);
+;;   4. SsimGradColumns: their column blurs and dL/dx, added to pixelGrads' .rgb.
+;; The gradient: L depends on x_q through every pixel p whose window covers q, as
+;; mx(p) = sum_q G(p - q) x_q and the like, so
+;;     dL/dx_q = sum_p G(p - q) (dL/dmx(p) + 2 x_q dL/d(G*x^2)(p) + y_q dL/d(G*xy)(p)),
+;; the partials blurred by the same window (it's symmetric) and zero-padded the same way, since
+;; only pixels p inside the image have a loss.
+;; The kernels add to pixelLosses and pixelGrads, so the Loss kernel (or a clear) writes them
+;; first. Their `weight` push constant is lambda, and they do nothing when it's 0, so a graph
+;; scoring some frames another way (splat_train's held-out views) keeps them and passes 0. The scratch
+;; (rows*, partials*: 7 vec4s, 112 bytes, a pixel) can be shared between frames in flight when
+;; the frames are serial anyway (training's: each steps the splats the next renders).
+;; docs/architecture.md has the training graph's use; programs/ssim_test tests them.
+
+;; An RGBA8 pixel's colour (the red in the low byte), in [0, 1] (docs/data-format.md's images;
+;; the training graph's Loss kernel reads its targets with it too)
+(define (unpackRgb [rgba : uint]) : vec3
+  (/ (vec3 (float (bitand rgba (uint 255))) (float (bitand (shr rgba (uint 8)) (uint 255)))
+           (float (bitand (shr rgba (uint 16)) (uint 255))))
+     255.0))
+
+;; The window's radius, and its 1D weights g_0 (the centre) to g_5: exp(-d^2 / (2 1.5^2)),
+;; normalized over d = -5..5 (in double, then rounded)
+(define ssimRadius 5)
+(define (ssimTap [d : int]) : float
+  (let* ([a (abs d)])
+    (cond [(= a 0) 0.266011725]
+          [(= a 1) 0.213005538]
+          [(= a 2) 0.10936069]
+          [(= a 3) 0.0360007721]
+          [(= a 4) 0.00759875814]
+          [else 0.00102838008])))
+
+(define ssimC1 0.0001)  ; 0.01^2
+(define ssimC2 0.0009)  ; 0.03^2
+
+;; One channel's S at a pixel, and its partial derivatives with respect to the pixel's mx, G*x^2
+;; and G*xy (bx, cxy: the means of the squares and product, so sx = bx - mx^2 and so on, each
+;; varied with the others held), from the blurs m = (mx, my, G*x^2, G*y^2) and cxy = G*xy:
+;; with l1 = 2 mx my + C1, l2 = mx^2 + my^2 + C1, c1 = 2 sxy + C2, c2 = sx + sy + C2 and
+;; S = l1 c1 / (l2 c2),
+;;     dS/dmx = 2 my (c1 - l1) / (l2 c2) - 2 mx S / l2 + 2 mx S / c2,
+;;     dS/dbx = -S / c2,  dS/dcxy = 2 l1 / (l2 c2);
+;; (S, dS/dmx, dS/dbx, dS/dcxy) in a vec4
+(define (ssimPartials [m : vec4] [cxy : float]) : vec4
+  (let* ([mx m.x]
+         [my m.y]
+         [sx (- m.z (* mx mx))]
+         [sy (- m.w (* my my))]
+         [sxy (- cxy (* mx my))]
+         [l1 (+ (* 2.0 mx my) ssimC1)]
+         [l2 (+ (* mx mx) (* my my) ssimC1)]
+         [c1 (+ (* 2.0 sxy) ssimC2)]
+         [c2 (+ sx sy ssimC2)]
+         [d (* l2 c2)]
+         [s (/ (* l1 c1) d)])
+    (vec4 s
+          (+ (/ (* 2.0 my (- c1 l1)) d) (/ (* -2.0 mx s) l2) (/ (* 2.0 mx s) c2))
+          (/ (- s) c2)
+          (/ (* 2.0 l1) d))))
+
+;; 1. The row blurs. The target is RGBA8 at targetOffset + the pixel's index (as the Loss
+;; kernel's: black past targetPixels).
+(compute-material SsimRows
+  (workgroup 256)
+  (bindings
+   (colours (buffer-array vec4 read))
+   (targets (buffer-array uint read))
+   (rowsR (buffer-array vec4 write))
+   (rowsG (buffer-array vec4 write))
+   (rowsB (buffer-array vec4 write))
+   (rowsCross (buffer-array vec4 write)))
+  (push (width uint) (height uint) (targetOffset uint) (targetPixels uint) (weight float))
+  (compute
+   (when (> weight 0.0)
+     (for ([i (range globalInvocationId.x (* width height) (* 256 workgroupCount.x))])
+       (let* ([x (int (remainder i width))]
+              [row (- i (remainder i width))]
+              [(sx sy sxx syy sxy)
+               (fold ([sx (vec3 0.0)] [sy (vec3 0.0)] [sxx (vec3 0.0)] [syy (vec3 0.0)] [sxy (vec3 0.0)])
+                     ([d (range (- ssimRadius) (+ ssimRadius 1))])
+                 (let* ([u (+ x d)])
+                   (if (and (>= u 0) (< u (int width)))
+                       (let* ([w (ssimTap d)]
+                              [v (.rgb (at colours (+ row (uint u))))]
+                              [t (if (< (+ targetOffset row (uint u)) targetPixels) (unpackRgb (at targets (+ targetOffset row (uint u)))) (vec3 0.0))])
+                         (values (+ sx (* w v)) (+ sy (* w t)) (+ sxx (* w v v)) (+ syy (* w t t))
+                                 (+ sxy (* w v t))))
+                       (values sx sy sxx syy sxy))))])
+         (write! (at rowsR i) (vec4 sx.r sy.r sxx.r syy.r))
+         (write! (at rowsG i) (vec4 sx.g sy.g sxx.g syy.g))
+         (write! (at rowsB i) (vec4 sx.b sy.b sxx.b syy.b))
+         (write! (at rowsCross i) (vec4 sxy 0.0)))))))
+
+;; 2. The column blurs, S and the partials (scaled by -weight / (3N), N the pixels, so they're the
+;; loss's), and the pixel's loss weight sum_c (1 - S_c) / (3N), added to pixelLosses
+(compute-material SsimColumns
+  (workgroup 256)
+  (bindings
+   (rowsR (buffer-array vec4 read))
+   (rowsG (buffer-array vec4 read))
+   (rowsB (buffer-array vec4 read))
+   (rowsCross (buffer-array vec4 read))
+   (partialsR (buffer-array vec4 write))   ; (dL/dmx, dL/d(G*x^2), dL/d(G*xy), 0) of red
+   (partialsG (buffer-array vec4 write))
+   (partialsB (buffer-array vec4 write))
+   (pixelLosses (buffer-array float read-write)))
+  (push (width uint) (height uint) (weight float))
+  (compute
+   (when (> weight 0.0)
+     (let* ([scale (/ weight (* 3.0 (float (* width height))))])
+       (for ([i (range globalInvocationId.x (* width height) (* 256 workgroupCount.x))])
+         (let* ([y (int (/ i width))]
+                [x (remainder i width)]
+                [(mr mg mb mc)
+                 (fold ([mr (vec4 0.0)] [mg (vec4 0.0)] [mb (vec4 0.0)] [mc (vec4 0.0)])
+                       ([d (range (- ssimRadius) (+ ssimRadius 1))])
+                   (let* ([v (+ y d)])
+                     (if (and (>= v 0) (< v (int height)))
+                         (let* ([w (ssimTap d)]
+                                [j (+ (* (uint v) width) x)])
+                           (values (+ mr (* w (at rowsR j))) (+ mg (* w (at rowsG j))) (+ mb (* w (at rowsB j)))
+                                   (+ mc (* w (at rowsCross j)))))
+                         (values mr mg mb mc))))]
+                [pr (ssimPartials mr mc.r)]
+                [pg (ssimPartials mg mc.g)]
+                [pb (ssimPartials mb mc.b)])
+           (write! (at partialsR i) (vec4 (* (- scale) (.yzw pr)) 0.0))
+           (write! (at partialsG i) (vec4 (* (- scale) (.yzw pg)) 0.0))
+           (write! (at partialsB i) (vec4 (* (- scale) (.yzw pb)) 0.0))
+           (write! (at pixelLosses i)
+                   (+ (at pixelLosses i) (* scale (- 3.0 (+ pr.x pg.x pb.x)))))))))))
+
+;; 3. The partials' row blurs
+(compute-material SsimGradRows
+  (workgroup 256)
+  (bindings
+   (partialsR (buffer-array vec4 read))
+   (partialsG (buffer-array vec4 read))
+   (partialsB (buffer-array vec4 read))
+   (rowsR (buffer-array vec4 write))
+   (rowsG (buffer-array vec4 write))
+   (rowsB (buffer-array vec4 write)))
+  (push (width uint) (height uint) (weight float))
+  (compute
+   (when (> weight 0.0)
+     (for ([i (range globalInvocationId.x (* width height) (* 256 workgroupCount.x))])
+       (let* ([x (int (remainder i width))]
+              [row (- i (remainder i width))]
+              [(r g b)
+               (fold ([r (vec4 0.0)] [g (vec4 0.0)] [b (vec4 0.0)])
+                     ([d (range (- ssimRadius) (+ ssimRadius 1))])
+                 (let* ([u (+ x d)])
+                   (if (and (>= u 0) (< u (int width)))
+                       (let* ([w (ssimTap d)]
+                              [j (+ row (uint u))])
+                         (values (+ r (* w (at partialsR j))) (+ g (* w (at partialsG j)))
+                                 (+ b (* w (at partialsB j)))))
+                       (values r g b))))])
+         (write! (at rowsR i) r)
+         (write! (at rowsG i) g)
+         (write! (at rowsB i) b))))))
+
+;; 4. Their column blurs, and dL/dx = G*dL/dmx + 2 x G*dL/d(G*x^2) + y G*dL/d(G*xy), added to
+;; pixelGrads' .rgb
+(compute-material SsimGradColumns
+  (workgroup 256)
+  (bindings
+   (rowsR (buffer-array vec4 read))
+   (rowsG (buffer-array vec4 read))
+   (rowsB (buffer-array vec4 read))
+   (colours (buffer-array vec4 read))
+   (targets (buffer-array uint read))
+   (pixelGrads (buffer-array vec4 read-write)))
+  (push (width uint) (height uint) (targetOffset uint) (targetPixels uint) (weight float))
+  (compute
+   (when (> weight 0.0)
+     (for ([i (range globalInvocationId.x (* width height) (* 256 workgroupCount.x))])
+       (let* ([y (int (/ i width))]
+              [x (remainder i width)]
+              [(r g b)
+               (fold ([r (vec4 0.0)] [g (vec4 0.0)] [b (vec4 0.0)])
+                     ([d (range (- ssimRadius) (+ ssimRadius 1))])
+                 (let* ([v (+ y d)])
+                   (if (and (>= v 0) (< v (int height)))
+                       (let* ([w (ssimTap d)]
+                              [j (+ (* (uint v) width) x)])
+                         (values (+ r (* w (at rowsR j))) (+ g (* w (at rowsG j))) (+ b (* w (at rowsB j)))))
+                       (values r g b))))]
+              [c (.rgb (at colours i))]
+              [t (if (< (+ targetOffset i) targetPixels) (unpackRgb (at targets (+ targetOffset i))) (vec3 0.0))]
+              [grad (+ (vec3 r.x g.x b.x) (* 2.0 c (vec3 r.y g.y b.y)) (* t (vec3 r.z g.z b.z)))])
+         (write! (at pixelGrads i) (+ (at pixelGrads i) (vec4 grad 0.0))))))))
