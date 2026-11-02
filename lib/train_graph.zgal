@@ -13,7 +13,7 @@
 ;;   9. the backward preprocess: each splat's gradients with respect to its parameters
 ;;      (BackwardPreprocess, lib/splat_backward.zgal's math), into parameterGradients, and the
 ;;      densification's statistics (densifyStats: the 2D mean's gradient norm and the frames that
-;;      saw the splat, accumulated until the app runs resetDensify again).
+;;      saw the splat, accumulated until a densification clears them).
 ;; No global float atomics anywhere (D4(b)): every entry's gradients are reduced in the tile's
 ;; workgroup and written once, and every splat's summed by one invocation, so the gradients are
 ;; the same, bit for bit, on every run. With finiteDifferences, the graph also perturbs one splat's
@@ -23,6 +23,7 @@
 
 (import "render_graph.zgal")
 (import "splat_backward.zgal")  ; ProjectedGradient, preprocessBackward
+(import random)                 ; pcgHash: the split's samples
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Constants
@@ -325,18 +326,19 @@
                        (values mean conic opacity colour))))])
          (write! (at splatGradients s) (ProjectedGradient mean conic opacity colour)))))))
 
-;; A splat's densification statistics (8 bytes; Sec. 5.2): accumulated over the frames since
-;; TrainGraph's resetDensify last ran, for the densification to read and reset
+;; A splat's densification statistics (12 bytes; Sec. 5.2): accumulated over the frames since the
+;; first or the last densification (which clears them in its frame), for the densification
 (struct DensifyStat
   (gradientNorm float)  ; the sum of densifyNorm(dL/dmean) over the frames that saw the splat
-  (visible uint))       ; those frames' number
+  (visible uint)        ; those frames' number
+  (maxRadius uint))     ; the largest radius (Projected's, in pixels) it had in them
 
 ;; 9. Each splat's gradients with respect to its parameters (parameterGradients, a Splat of
 ;; gradients: dL/dposition, dL/d(the opacity logit), dL/dlogScale, dL/d(the quaternion as stored)
 ;; and dL/dsh; the padding isn't written) from its gradients with respect to its projection
 ;; (splatGradients): lib/splat_backward.zgal's preprocessBackward, one invocation a splat. A culled
 ;; splat (tileCount 0) gets gradients of 0 and its statistics stay as they were; a visible one adds
-;; its densifyNorm to densifyStats and counts the frame.
+;; its densifyNorm to densifyStats, counts the frame and keeps its largest radius.
 (compute-material BackwardPreprocess
   (workgroup 64)
   (bindings
@@ -369,7 +371,8 @@
          (when visible
            (let* ([d (at densifyStats i)])
              (write! (at densifyStats i)
-                     (DensifyStat (+ d.gradientNorm (densifyNorm g.mean cam.size)) (+ d.visible (uint 1)))))))))))
+                     (DensifyStat (+ d.gradientNorm (densifyNorm g.mean cam.size)) (+ d.visible (uint 1))
+                                  (max d.maxRadius (.radius (at projected i))))))))))))
 
 ;; The unit vector along axis i (0-2; none past them)
 (define (unit3 [i : uint]) : vec3
@@ -578,6 +581,231 @@
              (if (<= (at counts countTotal) (at counts countCapacity)) (at losses lossTotal) -1.0)))))
 
 ;; ---------------------------------------------------------------------------------------------
+;; 12. Densification and pruning (Sec. 5.2; the reference's densify_and_prune and reset_opacity)
+;; ---------------------------------------------------------------------------------------------
+;; The splats in use are the first splatCounts[splatActive] of the splat buffer; densification
+;; rewrites them in place, in one GPU frame, and the count with them:
+;;   DensifyPrepare: the slots' scan count (2 n + 2, for n splats) and the two separators;
+;;   DensifyMark: each splat's action (densifyAction) and its slot flags: slots[i] is 1 when it
+;;     keeps a place (all but a pruned one), slots[n + 1 + i] when it adds one (a clone, or a
+;;     split's second half), slots[n] and slots[2 n + 1] are 0;
+;;   an exclusive scan of the 2 n + 2 flags: slots[i] becomes a kept splat's new index, slots[n]
+;;     the kept splats' number K, slots[n + 1 + i] an added splat's index (K and the additions
+;;     before it: the additions come after the survivors, in their parents' order), and
+;;     slots[2 n + 1] the total;
+;;   DensifyScatter: the splats from a copy (the previous ones) into their slots, and
+;;     DensifyScatterMoments Adam's moments likewise (kept as they were for a kept or cloned splat,
+;;     zero for a clone and both halves of a split, as the reference's new parameters start);
+;;   DensifyFinish: the count, min(total, capacity), the per-splat dispatch, and the counters.
+;; An addition past the capacity (maxSplats) is dropped and counted (splatOverflow): a clone is
+;; then not made, and a split not done (the splat stays as it was, with its moments). The app then
+;; clears densifyStats in the same frame, so no frame's statistics are lost or counted twice.
+
+;; The actions
+(define densifyPrune (uint 0))  ; removed
+(define densifyKeep (uint 1))   ; kept as it is
+(define densifyClone (uint 2))  ; kept, and a copy added (Sec. 5.2's under-reconstruction)
+(define densifySplit (uint 3))  ; replaced by two halves (over-reconstruction)
+
+;; The reference's constants: a split half's scale is the splat's / 1.6; the prune's opacity; the
+;; reset's opacity logit, logit(0.01) = ln(0.01 / 0.99), the most the reset leaves
+(define splitScaleDivisor 1.6)
+(define pruneOpacity 0.005)
+(define resetOpacityLogit -4.59512)
+
+;; A splat's mean 2D-mean gradient over the frames that saw it (0 when none did: the reference's
+;; NaN is set to 0)
+(define (densifyGradient [d : DensifyStat]) : float
+  (if (> d.visible (uint 0)) (/ d.gradientNorm (float d.visible)) 0.0))
+
+;; Its largest scale (activated)
+(define (maxScale [s : Splat]) : float
+  (let* ([e (exp s.logScale)])
+    (max e.x (max e.y e.z))))
+
+;; A splat's action. threshold is the gradient's (densify_grad_threshold), cloneScale the largest
+;; scale a clone has (percent_dense x extent; larger ones split), pruneScale the largest any splat
+;; keeps once screenPrune holds (0.1 x extent), and maxScreenSize the largest radius in pixels it
+;; keeps then (the reference's max_screen_size, 20; 0 for none). As the reference: a splat whose
+;; opacity is below pruneOpacity is pruned (its halves or clone would be too: they have its
+;; opacity), a split's halves are checked against pruneScale (they're 1.6 times smaller), and a
+;; clone like its splat. The reference clears max_radii2D before its prune reads it, so its
+;; screen-space prune never fires: maxScreenSize 0 is what it does, 20 what it means to
+;; (paper-conformance.md). A split's halves aren't checked by radius (theirs isn't known yet).
+(define (densifyAction [s : Splat] [d : DensifyStat] [threshold : float] [cloneScale : float]
+                       [pruneScale : float] [screenPrune : bool] [maxScreenSize : uint]) : uint
+  (let* ([scale (maxScale s)]
+         [densify (>= (densifyGradient d) threshold)]
+         [split (and densify (> scale cloneScale))]
+         [opaque (>= (sigmoid s.opacity) pruneOpacity)]
+         [small (if split
+                    (<= (/ scale splitScaleDivisor) pruneScale)
+                    (and (<= scale pruneScale)
+                         (or (= maxScreenSize (uint 0)) (<= d.maxRadius maxScreenSize))))])
+    (cond
+      [(not (and opaque (or (not screenPrune) small))) densifyPrune]
+      [split densifySplit]
+      [densify densifyClone]
+      [else densifyKeep])))
+
+;; A uniform float in (0, 1] and in [0, 1) from a random uint's top 24 bits, exact in a float
+(define (openUnit [r : uint]) : float
+  (/ (+ (float (shr r 8)) 1.0) 16777216.0))
+(define (halfOpenUnit [r : uint]) : float
+  (/ (float (shr r 8)) 16777216.0))
+
+;; Three standard normal samples from a key (Box-Muller on its hashes)
+(define (standardNormals [key : uint]) : vec3
+  (let* ([h0 (pcgHash key)]
+         [h1 (pcgHash h0)]
+         [h2 (pcgHash h1)]
+         [h3 (pcgHash h2)]
+         [r0 (sqrt (* -2.0 (log (openUnit h0))))]
+         [a0 (* 6.2831853 (halfOpenUnit h1))]
+         [r1 (sqrt (* -2.0 (log (openUnit h2))))]
+         [a1 (* 6.2831853 (halfOpenUnit h3))])
+    (vec3 (* r0 (cos a0)) (* r0 (sin a0)) (* r1 (cos a1)))))
+
+;; The key of splat i's split half `part` (0 or 1) in a densification seeded with seed
+(define (splitKey [seed : uint] [i : uint] [part : uint]) : uint
+  (pcgHash (bitxor seed (pcgHash (+ (* i (uint 2)) part)))))
+
+;; A split half's position: a sample of the splat's Gaussian, R (scale x N(0, 1)) + position, as
+;; the reference's
+(define (splitPosition [s : Splat] [key : uint]) : vec3
+  (+ s.position (* (quatToMatrix s.rotation) (* (exp s.logScale) (standardNormals key)))))
+
+;; A split half's log-scale: the scale / 1.6
+(define (splitLogScale [logScale : vec3]) : vec3
+  (log (/ (exp logScale) splitScaleDivisor)))
+
+;; The prepare: the scan's count and the flags' separators (one invocation)
+(compute-material DensifyPrepare
+  (workgroup 1)
+  (bindings
+   (splatCounts (buffer-array uint read-write))
+   (slots (buffer-array uint write)))
+  (compute
+   (let* ([n (at splatCounts splatActive)])
+     (write! (at splatCounts splatSlots) (+ (* n (uint 2)) (uint 2)))
+     (write! (at slots n) (uint 0))
+     (write! (at slots (+ (* n (uint 2)) (uint 1))) (uint 0)))))
+
+;; The mark: each splat's action and flags (screenPrune: 0 or 1)
+(compute-material DensifyMark
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat read))
+   (densifyStats (buffer-array DensifyStat read))
+   (splatCounts (buffer-array uint read))
+   (actions (buffer-array uint write))
+   (slots (buffer-array uint write)))
+  (push (threshold float) (cloneScale float) (pruneScale float) (screenPrune uint) (maxScreenSize uint))
+  (compute
+   (let* ([n (at splatCounts splatActive)])
+     (for ([i (range globalInvocationId.x n (* splatGroupSize workgroupCount.x))])
+       (let* ([a (densifyAction (at splats i) (at densifyStats i) threshold cloneScale pruneScale
+                                (not= screenPrune (uint 0)) maxScreenSize)])
+         (write! (at actions i) a)
+         (write! (at slots i) (if (= a densifyPrune) (uint 0) (uint 1)))
+         (write! (at slots (+ n (uint 1) i)) (if (> a densifyKeep) (uint 1) (uint 0))))))))
+
+;; The scatter: each splat's (from previous, the splats before) into its slots. capacity is the
+;; splat buffer's (maxSplats), seed the split's
+(compute-material DensifyScatter
+  (workgroup 64)
+  (bindings
+   (previous (buffer-array Splat read))
+   (actions (buffer-array uint read))
+   (slots (buffer-array uint read))
+   (splatCounts (buffer-array uint read))
+   (splats (buffer-array Splat write)))
+  (push (capacity uint) (seed uint))
+  (compute
+   (let* ([n (at splatCounts splatActive)])
+     (for ([i (range globalInvocationId.x n (* splatGroupSize workgroupCount.x))])
+       (let* ([a (at actions i)]
+              [k (at slots i)]
+              [e (at slots (+ n (uint 1) i))]
+              [fits (< e capacity)]
+              [s (at previous i)])
+         (when (not= a densifyPrune)
+           (write! (at splats k) s)
+           (when (and (= a densifySplit) fits)
+             (write! (.position (at splats k)) (splitPosition s (splitKey seed i (uint 0))))
+             (write! (.logScale (at splats k)) (splitLogScale s.logScale)))
+           (when (and (> a densifyKeep) fits)
+             (write! (at splats e) s)
+             (when (= a densifySplit)
+               (write! (.position (at splats e)) (splitPosition s (splitKey seed i (uint 1))))
+               (write! (.logScale (at splats e)) (splitLogScale s.logScale))))))))))
+
+;; The moments' scatter (one of Adam's moments, from previous), as DensifyScatter's
+(compute-material DensifyScatterMoments
+  (workgroup 64)
+  (bindings
+   (previous (buffer-array Splat read))
+   (actions (buffer-array uint read))
+   (slots (buffer-array uint read))
+   (splatCounts (buffer-array uint read))
+   (moments (buffer-array Splat write)))
+  (push (capacity uint))
+  (compute
+   (let* ([n (at splatCounts splatActive)])
+     (for ([i (range globalInvocationId.x n (* splatGroupSize workgroupCount.x))])
+       (let* ([a (at actions i)]
+              [k (at slots i)]
+              [e (at slots (+ n (uint 1) i))]
+              [fits (< e capacity)])
+         (when (not= a densifyPrune)
+           (write! (at moments k) (at previous i))
+           (when (and (> a densifyKeep) fits)
+             ;; The new splat's moments are 0, and a split's other half's too
+             (for ([part (range (if (= a densifySplit) (uint 0) (uint 1)) (uint 2))])
+               (let* ([j (if (= part (uint 0)) k e)])
+                 (write! (.position (at moments j)) (vec3 0.0))
+                 (write! (.opacity (at moments j)) 0.0)
+                 (write! (.logScale (at moments j)) (vec3 0.0))
+                 (write! (.rotation (at moments j)) (vec4 0.0))
+                 (for ([c (range (uint 0) (uint 48))])
+                   (write! (at (.sh (at moments j)) c) 0.0)))))))))))
+
+;; The finish (one invocation): the count, the counters and the per-splat dispatch
+(compute-material DensifyFinish
+  (workgroup 1)
+  (bindings
+   (slots (buffer-array uint read))
+   (splatCounts (buffer-array uint read-write))
+   (splatCommands (buffer-array DispatchCommand write)))
+  (push (capacity uint) (maxGroups uint))
+  (compute
+   (let* ([n (at splatCounts splatActive)]
+          [kept (at slots n)]
+          [total (at slots (+ (* n (uint 2)) (uint 1)))]
+          [inUse (min total capacity)])
+     (write! (at splatCounts splatActive) inUse)
+     (write! (at splatCounts splatOverflow) (+ (at splatCounts splatOverflow) (- total inUse)))
+     (write! (at splatCounts splatDensifies) (+ (at splatCounts splatDensifies) (uint 1)))
+     (write! (at splatCounts splatPruned) (- n kept))
+     (write! (at splatCounts splatAdded) (- inUse kept))
+     (write! (at splatCommands 0) (DispatchCommand (groupsFor inUse splatGroupSize maxGroups) 1 1)))))
+
+;; The opacity reset (the reference's reset_opacity): every splat's opacity at most 0.01, and its
+;; Adam moments zeroed
+(compute-material ResetOpacity
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat read-write))
+   (adamM (buffer-array Splat write))
+   (adamV (buffer-array Splat write))
+   (splatCounts (buffer-array uint read)))
+  (compute
+   (for ([i (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
+     (write! (.opacity (at splats i)) (min (.opacity (at splats i)) resetOpacityLogit))
+     (write! (.opacity (at adamM i)) 0.0)
+     (write! (.opacity (at adamV i)) 0.0))))
+
+;; ---------------------------------------------------------------------------------------------
 ;; The graph
 ;; ---------------------------------------------------------------------------------------------
 ;; SplatGraph's forward pass (ZGAL has no graph composition, so its nodes are repeated here,
@@ -642,6 +870,17 @@
   (input opacityLr (per-frame float))
   (input scalingLr (per-frame float))
   (input rotationLr (per-frame float))
+  ;; The densification's (with train; the app enables its nodes, densify*, in a densification's
+  ;; frame, and resetOpacity in a reset's): densifyAction's gradient threshold, the largest scale
+  ;; a clone has and the largest a splat keeps, whether the size prunes apply (0 or 1), the
+  ;; largest radius in pixels a splat keeps then (0: no screen-space prune), and the split's seed
+  ;; (a new one each densification)
+  (parameter densifyThreshold float)
+  (parameter cloneScale float)
+  (parameter pruneScale float)
+  (input screenPrune (per-frame uint))
+  (input maxScreenSize (per-frame uint))
+  (input densifySeed (per-frame uint))
 
   ;; The buffers' sizes; this frame's are (/ (+ width 15) 16) and so on, written out where used
   (constant maxTileCount (* (/ (+ maxWidth 15) 16) (/ (+ maxHeight 15) 16)))
@@ -674,9 +913,8 @@
   (buffer entryPositions uint (min capacity 3145728) #:frames per-frame)
   (buffer splatGradients ProjectedGradient maxSplats #:frames per-frame)
   (buffer parameterGradients Splat maxSplats #:frames per-frame)
-  ;; Accumulated across frames, so shared: cleared in the graph's first frame and whenever the app
-  ;; runs resetDensify again (run-once!; untested so far, and the frames in flight between the
-  ;; app's readback and the reset are lost: architecture.md's train graph, step 9)
+  ;; Accumulated across frames, so shared: cleared in the graph's first frame (resetDensify) and by
+  ;; each densification, in its frame (densifyClear)
   (buffer densifyStats DensifyStat maxSplats #:frames shared)
   ;; Finite differences': the +h side's, shared, so the -h frames see the last +h frame's
   (buffer plusLosses float maxPixels #:frames shared #:when finiteDifferences)
@@ -687,6 +925,11 @@
   (buffer adamM Splat maxSplats #:frames shared #:when train)
   (buffer adamV Splat maxSplats #:frames shared #:when train)
   (buffer history float (max historySize 1) #:frames shared #:when train)
+  ;; The densification's, within its frame: each splat's action, and its slots (2 maxSplats + 2).
+  ;; Its copy of the splats and of each moment before it is parameterGradients (dead after Adam,
+  ;; which doesn't run in a densification's frame), so it needs no 240 B a splat more
+  (buffer actions uint maxSplats #:frames shared #:when train)
+  (buffer slots uint (+ (* maxSplats 2) 2) #:frames shared #:when train)
 
   (material initializing InitSplatCounts splatCounts splatCommands
             #:push ((splatCount splatCount) (maxGroups maxGroups)) #:invocations (1))
@@ -696,6 +939,20 @@
             #:push ((splatCount splatCount) (splat perturbSplat) (field perturbField) (delta perturbDelta)
                     (cameraIndex cameraIndex) (near near) (shDegree shDegree))
             #:invocations (1) #:when finiteDifferences)
+  (material preparing DensifyPrepare splatCounts slots #:invocations (1) #:when train)
+  (material marking DensifyMark splats densifyStats splatCounts actions slots
+            #:push ((threshold densifyThreshold) (cloneScale cloneScale) (pruneScale pruneScale)
+                    (screenPrune screenPrune) (maxScreenSize maxScreenSize))
+            #:when train)
+  (material scattering DensifyScatter (previous parameterGradients) actions slots splatCounts splats
+            #:push ((capacity maxSplats) (seed densifySeed)) #:when train)
+  (material scatteringFirst DensifyScatterMoments (previous parameterGradients) actions slots splatCounts (moments adamM)
+            #:push ((capacity maxSplats)) #:when train)
+  (material scatteringSecond DensifyScatterMoments (previous parameterGradients) actions slots splatCounts (moments adamV)
+            #:push ((capacity maxSplats)) #:when train)
+  (material finishing DensifyFinish slots splatCounts splatCommands
+            #:push ((capacity maxSplats) (maxGroups maxGroups)) #:invocations (1) #:when train)
+  (material resetting ResetOpacity splats adamM adamV splatCounts #:when train)
   (material planning PlanEntries counts commands
             #:push ((capacity (min capacity 3145728)) (tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16))) (near near) (far far)
                     (maxGroups maxGroups))
@@ -768,6 +1025,20 @@
   (clear resetHistory history #:once #t #:when train)
   (dispatch adam stepping #:indirect (at splatCommands 0) #:when train)
   (dispatch record recording #:when train)
+  ;; The densification and the opacity reset (12): off until the app enables them in a frame,
+  ;; after the backward pass (whose statistics they include) and instead of Adam
+  (dispatch densifyPrepare preparing #:enabled #f #:when train)
+  (dispatch densifyMark marking #:indirect (at splatCommands 0) #:enabled #f #:when train)
+  (exclusive-scan densifyScan slots slots #:op add #:count (at splatCounts 2) #:enabled #f #:when train)  ; splatSlots
+  (copy densifyCopySplats splats parameterGradients #:enabled #f #:when train)
+  (dispatch densifyScatter scattering #:indirect (at splatCommands 0) #:enabled #f #:when train)
+  (copy densifyCopyFirstMoments adamM parameterGradients #:enabled #f #:when train)
+  (dispatch densifyScatterFirst scatteringFirst #:indirect (at splatCommands 0) #:enabled #f #:when train)
+  (copy densifyCopySecondMoments adamV parameterGradients #:enabled #f #:when train)
+  (dispatch densifyScatterSecond scatteringSecond #:indirect (at splatCommands 0) #:enabled #f #:when train)
+  (dispatch densifyFinish finishing #:enabled #f #:when train)
+  (clear densifyClear densifyStats #:enabled #f #:when train)
+  (dispatch resetOpacity resetting #:indirect (at splatCommands 0) #:enabled #f #:when train)
 
   (readback readCounts counts)
   (readback readLosses losses)
@@ -779,4 +1050,5 @@
   (readback readCameras cameras #:once #t #:when (or inspect train))
   (readback readHistory history #:when train)
   (readback readTrained splats #:when train)
+  (readback readSplatCounts splatCounts)
   (readback readProjected projected #:when inspect))

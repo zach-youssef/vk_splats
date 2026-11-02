@@ -323,13 +323,11 @@ input).
    the SH colour (degrees 0 to 3, its clamp at 0, and its view direction's dependence on the
    position). `densifyStats` (a `DensifyStat` a splat, `#:frames shared`) accumulates over frames:
    each visible splat adds `densifyNorm` of its 2D-mean gradient (its norm in NDC units,
-   |(W/2·∂L/∂x, H/2·∂L/∂y)|, the reference's) and 1 to its frame count. Nothing else writes it:
-   the `#:once` clear `resetDensify` zeroes it in the first frame, and the densification reruns
-   it (`run-once!`) after reading it. Two gaps, for the densification to close: the rerun is
-   untested (grad_test only checks that every visible splat has the same count), and reading back
-   then resetting in a later frame drops the frames in flight between the read and the reset
-   from both intervals (1–2 frames of a 100-iteration interval; consuming and resetting in the
-   same frame on the GPU would drop none). `tests/cpp/splat_backward_test.cpp` checks
+   |(W/2·∂L/∂x, H/2·∂L/∂y)|, the reference's) and 1 to its frame count, and keeps its largest
+   `Projected` radius (`maxRadius`, the reference's `max_radii2D`). The `#:once` clear
+   `resetDensify` zeroes it in the first frame, and each densification (step 12) clears it in its
+   own frame, after reading it on the GPU, so no frame's statistics are lost or counted twice
+   (`resetDensify` is never rerun). `tests/cpp/splat_backward_test.cpp` checks
    `preprocessBackward` on the CPU (the oracle and central differences of `projectSplat`).
 10. `Adam` (64-wide, grid stride over the splats; only with the `train` parameter) steps every
     splat's parameters with `parameterGradients` (`adamStep`, four floats at a time: β₁ = 0.9,
@@ -344,9 +342,51 @@ input).
     for a frame Adam skipped; `historySize` floats, `#:frames shared`, zeroed once), so the app
     reads every iteration's loss once at the end: a readback event sees only the newest frame's
     copy, and a trainer runs frames back to back.
+12. **Densification and pruning** (with `train`; Sec. 5.2, the reference's `densify_and_prune`):
+    nodes off (`#:enabled #f`) until the app enables them all in a densification's frame, after
+    the backward pass and instead of Adam (the reference's step skips the parameters a
+    densification replaced). The splats in use are the first `splatCounts[splatActive]` of
+    `splats` ([render graph](#render-graph)'s splat count), rewritten in place:
+    - `DensifyPrepare` (one invocation) writes the scan's count, 2n + 2 for n splats, into
+      `splatCounts[splatSlots]`, and zeroes `slots[n]` and `slots[2n + 1]`.
+    - `DensifyMark` (indirect, per splat) takes each splat's action (`densifyAction`) into
+      `actions` and its flags into `slots`: `slots[i]` = 1 unless pruned, `slots[n + 1 + i]` = 1
+      for a clone or a split. The actions: **prune** when its opacity is below 0.005, or, with
+      `screenPrune` (the app's: after the first opacity reset), its largest scale past
+      `pruneScale` (0.1 × extent) or its largest radius past `maxScreenSize` px (the reference's
+      20, which its code never applies; 0 for none: [departure
+      13](paper-conformance.md#departures)); otherwise, when its mean
+      gradient (`densifyGradient`: the norm sum over its frames, 0 for none) is at least
+      `densifyThreshold`, **clone** when its largest scale is at most `cloneScale`
+      (`percent_dense` × extent), else **split**; else **keep**. A split's halves are checked
+      against `pruneScale` at their own scale (1.6 times smaller) and not by radius (theirs isn't
+      known); a pruned splat neither clones nor splits (its clone or halves would be pruned too).
+    - An in-place `exclusive-scan` of the 2n + 2 flags (`#:count` from `splatCounts`) gives each
+      kept splat its new index (`slots[i]`, in order), the kept number K (`slots[n]`), each
+      addition its index K + the additions before it (`slots[n + 1 + i]`: after the survivors, in
+      their parents' order) and the total (`slots[2n + 1]`).
+    - `copy` the splats into `parameterGradients` (dead after the backward pass, so the
+      densification's scratch costs no memory), then `DensifyScatter` (indirect) writes each kept
+      splat at its index, a clone's copy at its addition's, and a split's halves at both: each a
+      sample of the splat's Gaussian, R(scale ⊙ n) + position with n three standard normals
+      (`standardNormals`: Box-Muller on `pcgHash`es of `splitKey`, from the app's `densifySeed`,
+      the splat's index and the half), and the log-scale of the scale / 1.6. Then the same for
+      `adamM` and `adamV` (`DensifyScatterMoments`, each through `parameterGradients`): a kept or
+      cloned splat keeps its moments, a clone's copy and both halves start at 0.
+    - An addition at or past the capacity (`maxSplats`) is dropped: a clone isn't made and a split
+      isn't done (the splat is kept as it was, with its moments). `DensifyFinish` (one invocation)
+      sets the count to min(total, capacity), adds the dropped ones to `splatOverflow`, counts the
+      densification (`splatDensifies`) and writes its pruned and added numbers (`splatPruned`,
+      `splatAdded`) and the per-splat `DispatchCommand` for the new count.
+    - `densifyClear` zeroes `densifyStats`.
+    `ResetOpacity` (`resetOpacity`, enabled separately in a reset's frame, after any
+    densification) sets every splat's opacity logit to at most logit(0.01) (`resetOpacityLogit`)
+    and zeroes its Adam moments, as the reference's `reset_opacity` does. `splatCounts` is read
+    back every frame (`readSplatCounts`). `tests/cpp/densify_test.cpp` checks the actions and the
+    split's samples on the CPU, and `programs/densify_test` the kernels on the GPU.
 
 `losses` holds (the loss, the probe, the loss's change) and is read back every frame, with
-`counts`. With `inspect` (tests), so are `splatGradients`, `parameterGradients`, `densifyStats`,
+`counts` and `splatCounts`. With `inspect` (tests), so are `splatGradients`, `parameterGradients`, `densifyStats`,
 the projections and `backwardRanges`, and the splats and cameras once. With `train`, the cameras
 are read too, and `history` and the trained splats when the app enables `readHistory` and
 `readTrained`.

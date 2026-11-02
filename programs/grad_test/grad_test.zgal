@@ -387,6 +387,7 @@
   (run TrainGraph (splatFile splatFile) (cameraFile cameraFile) (targetFile targetFile)
        (splatCount splatCount) (maxSplats splatCount) (cameraIndex cameraIndex) (width width) (height height)
        (maxWidth width) (maxHeight height) (train #f) (historySize 0) (historySlot 0) (bias1 1.0) (bias2 1.0)
+       (densifyThreshold 0.0) (cloneScale 0.0) (pruneScale 0.0) (screenPrune 0) (maxScreenSize 0) (densifySeed 0)
        (positionLr 0.0) (dcLr 0.0) (restLr 0.0) (opacityLr 0.0) (scalingLr 0.0) (rotationLr 0.0)
        (shDegree shDegree) (near near) (far far) (maxGroups maxGroups) (inspect #t)
        (loss (if l1 lossL1 lossL2)) (finiteDifferences finiteDifferences)

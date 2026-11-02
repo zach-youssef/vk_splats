@@ -96,7 +96,8 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
 - A black background (`white_background` off) and no random background.
 - Evaluation: PSNR on the render clamped to [0, 1], averaged over the test views.
 - `percent_dense` 0.01 (the clone/split size threshold, relative to the scene extent).
-- Pruning below opacity 0.005, and above 20 px on screen after the first opacity reset.
+- Pruning below opacity 0.005, and above 20 px on screen after the first opacity reset (as the
+  code is written: it never fires, [departure 13](#departures)).
 
 ## Departures
 
@@ -146,7 +147,24 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     and the capacity grows for the next). The reference allocates per frame and never truncates.
     Adam's step count t still advances on a skipped frame, so its bias corrections run one step
     ahead of the reference's per skip, which is negligible past the first iterations.
-13. **No densification yet** (T14): the splat count stays at the start's.
+13. **Screen-space prune, a choice** (`maxScreenSize`): after the first opacity reset, a splat
+    whose largest radius since the last densification passed `maxScreenSize` pixels is pruned, as
+    the reference code means to with its `max_screen_size` of 20; 0 prunes none. The reference's
+    never fires: `densification_postfix` zeroes `max_radii2D` before `prune` reads it, so its
+    published results are 0's (large background and near-camera splats survive), while 20 is what
+    it was written to do. Neither is hidden as a default: the app chooses. A split's halves aren't
+    checked by radius (their radii aren't known; the reference's world-space check at the halves'
+    scale applies to them, as it does to every splat after the first reset, with either choice).
+14. **Densification order**: the splats are compacted in place by a scan (survivors in order, a
+    split's first half in its parent's place), then the additions (clones' copies and splits'
+    second halves) in their parents' order. The reference appends the clones, then the halves
+    after it removes the split parents, and prunes last; the set of splats is the same.
+15. **Capacity overflow**: an addition past `--max-splats` is dropped and counted: the clone isn't
+    made, the split isn't done (the splat is kept, with its Adam moments). The reference has no
+    cap.
+16. **Split sampling**: the halves' offsets are standard normals from a PCG hash of the
+    densification's seed, the splat's index and the half (Box-Muller), not torch's generator, so
+    runs are deterministic on every backend but don't match the reference's samples.
 
 ## How correctness is checked
 

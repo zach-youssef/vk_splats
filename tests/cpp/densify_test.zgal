@@ -1,0 +1,20 @@
+;; The densification's functions for their C++ test (densify_test.cpp includes the generated
+;; densify_test.zgal.h, whose namespace is this file's name). The probe material calls them, so the
+;; build also compiles them to GLSL (glslc checks them); the test never runs it.
+(import "../../lib/train_graph.zgal")
+
+(compute-material DensifyProbe
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat))
+   (stats (buffer-array DensifyStat))
+   (actions (buffer-array uint))
+   (positions (buffer-array vec4)))
+  (push (count uint))
+  (compute
+   (let* ([i globalInvocationId.x])
+     (when (< i count)
+       (let* ([s (at splats i)])
+         (write! (at actions i) (densifyAction s (at stats i) 0.0002 0.01 0.1 #t (uint 20)))
+         (write! (at positions i) (vec4 (splitPosition s (splitKey (uint 7) i (uint 1)))
+                                        (.x (splitLogScale s.logScale)))))))))

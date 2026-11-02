@@ -62,7 +62,7 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   distributions: `std::mt19937`'s words are standard, but `uniform_real_distribution`,
   `normal_distribution` and `uniform_int_distribution` aren't, and libstdc++ (CI's Linux) and
   libc++ (macOS) draw different numbers from the same seed, so a test would check other cases on
-  each and could pass on one only. `make test-cpp CXX=g++-16 OUT=<dir>` (Homebrew's GCC, with
+  each and could pass on one only. `make test-cpp CXX=g++-16 OUT=build/gcc` (Homebrew's GCC, with
   libstdc++) runs the C++ tests against Linux CI's standard library (CI compiles with clang++).
   Keep the draws in a defined order: several in one value through brace initialization
   (`glm::vec3{u(rng), u(rng), u(rng)}`, evaluated left to right), never as the arguments of one
@@ -132,7 +132,8 @@ differences:
   projection gradients within 1e-3 relative (to the larger of the value and 1e-2 of the largest of
   its group: position, opacity, log-scale, quaternion, SH), and the densification's statistics
   must be consistent: every visible splat seen the same n frames, culled ones none, and each norm
-  n times `densifyNorm` of its 2D-mean gradient within 1e-4. `tests/cpp/splat_backward_test.cpp` checks
+  n times `densifyNorm` of its 2D-mean gradient within 1e-4, and its largest radius
+  (`maxRadius`) the frames' `Projected` radius (0 for a culled one). `tests/cpp/splat_backward_test.cpp` checks
   `preprocessBackward` itself on the CPU, against the oracle and central differences of
   `projectSplat` (general rotations and cameras, SH degrees 1 to 3, the clamps).
 - **GPU finite differences**, the plan's rule: the smooth L2 loss against a fixed target unlike

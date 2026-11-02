@@ -8,8 +8,9 @@
 //     1e-2 of the largest of its group (position, opacity, log-scale, rotation, SH): the kernel's
 //     plumbing (every field written where it belongs, culled splats' 0);
 //   - the densification's statistics: every visible splat seen by the same number n >= 1 of
-//     frames (they're all the same frame), every culled one by none, and its norm sum n times
-//     densifyNorm of its 2D mean's gradient, within 1e-4;
+//     frames (they're all the same frame), every culled one by none (and its largest radius 0),
+//     its norm sum n times densifyNorm of its 2D mean's gradient, within 1e-4, and its largest
+//     radius its projection's;
 //   - with --oracle (S1's "gradient" variant: one splat blended into every pixel, a constant
 //     target), against the closed-form oracle (tests/oracle/closed_form.h's projected_gradients,
 //     L2 or L1) at the oracle's projection, with the target rounded to 8 bits as the targets file
@@ -180,7 +181,9 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
         for (uint32_t i = 0; i < splats.size(); ++i) {
             const DensifyStat& d = densify[i];
             if (projected[i].tileCount == 0) {
-                if (d.visible != 0 || d.gradientNorm != 0.0f) fail("culled splat " + std::to_string(i) + " has densification statistics");
+                if (d.visible != 0 || d.gradientNorm != 0.0f || d.maxRadius != 0) {
+                    fail("culled splat " + std::to_string(i) + " has densification statistics");
+                }
                 continue;
             }
             if (seen == 0) seen = d.visible;
@@ -188,6 +191,11 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
                 fail("splat " + std::to_string(i) + " was seen by " + std::to_string(d.visible) + " frames, not " +
                      std::to_string(seen));
                 continue;
+            }
+            // Every frame renders the same camera, so the largest radius is this frame's
+            if (d.maxRadius != projected[i].radius) {
+                fail("splat " + std::to_string(i) + "'s largest radius " + std::to_string(d.maxRadius) + ", not " +
+                     std::to_string(projected[i].radius));
             }
             const double expected = double(d.visible) * densifyNorm(gradients[i].mean, cam.size);
             const double error = std::abs(d.gradientNorm - expected) / std::max(expected, 1e-30);

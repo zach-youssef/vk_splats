@@ -28,6 +28,10 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | BackwardPreprocess | 7 | 1 | 0 | 0 | 64 |
 | Adam | 6 | 1 | 0 | 0 | 64 |
 | Record | 3 | 1 | 0 | 0 | 1 |
+| DensifyPrepare, DensifyFinish | 2, 3 | 0, 1 | 0 | 0 | 1 |
+| DensifyMark | 5 | 1 | 0 | 0 | 64 |
+| DensifyScatter, DensifyScatterMoments | 5 | 1 | 0 | 0 | 64 |
+| ResetOpacity | 4 | 0 | 0 | 0 | 64 |
 | Perturb, LossDelta (grad_test only) | 3, 8 (at the limit) | 1 | 0 | 0 | 1, 256 |
 | ZgalSortCount | 4 | 1 | 0 | 64 B (16 atomic bins) | 256 |
 | ZgalSortOffsets | 1 | 1 | 0 | 260 B with subgroups, 1028 B without (256 lanes and a carry) | 256 |
