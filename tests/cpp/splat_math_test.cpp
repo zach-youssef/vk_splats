@@ -13,13 +13,13 @@
 
 #include "oracle/closed_form.h"
 #include "splat_math_test.zgal.h"
+#include "test_random.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <random>
 #include <utility>
 #include <vector>
 
@@ -282,8 +282,8 @@ TEST_CASE("radiusPx and conicOf on the oracle's matrices, including the 0.1 floo
 // Beyond the oracles: general rotations and the frustum guard
 // ---------------------------------------------------------------------------------------------
 TEST_CASE("quatToMatrix matches Rodrigues' formula for any axis, and normalizes") {
-    std::mt19937 rng(7);
-    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    TestRandom rng(7);
+    auto u = [](TestRandom& r) { return r.uniform(-1.0, 1.0); };
     for (int i = 0; i < 50; ++i) {
         const std::array<double, 3> axis = {u(rng), u(rng), u(rng) + 0.01};
         const double angle = 3.0 * u(rng);
@@ -296,12 +296,17 @@ TEST_CASE("quatToMatrix matches Rodrigues' formula for any axis, and normalizes"
 
 TEST_CASE("covariance2d matches J W Sigma W^T J^T with J from central differences, any rotation") {
     // Independent of the module's Jacobian: J is the pinhole projection's derivative, numerically.
-    std::mt19937 rng(11);
-    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    TestRandom rng(11);
+    auto u = [](TestRandom& r) { return r.uniform(-1.0, 1.0); };
     const double fx = 120.0, fy = 90.0, cx = 40.0, cy = 30.0, width = 96.0, height = 64.0;
     for (int i = 0; i < 50; ++i) {
-        const Mat3d R = rodrigues({u(rng), u(rng), u(rng) + 0.01}, 3.0 * u(rng));
-        const Mat3d W = rodrigues({u(rng), u(rng), u(rng) + 0.01}, 3.0 * u(rng));
+        // One axis or angle a statement: a call's arguments are evaluated in an unspecified order
+        const std::array<double, 3> axisR = {u(rng), u(rng), u(rng) + 0.01};
+        const double angleR = 3.0 * u(rng);
+        const std::array<double, 3> axisW = {u(rng), u(rng), u(rng) + 0.01};
+        const double angleW = 3.0 * u(rng);
+        const Mat3d R = rodrigues(axisR, angleR);
+        const Mat3d W = rodrigues(axisW, angleW);
         const std::array<double, 3> s = {std::exp(-2.0 + u(rng)), std::exp(-2.0 + u(rng)), std::exp(-2.0 + u(rng))};
         // A camera-space mean inside the image's view
         const double z = 3.0 + 2.0 * u(rng);
@@ -463,8 +468,8 @@ TEST_CASE("projectSplat with fx != fy, an off-centre principal point and a non-s
     // the tiles by brute force over the 6x4 grid.
     const double fx = 120.0, fy = 90.0, cx = 40.0, cy = 30.0;
     const glm::uvec2 size(96, 64);
-    std::mt19937 rng(13);
-    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    TestRandom rng(13);
+    auto u = [](TestRandom& r) { return r.uniform(-1.0, 1.0); };
     const Mat3d W = rodrigues({0.3, -0.8, 0.5}, 0.9);
     const double tc[3] = {0.2, -0.1, 0.4};
     sm::Camera cam{};
@@ -607,8 +612,8 @@ int band(int k) { return k == 0 ? 0 : k < 4 ? 1 : k < 9 ? 2 : 3; }
 }  // namespace
 
 TEST_CASE("shColour evaluates each coefficient's basis function in the reference's order and signs") {
-    std::mt19937 rng(3);
-    std::normal_distribution<double> n(0.0, 1.0);
+    TestRandom rng(3);
+    auto n = [](TestRandom& r) { return r.normal(); };
     for (int i = 0; i < 40; ++i) {
         double x = n(rng), y = n(rng), z = n(rng);
         const double len = std::sqrt(x * x + y * y + z * z);
@@ -704,10 +709,10 @@ TEST_CASE("tileRect holds exactly the tiles meeting [mean - r, mean + r), clampe
     const glm::uvec2 size(70, 50);
     const glm::uvec2 grid = sm::tileGrid(size);
     REQUIRE(grid == glm::uvec2(5, 4));
-    std::mt19937 rng(5);
+    TestRandom rng(5);
     // Means on a 1/64 grid, so mean +- r is exact in float, plus edges exactly on tile boundaries
-    std::uniform_int_distribution<int> coord(-40 * 64, 120 * 64);
-    std::uniform_int_distribution<int> rad(0, 40);
+    auto coord = [](TestRandom& r) { return r.integer(-40 * 64, 120 * 64); };
+    auto rad = [](TestRandom& r) { return r.integer(0, 40); };
     std::vector<std::pair<glm::vec2, uint32_t>> samples = {
         {{16.0f, 16.0f}, 0u}, {{20.0f, 20.0f}, 4u}, {{36.0f, 12.0f}, 4u}, {{-3.0f, 25.0f}, 3u}, {{80.0f, 60.0f}, 10u}};
     for (int i = 0; i < 2000; ++i)

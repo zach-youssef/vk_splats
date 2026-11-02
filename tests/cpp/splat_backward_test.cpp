@@ -18,12 +18,12 @@
 
 #include "oracle/closed_form.h"
 #include "splat_backward_test.zgal.h"
+#include "test_random.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -148,8 +148,9 @@ double linear_loss(const sb::Projected& p, const sb::ProjectedGradient& w) {
 }
 
 // The splat's float at offset f of the 60 (data-format.md's layout: position 0-2, opacity 3,
-// logScale 4-6, rotation 8-11, sh 12-59; 7 is padding)
-float& field(sb::Splat& s, int f) {
+// logScale 4-6, rotation 8-11, sh 12-59; 7 is padding), writable through a non-const splat
+template <class S>  // sb::Splat or const sb::Splat
+auto& field(S& s, int f) {
     if (f < 3) return s.position[f];
     if (f == 3) return s.opacity;
     if (f < 7) return s.logScale[f - 4];
@@ -167,9 +168,9 @@ double analytic(const sb::SplatGradient& g, int f, uint32_t degree) {
 }
 
 // A random rotation matrix's quaternion: (w, x, y, z) of a random unit quaternion, scaled
-glm::vec4 random_quat(std::mt19937& rng, float length) {
-    std::normal_distribution<float> n(0.0f, 1.0f);
-    return length * glm::normalize(glm::vec4(n(rng), n(rng), n(rng), n(rng)));
+glm::vec4 random_quat(TestRandom& rng, float length) {
+    auto n = [&] { return float(rng.normal()); };
+    return length * glm::normalize(glm::vec4(n(), n(), n(), n()));
 }
 
 glm::mat3 quat_matrix(glm::vec4 q) {
@@ -181,11 +182,11 @@ glm::mat3 quat_matrix(glm::vec4 q) {
 }
 
 // A camera with a random rotation and translation, fx != fy, an off-centre principal point
-sb::Camera random_camera(std::mt19937& rng) {
-    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+sb::Camera random_camera(TestRandom& rng) {
+    auto u = [&](TestRandom& r) { return float(r.uniform(-1.0, 1.0)); };
     sb::Camera cam{};
     const glm::mat3 r = quat_matrix(random_quat(rng, 1.0f));
-    const glm::vec3 t(u(rng), u(rng), u(rng));
+    const glm::vec3 t{u(rng), u(rng), u(rng)};
     cam.worldToCamera = glm::mat4(r);
     cam.worldToCamera[3] = glm::vec4(t, 1.0f);
     cam.intrinsics = glm::vec4(110.0f, 90.0f, 52.0f, 38.0f);
@@ -222,18 +223,19 @@ void check_against_differences(const sb::Splat& s, const sb::Camera& cam, uint32
     for (const Group& group : groups) {
         std::vector<double> actual, expected;
         for (int f = group.first; f < group.last; ++f) {
-            const float v = field(const_cast<sb::Splat&>(s), f);
+            const float v = field(s, f);
             // Relative steps; positions by a share of the depth, so the mean moves about 0.1 px, and
             // the quaternion's components by a share of its length (the rotation depends only on
             // q / |q|, and a step relative to a small component left the float forward pass's
-            // rounding at the check's floor, 1e-4 of the group's largest gradient)
+            // rounding at the check's floor: check_group's 1e-2 tolerance of 1e-2 of the group's
+            // largest gradient, an error of 1e-4 of it)
             const float t_z = (glm::mat3(cam.worldToCamera) * s.position + glm::vec3(cam.worldToCamera[3])).z;
             const float h = f < 3                ? 1e-3f * t_z
                             : f >= 12            ? 1e-2f
                             : f >= 8             ? 1e-2f * glm::length(s.rotation)
                                                  : std::max(3e-3f * std::abs(v), 3e-3f);
-            // The central difference over [v - k h, v + k h], divided by the step float rounding
-            // gives
+            // The central difference over [v - k h, v + k h], divided by the step actually taken
+            // (the stored floats' difference, which float rounding makes differ from 2 k h)
             auto central = [&](float k, sb::Projected& pp) {
                 sb::Splat plus = s, minus = s;
                 field(plus, f) = v + k * h;
@@ -265,22 +267,22 @@ void check_against_differences(const sb::Splat& s, const sb::Camera& cam, uint32
 // Random weights for a splat's projection p, each term of the loss about as large as the others:
 // the conic's entries, ~1 / covariance, weighted by the covariance's scale, and the mean's by
 // 1 / the radius, so a shift by the radius matters as much as the opacity
-sb::ProjectedGradient random_weights(std::mt19937& rng, const sb::Projected& p) {
-    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+sb::ProjectedGradient random_weights(TestRandom& rng, const sb::Projected& p) {
+    auto u = [&](TestRandom& r) { return float(r.uniform(-1.0, 1.0)); };
     sb::ProjectedGradient w{};
-    w.mean = glm::vec2(u(rng), u(rng)) / float(std::max(p.radius, 1u));
-    w.conic = glm::vec3(u(rng), u(rng), u(rng)) / std::max(std::abs(p.conic.x), std::abs(p.conic.z));
+    w.mean = glm::vec2{u(rng), u(rng)} / float(std::max(p.radius, 1u));
+    w.conic = glm::vec3{u(rng), u(rng), u(rng)} / std::max(std::abs(p.conic.x), std::abs(p.conic.z));
     w.opacity = u(rng);
-    w.colour = glm::vec3(u(rng), u(rng), u(rng));
+    w.colour = glm::vec3{u(rng), u(rng), u(rng)};
     return w;
 }
 
-sb::Splat random_splat(std::mt19937& rng, const sb::Camera& cam, float px, float py) {
-    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+sb::Splat random_splat(TestRandom& rng, const sb::Camera& cam, float px, float py) {
+    auto u = [&](TestRandom& r) { return float(r.uniform(-1.0, 1.0)); };
     sb::Splat s{};
     s.position = world_at(cam, px, py, 3.0f + u(rng));
     s.opacity = u(rng);
-    s.logScale = glm::vec3(-2.0f + 0.5f * u(rng), -2.0f + 0.5f * u(rng), -2.0f + 0.5f * u(rng));
+    s.logScale = glm::vec3{-2.0f + 0.5f * u(rng), -2.0f + 0.5f * u(rng), -2.0f + 0.5f * u(rng)};
     s.rotation = random_quat(rng, 0.5f + std::abs(u(rng)));
     for (float& c : s.sh) c = 0.5f * u(rng);
     return s;
@@ -289,16 +291,20 @@ sb::Splat random_splat(std::mt19937& rng, const sb::Camera& cam, float px, float
 }  // namespace
 
 TEST_CASE("preprocessBackward is projectSplat's chain rule: any rotation, camera and SH degree") {
-    std::mt19937 rng(17);
-    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    TestRandom rng(17);
+    auto u = [&](TestRandom& r) { return float(r.uniform(0.0, 1.0)); };
     FdStats stats;
     for (int i = 0; i < 24; ++i) {
         const sb::Camera cam = random_camera(rng);
         const uint32_t degree = static_cast<uint32_t>(i % 4);
         // Away from the colour's clamp, which a step could cross (the next case tests it)
         sb::Splat s;
-        do s = random_splat(rng, cam, 10.0f + 76.0f * u(rng), 10.0f + 52.0f * u(rng));
-        while (glm::any(glm::lessThan(sb::projectSplat(s, cam, kNear, degree).colour, glm::vec3(0.1f))));
+        do {
+            // One draw a statement: a call's arguments are evaluated in an unspecified order
+            const float x = 10.0f + 76.0f * u(rng);
+            const float y = 10.0f + 52.0f * u(rng);
+            s = random_splat(rng, cam, x, y);
+        } while (glm::any(glm::lessThan(sb::projectSplat(s, cam, kNear, degree).colour, glm::vec3(0.1f))));
         INFO("case " << i << ", SH degree " << degree);
         check_against_differences(s, cam, degree, random_weights(rng, sb::projectSplat(s, cam, kNear, degree)), stats);
     }
@@ -306,7 +312,7 @@ TEST_CASE("preprocessBackward is projectSplat's chain rule: any rotation, camera
 }
 
 TEST_CASE("preprocessBackward: the colour's clamp at 0 passes no gradient") {
-    std::mt19937 rng(5);
+    TestRandom rng(5);
     const sb::Camera cam = random_camera(rng);
     sb::Splat s = random_splat(rng, cam, 40.0f, 30.0f);
     s.sh[0] = -5.0f;  // red's DC: far below the clamp whatever the other bands add
@@ -324,7 +330,7 @@ TEST_CASE("preprocessBackward: the colour's clamp at 0 passes no gradient") {
 TEST_CASE("preprocessBackward: where the frustum guard clamps x/z, x passes nothing through J") {
     // A large splat whose mean is 1.3 image widths right of the image: x/z is clamped in J, and
     // its square still reaches the image
-    std::mt19937 rng(9);
+    TestRandom rng(9);
     const sb::Camera cam = random_camera(rng);
     for (float px : {96.0f * 1.3f, -96.0f * 0.35f}) {
         INFO("mean at x = " << px << " px");

@@ -58,6 +58,16 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   the generated `<name>.zgal.h` (namespace `<name>`), and the file's shaders are compiled too, so a
   compute material there that calls the functions has glslc check them
   (`tests/cpp/splat_math_test.zgal`).
+  Seeded random test data comes from `tests/cpp/test_random.h` (`TestRandom`), not the `<random>`
+  distributions: `std::mt19937`'s words are standard, but `uniform_real_distribution`,
+  `normal_distribution` and `uniform_int_distribution` aren't, and libstdc++ (CI's Linux) and
+  libc++ (macOS) draw different numbers from the same seed, so a test would check other cases on
+  each and could pass on one only. `make test-cpp CXX=g++-16 OUT=<dir>` (Homebrew's GCC, with
+  libstdc++) runs the C++ tests against Linux CI's standard library (CI compiles with clang++).
+  Keep the draws in a defined order: several in one value through brace initialization
+  (`glm::vec3{u(rng), u(rng), u(rng)}`, evaluated left to right), never as the arguments of one
+  call or parenthesized constructor, whose order is unspecified (GCC on x86-64 can go right to
+  left).
 - **A Python test**: `test_*.py` anywhere under `tools/` or `tests/`. They run in one pytest
   invocation without `__init__.py` files, so each basename must be unique (pytest otherwise fails
   with "import file mismatch").
