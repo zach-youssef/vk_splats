@@ -33,10 +33,17 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   for the web (no native-only features such as `import-images`). Programs link only Vulkan; one
   that needs more, e.g. GLFW for a window, opts in with `programs/<name>/program.mk`:
   `LIBS_<name> = -lglfw`. Headless programs then build and run without GLFW.
+  A numeric option whose every value, 0 included, is a meaningful choice is made required with
+  ZGAL's `#:given`: the option also sets a `bool` parameter when it's on the command line, and the
+  program fails without it (splat_train's `--max-screen-size`, where 0 turns the prune off).
 - **A program test**: `programs/<name>/test.sh`, executable, run from the repository's root as
   `test.sh <binary> <output dir>`. It runs the program headless with `--validation` (which fails
   unless validation and synchronization validation are both available) and exits non-zero on any
   failure; a validation message is a failure.
+  A training test ends several hundred iterations after its last densification or opacity reset
+  (splat_train's `--densify-until 1500` in 2000 and 1800-iteration runs): right after one, fresh
+  clones and splits are untrained and a reset has just cut every opacity, so the score says
+  little about the trainer (a sparse run ending on a reset scores about 13 dB instead of 33).
   A test that runs another program (splat_train's renders its ground truth with splat_render)
   names that build in its `program.mk`: `test-<name>: $(OUT)/<other>/<other>` and
   `test-web-<name>: $(OUT)/web/<other>`.
