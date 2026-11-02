@@ -2,13 +2,16 @@
 ;; Adam iteration a frame), scores the held-out views, and writes the trained splats as an INRIA
 ;; PLY. ZGAL can't read the manifest or join paths, so tools/scene_args.py prints the arguments:
 ;;
-;;     build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) --iterations 2000 --frames 2100
+;;     build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) --max-splats 100000 \
+;;         --iterations 2000 --frames 2100
 ;;
+;; --max-splats (required) is the splat buffers' capacity, at least the scene's splats: the graph
+;; holds the count in use on the GPU, and only the first ones are trained and written.
 ;; The phases, one graph throughout:
 ;;   0. loading: the graph's first frames read the cameras back (Adam and the loss history off;
 ;;      they render camera 0 at 16x16, or less within --max-width x --max-height);
 ;;      the app then checks them against the arguments (the camera count, the sizes, a single
-;;      image batch, the targets' size) and splits them, by their heldOut, into training and test
+;;      image batch, the targets' size, --max-splats >= --splat-count) and splits them, by their heldOut, into training and test
 ;;      views (cameras without an image are neither);
 ;;   1. training: iteration t (1-based) renders a training camera, popped at random from a stack
 ;;      of them refilled when empty (the reference's order; the pick is pcgHash of the seed and
@@ -205,8 +208,10 @@
          (with state #:phase phaseEvaluating #:view view #:camera (at state.test view)))]
       [(not= state.phase phaseReading) (with state #:phase phaseReading)]
       ;; 3: once the history and the splats have arrived, report and write them
-      [(and (= (count state.history) (+ iterations cameraCount)) (= (count state.trained) splatCount))
+      [(and (= (count state.history) (+ iterations cameraCount)) (>= (count state.trained) splatCount))
        (let* ([h state.history]
+              ;; The buffer holds --max-splats; the splats in use are its first ones
+              [trained (collect ([i (range (uint 0) splatCount)]) (at state.trained i))]
               [epoch (min (count state.train) iterations)]
               [first (meanOf (fold ([a 0.0]) ([i (range (uint 0) epoch)]) (+ a (heldLoss (at h i))))
                              (fold ([a 0.0]) ([i (range (uint 0) epoch)]) (+ a (held (at h i)))))]
@@ -222,8 +227,8 @@
                             0.0)]
               [lossesFinite (fold ([ok #t]) ([i (range (uint 0) (+ iterations (count state.test)))])
                               (and ok (finite (at h i))))]
-              [splatsFinite (fold ([ok #t]) ([i (range (uint 0) (count state.trained))])
-                              (and ok (finiteSplat (at state.trained i))))])
+              [splatsFinite (fold ([ok #t]) ([i (range (uint 0) (count trained))])
+                              (and ok (finiteSplat (at trained i))))])
          (for ([v (range (uint 0) (count state.test))])
            (print! "splat_train: test view " (at state.test v) " PSNR " (psnr (at h (+ iterations v))) " dB"))
          (print! "splat_train: training loss (L1) first epoch " first ", last epoch " last ", ratio "
@@ -231,7 +236,7 @@
          (print! "splat_train: held-out PSNR " meanPsnr " dB over " (count state.test) " views")
          (print! "splat_train: " skipped " iterations skipped (overflowed), the most tile entries a frame needed "
                  state.mostEntries)
-         (exportPly state.trained)
+         (exportPly trained)
          (cond
            [(not (and lossesFinite splatsFinite))
             (begin (print! "splat_train: FAILED, a loss or a trained splat isn't finite") (fail))]
@@ -244,7 +249,7 @@
          state)]
       [else state]))
   (run TrainGraph (splatFile splatFile) (cameraFile cameraFile) (targetFile targetFile)
-       (splatCount splatCount) (maxWidth maxWidth) (maxHeight maxHeight)
+       (splatCount splatCount) (maxSplats (max maxSplats splatCount)) (maxWidth maxWidth) (maxHeight maxHeight)
        (cameraIndex state.camera)
        (width (if (= state.phase phaseLoading) (min (uint 16) maxWidth) (.x (.size (at state.cameras state.camera)))))
        (height (if (= state.phase phaseLoading) (min (uint 16) maxHeight) (.y (.size (at state.cameras state.camera)))))
@@ -282,8 +287,10 @@
   (option targetFile "--targets" "the scene's images (its only images_<k>.bin)" #:default "images_0.bin")
   (option splatCount "--splat-count" "the splats in it (the manifest's splatCount)" #:default 1
           #:range (1 16777216))
-  (option maxSplats "--max-splats" "the most splats training may hold (densification's cap; at least --splat-count)"
-          #:default 16777216 #:range (1 16777216))
+  ;; Required (0 fails loading): the cap is a trade-off between memory and how far densification
+  ;; may grow the scene. At most 559240 (the 128 MiB binding budget / 240 B a splat)
+  (option maxSplats "--max-splats" "the most splats training may hold (densification's cap; required, at least --splat-count, at most 559240)"
+          #:default 0 #:range (0 559240))
   (option cameraCount "--camera-count" "the cameras in it (the manifest's cameraCount)" #:default 1
           #:range (1 65536))
   ;; At most 2896 a side, as splat_render's (the 128 MiB binding budget)

@@ -16,6 +16,9 @@
 ;; is incomplete, and `counts` (read back each frame) tells the app, which grows the capacity
 ;; (grownCapacity) for the frames after. The tile counts' total must stay below 2^32 (it's a
 ;; uint): past that the entries are wrong, but every kernel still stays in its buffers' bounds.
+;; The splat count lives on the GPU (`splatCounts`, written once by InitSplatCounts, and by the
+;; training graph's densification), so the per-splat kernels read it there and are dispatched
+;; indirectly (`splatCommands`): a count that changes on the GPU needs no CPU round trip.
 ;; Every 1D kernel (preprocess, plan, entries, ranges) loops over its elements by grid stride, so
 ;; its dispatches stay within maxGroups workgroups (a graph parameter: groupLimit, or less to test
 ;; the loops). Rasterize is the exception: a 2D dispatch of the tile grid, which maxGroups doesn't
@@ -74,9 +77,32 @@
 (define countDepthShift (uint 4)) ; depthShift(depth bits, near, far): the keys' depth shift
 (define countSize (uint 5))      ; the elements (SplatGraph says 5: it can't use this)
 
+;; `splatCounts`, the splats' GPU-side count (shared between frames), element by element. The
+;; render graph uses splatActive only; the training graph's densification the rest.
+(define splatActive (uint 0))     ; the splats in use: those at indices [0, splatActive)
+(define splatOverflow (uint 1))   ; the splats densification couldn't add for lack of capacity, in all
+(define splatSlots (uint 2))      ; the last densification's slot count (2 n + 2): its scan's count
+(define splatDensifies (uint 3))  ; the densifications run
+(define splatPruned (uint 4))     ; the splats the last densification removed
+(define splatAdded (uint 5))      ; the splats the last densification added (clones and splits' second halves)
+(define splatCountsSize (uint 6)) ; the elements (the graphs say 6: they can't use this)
+
 ;; ---------------------------------------------------------------------------------------------
 ;; Kernels
 ;; ---------------------------------------------------------------------------------------------
+;; 0. The splat count and the per-splat kernels' indirect dispatch (groupsFor splatGroupSize, at
+;; most maxGroups), once, in the graph's first frame: one invocation
+(compute-material InitSplatCounts
+  (workgroup 1)
+  (bindings
+   (splatCounts (buffer-array uint write))
+   (splatCommands (buffer-array DispatchCommand write)))
+  (push (splatCount uint) (maxGroups uint))
+  (compute
+   (for ([k (range (uint 0) splatCountsSize)])
+     (write! (at splatCounts k) (if (= k splatActive) splatCount (uint 0))))
+   (write! (at splatCommands 0) (DispatchCommand (groupsFor splatCount splatGroupSize maxGroups) 1 1))))
+
 ;; 1. Each splat as the camera sees it, and how many tiles it touches (0 when culled)
 (compute-material Preprocess
   (workgroup 64)
@@ -84,10 +110,11 @@
    (splats (buffer-array Splat read))
    (cameras (buffer-array Camera read))
    (projected (buffer-array Projected write))
-   (tileCounts (buffer-array uint write)))
-  (push (splatCount uint) (cameraIndex uint) (near float) (shDegree uint))
+   (tileCounts (buffer-array uint write))
+   (splatCounts (buffer-array uint read)))
+  (push (cameraIndex uint) (near float) (shDegree uint))
   (compute
-   (for ([i (range globalInvocationId.x splatCount (* splatGroupSize workgroupCount.x))])
+   (for ([i (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
      (let* ([p (projectSplat (at splats i) (at cameras cameraIndex) near shDegree)])
        (write! (at projected i) p)
        (write! (at tileCounts i) p.tileCount)))))
@@ -121,10 +148,12 @@
    (offsets (buffer-array uint read))
    (counts (buffer-array uint read))
    (entryKeys (buffer-array uint write))
-   (entrySplats (buffer-array uint write)))
-  (push (splatCount uint) (gridWidth uint) (near float) (far float))
+   (entrySplats (buffer-array uint write))
+   (splatCounts (buffer-array uint read)))
+  (push (gridWidth uint) (near float) (far float))
   (compute
-   (let* ([entries (at counts countEntries)]
+   (let* ([splatCount (at splatCounts splatActive)]
+          [entries (at counts countEntries)]
           [depthBits (at counts countDepthBits)]
           [shift (at counts countDepthShift)])
      (for ([e (range globalInvocationId.x entries (* entryGroupSize workgroupCount.x))])
@@ -313,6 +342,8 @@
   (buffer offsets uint splatCount #:frames per-frame)
   (buffer counts uint 5 #:frames per-frame)  ; countSize
   (buffer commands DispatchCommand 1 #:frames per-frame)
+  (buffer splatCounts uint 6 #:frames shared)  ; splatCountsSize
+  (buffer splatCommands DispatchCommand 1 #:frames shared)
   (buffer entryKeys uint capacity #:frames per-frame)
   (buffer entrySplats uint capacity #:frames per-frame)
   (buffer ranges uint (* tileCount 2) #:frames per-frame)  ; [start, end) a tile: TileRanges
@@ -324,15 +355,16 @@
   (sampler nearest #:filter nearest #:address clamp-to-edge)
   (target screen (surface #:clear (0.0 0.0 0.0 1.0) #:depth none) #:when window)
 
-  (material preprocessing Preprocess splats cameras projected tileCounts
-            #:push ((splatCount splatCount) (cameraIndex cameraIndex) (near near) (shDegree shDegree))
-            #:invocations ((min splatCount (* (max maxGroups 1) 64))))  ; 64: the splat workgroup size
+  (material initializing InitSplatCounts splatCounts splatCommands
+            #:push ((splatCount splatCount) (maxGroups maxGroups)) #:invocations (1))
+  (material preprocessing Preprocess splats cameras projected tileCounts splatCounts
+            #:push ((cameraIndex cameraIndex) (near near) (shDegree shDegree)))
   (material planning PlanEntries counts commands
             #:push ((capacity capacity) (tileCount tileCount) (near near) (far far)
                     (maxGroups maxGroups))
             #:invocations (1))
-  (material emitting EmitEntries projected offsets counts entryKeys entrySplats
-            #:push ((splatCount splatCount) (gridWidth gridWidth) (near near) (far far)))
+  (material emitting EmitEntries projected offsets counts entryKeys entrySplats splatCounts
+            #:push ((gridWidth gridWidth) (near near) (far far)))
   (material ranging TileRanges entryKeys counts ranges #:push ((tileCount tileCount)))
   (material rasterizing Rasterize projected entrySplats ranges colours lastEntries rendered
             #:push ((width width) (height height) (background background))
@@ -340,7 +372,8 @@
   (material presenting Present (picture rendered) (pictureSampler nearest)
             #:push ((scale presentScale)) #:when window)
 
-  (dispatch preprocess preprocessing)
+  (dispatch initSplats initializing #:once #t)
+  (dispatch preprocess preprocessing #:indirect (at splatCommands 0))
   (exclusive-scan scanTileCounts tileCounts offsets #:op add #:count splatCount)
   (reduce totalTileCounts tileCounts (at counts 1) #:op add #:count splatCount)
   (dispatch plan planning)

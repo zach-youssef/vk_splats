@@ -300,11 +300,11 @@
    (counts (buffer-array uint read))
    (entryPositions (buffer-array uint read))
    (entryGradients (buffer-array float read))
-   (splatGradients (buffer-array ProjectedGradient write)))
-  (push (splatCount uint))
+   (splatGradients (buffer-array ProjectedGradient write))
+   (splatCounts (buffer-array uint read)))
   (compute
    (let* ([entries (at counts countEntries)])
-     (for ([s (range globalInvocationId.x splatCount (* splatGroupSize workgroupCount.x))])
+     (for ([s (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
        (let* ([first (at offsets s)]
               [(mean conic opacity colour)
                (fold ([mean (vec2 0.0)] [conic (vec3 0.0)] [opacity 0.0] [colour (vec3 0.0)])
@@ -345,11 +345,12 @@
    (projected (buffer-array Projected read))
    (splatGradients (buffer-array ProjectedGradient read))
    (parameterGradients (buffer-array Splat write))
-   (densifyStats (buffer-array DensifyStat read-write)))
-  (push (splatCount uint) (cameraIndex uint) (shDegree uint))
+   (densifyStats (buffer-array DensifyStat read-write))
+   (splatCounts (buffer-array uint read)))
+  (push (cameraIndex uint) (shDegree uint))
   (compute
    (let* ([cam (at cameras cameraIndex)])
-     (for ([i (range globalInvocationId.x splatCount (* splatGroupSize workgroupCount.x))])
+     (for ([i (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
        (let* ([visible (> (.tileCount (at projected i)) (uint 0))]
               [g (at splatGradients i)]
               ;; A culled splat's: 0 (preprocessBackward needs a splat projectSplat doesn't cull)
@@ -509,12 +510,13 @@
    (parameterGradients (buffer-array Splat read))
    (adamM (buffer-array Splat read-write))
    (adamV (buffer-array Splat read-write))
-   (counts (buffer-array uint read)))
-  (push (splatCount uint) (bias1 float) (bias2 float) (positionLr float) (dcLr float) (restLr float)
+   (counts (buffer-array uint read))
+   (splatCounts (buffer-array uint read)))
+  (push (bias1 float) (bias2 float) (positionLr float) (dcLr float) (restLr float)
         (opacityLr float) (scalingLr float) (rotationLr float))
   (compute
    (when (<= (at counts countTotal) (at counts countCapacity))
-     (for ([i (range globalInvocationId.x splatCount (* splatGroupSize workgroupCount.x))])
+     (for ([i (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
        (let* ([s (at splats i)]
               [g (at parameterGradients i)]
               [m (at adamM i)]
@@ -586,7 +588,11 @@
 ;; height), and the grid, tile and pixel counts are computed each frame in the push constants,
 ;; invocations and counts that use them (a graph constant is computed once, when it's built).
 (graph TrainGraph
+  ;; The splats splatFile holds (splatCount), in a buffer of maxSplats (at least splatCount), the
+  ;; most the densification may grow them to: ZGAL recreates a buffer whose size changes, losing
+  ;; its contents, so the capacity is fixed and the count lives on the GPU (splatCounts)
   (parameter splatCount uint)
+  (parameter maxSplats uint)
   (input cameraIndex (per-frame uint))
   (input width (per-frame uint))
   (input height (per-frame uint))
@@ -641,14 +647,18 @@
   (constant maxTileCount (* (/ (+ maxWidth 15) 16) (/ (+ maxHeight 15) 16)))
   (constant maxPixels (* maxWidth maxHeight))
 
-  (buffer-file splats Splat splatFile)
+  ;; The splats: the file's, copied once into the first splatCount of `splats`
+  (buffer-file splatSource Splat splatFile)
+  (buffer splats Splat maxSplats #:frames shared)
   (buffer-file cameras Camera cameraFile)
   (buffer-file targets uint targetFile)
-  (buffer projected Projected splatCount #:frames per-frame)
-  (buffer tileCounts uint splatCount #:frames per-frame)
-  (buffer offsets uint splatCount #:frames per-frame)
+  (buffer projected Projected maxSplats #:frames per-frame)
+  (buffer tileCounts uint maxSplats #:frames per-frame)
+  (buffer offsets uint maxSplats #:frames per-frame)
   (buffer counts uint 5 #:frames per-frame)  ; countSize
   (buffer commands DispatchCommand 1 #:frames per-frame)
+  (buffer splatCounts uint 6 #:frames shared)  ; splatCountsSize
+  (buffer splatCommands DispatchCommand 1 #:frames shared)
   (buffer entryKeys uint (min capacity 3145728) #:frames per-frame)
   (buffer entrySplats uint (min capacity 3145728) #:frames per-frame)
   (buffer ranges uint (* maxTileCount 2) #:frames per-frame)
@@ -662,25 +672,26 @@
   (buffer losses float 3 #:frames per-frame)  ; lossTotal, lossProbe, lossDelta
   (buffer entryGradients float (* (min capacity 3145728) 9) #:frames per-frame)  ; gradientStride
   (buffer entryPositions uint (min capacity 3145728) #:frames per-frame)
-  (buffer splatGradients ProjectedGradient splatCount #:frames per-frame)
-  (buffer parameterGradients Splat splatCount #:frames per-frame)
+  (buffer splatGradients ProjectedGradient maxSplats #:frames per-frame)
+  (buffer parameterGradients Splat maxSplats #:frames per-frame)
   ;; Accumulated across frames, so shared: cleared in the graph's first frame and whenever the app
   ;; runs resetDensify again (run-once!; untested so far, and the frames in flight between the
   ;; app's readback and the reset are lost: architecture.md's train graph, step 9)
-  (buffer densifyStats DensifyStat splatCount #:frames shared)
+  (buffer densifyStats DensifyStat maxSplats #:frames shared)
   ;; Finite differences': the +h side's, shared, so the -h frames see the last +h frame's
   (buffer plusLosses float maxPixels #:frames shared #:when finiteDifferences)
   (buffer plusLasts uint maxPixels #:frames shared #:when finiteDifferences)
   (buffer plusProjected Projected 1 #:frames shared #:when finiteDifferences)
   (buffer lossDeltas float maxPixels #:frames per-frame #:when finiteDifferences)
   ;; Training's, across frames
-  (buffer adamM Splat splatCount #:frames shared #:when train)
-  (buffer adamV Splat splatCount #:frames shared #:when train)
+  (buffer adamM Splat maxSplats #:frames shared #:when train)
+  (buffer adamV Splat maxSplats #:frames shared #:when train)
   (buffer history float (max historySize 1) #:frames shared #:when train)
 
-  (material preprocessing Preprocess splats cameras projected tileCounts
-            #:push ((splatCount splatCount) (cameraIndex cameraIndex) (near near) (shDegree shDegree))
-            #:invocations ((min splatCount (* (max maxGroups 1) 64))))  ; 64: the splat workgroup size
+  (material initializing InitSplatCounts splatCounts splatCommands
+            #:push ((splatCount splatCount) (maxGroups maxGroups)) #:invocations (1))
+  (material preprocessing Preprocess splats cameras projected tileCounts splatCounts
+            #:push ((cameraIndex cameraIndex) (near near) (shDegree shDegree)))
   (material perturbing Perturb splats cameras projected
             #:push ((splatCount splatCount) (splat perturbSplat) (field perturbField) (delta perturbDelta)
                     (cameraIndex cameraIndex) (near near) (shDegree shDegree))
@@ -689,8 +700,8 @@
             #:push ((capacity (min capacity 3145728)) (tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16))) (near near) (far far)
                     (maxGroups maxGroups))
             #:invocations (1))
-  (material emitting EmitEntries projected offsets counts entryKeys entrySplats
-            #:push ((splatCount splatCount) (gridWidth (/ (+ width 15) 16)) (near near) (far far)))
+  (material emitting EmitEntries projected offsets counts entryKeys entrySplats splatCounts
+            #:push ((gridWidth (/ (+ width 15) 16)) (near near) (far far)))
   (material ranging TileRanges entryKeys counts ranges #:push ((tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16)))))
   (material rasterizing Rasterize projected entrySplats ranges colours lastEntries rendered
             #:push ((width width) (height height) (background background))
@@ -712,26 +723,26 @@
   (material inverting InvertEntries projected offsets counts entryKeys entrySplats entryPositions
             #:push ((gridWidth (/ (+ width 15) 16))))
   (material gathering GatherGradients projected offsets counts entryPositions entryGradients
-            splatGradients
-            #:push ((splatCount splatCount))
-            #:invocations ((min splatCount (* (max maxGroups 1) 64))))
+            splatGradients splatCounts)
   (material backwardPreprocessing BackwardPreprocess splats cameras projected splatGradients
-            parameterGradients densifyStats
-            #:push ((splatCount splatCount) (cameraIndex cameraIndex) (shDegree shDegree))
-            #:invocations ((min splatCount (* (max maxGroups 1) 64))))
-  (material stepping Adam splats parameterGradients adamM adamV counts
-            #:push ((splatCount splatCount) (bias1 bias1) (bias2 bias2) (positionLr positionLr) (dcLr dcLr)
+            parameterGradients densifyStats splatCounts
+            #:push ((cameraIndex cameraIndex) (shDegree shDegree)))
+  (material stepping Adam splats parameterGradients adamM adamV counts splatCounts
+            #:push ((bias1 bias1) (bias2 bias2) (positionLr positionLr) (dcLr dcLr)
                     (restLr restLr) (opacityLr opacityLr) (scalingLr scalingLr) (rotationLr rotationLr))
-            #:invocations ((min splatCount (* (max maxGroups 1) 64))) #:when train)
+            #:when train)
   (material recording Record losses counts history
             #:push ((slot historySlot) (historySize historySize))
             #:invocations (1) #:when train)
 
-  ;; The forward pass: SplatGraph's
-  (dispatch preprocess preprocessing)
+  ;; The splats and their count, in the first frame
+  (copy loadSplats splatSource splats #:once #t)
+  (dispatch initSplats initializing #:once #t)
+  ;; The forward pass: SplatGraph's, over the splats in use
+  (dispatch preprocess preprocessing #:indirect (at splatCommands 0))
   (dispatch perturb perturbing #:when finiteDifferences)
-  (exclusive-scan scanTileCounts tileCounts offsets #:op add #:count splatCount)
-  (reduce totalTileCounts tileCounts (at counts 1) #:op add #:count splatCount)
+  (exclusive-scan scanTileCounts tileCounts offsets #:op add #:count (at splatCounts 0))  ; splatActive
+  (reduce totalTileCounts tileCounts (at counts 1) #:op add #:count (at splatCounts 0))
   (dispatch plan planning)
   (dispatch emit emitting #:indirect (at commands 0))
   (sort sortEntries entryKeys #:values entrySplats #:count (at counts 0))
@@ -748,14 +759,14 @@
   (dispatch backwardRasterize backward)
   (clear clearPositions entryPositions #:value 4294967295)
   (dispatch invert inverting #:indirect (at commands 0))
-  (dispatch gather gathering)
+  (dispatch gather gathering #:indirect (at splatCommands 0))
   (clear resetDensify densifyStats #:once #t)
-  (dispatch backwardPreprocess backwardPreprocessing)
+  (dispatch backwardPreprocess backwardPreprocessing #:indirect (at splatCommands 0))
   ;; Training
   (clear resetFirstMoments adamM #:once #t #:when train)
   (clear resetSecondMoments adamV #:once #t #:when train)
   (clear resetHistory history #:once #t #:when train)
-  (dispatch adam stepping #:when train)
+  (dispatch adam stepping #:indirect (at splatCommands 0) #:when train)
   (dispatch record recording #:when train)
 
   (readback readCounts counts)

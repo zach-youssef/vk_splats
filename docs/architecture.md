@@ -204,6 +204,17 @@ rather than in the program.
   (256-wide) loop over their elements by grid stride, so 2²⁴ splats or 2²⁵ entries need no more
   groups. `PlanEntries` sizes the indirect dispatch with `groupsFor`; tests pass a smaller
   `maxGroups` (tile_test's `--max-groups`) so the loops go round.
+- **Splat count**: the count of splats in use lives on the GPU, in `splatCounts` (`#:frames
+  shared`; `splatActive` is its first `uint`), because training's densification changes it on the
+  GPU. `InitSplatCounts` (`#:once`) writes the scene's `splatCount` there and the indirect
+  `DispatchCommand` in `splatCommands` (`groupsFor` with `maxGroups`) in the first frame; the
+  per-splat kernels read the count from `splatCounts` and are dispatched indirectly through
+  `splatCommands`, and the scan and reduce over `tileCounts` take their count from it on the GPU.
+  `SplatGraph`'s splats never change, so it sizes its buffers with `splatCount`; `TrainGraph`'s
+  per-splat buffers hold `maxSplats` (a parameter, at least `splatCount`): ZGAL recreates a buffer
+  whose size changes, losing its contents, so the capacity is fixed and only the count moves.
+  `TrainGraph` copies the scene's splats (`splatSource`, the file) into the first `splatCount` of
+  its `splats` buffer once (`loadSplats`), and the splats past the count are never read.
 - **Total**: the tile counts and their scan and total are `uint`, so the total must stay below
   2³² (e.g. 2M splats each covering all of a 748² view would wrap it). Past that the offsets
   aren't ascending and the frame's entries are wrong, but the kernels stay in bounds: an entry
@@ -400,8 +411,14 @@ iterations, the held-out views and a few frames of loading and readback latency,
 fails.
 
 ```
-build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) --iterations 2000 --frames 2100
+build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) --max-splats 100000 \
+    --iterations 2000 --frames 2100
 ```
+
+`--max-splats` is required (it has no default, since it trades memory for how far the scene may
+grow): the capacity of every per-splat buffer, at least `--splat-count` and at most 559240 (the
+128 MiB binding budget over a 240-byte `Splat`). The scene's splats are copied into the first
+`--splat-count` of the splat buffer, and only the splats in use are trained and written.
 
 Its phases, in one graph:
 

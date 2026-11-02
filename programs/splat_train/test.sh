@@ -48,6 +48,6 @@ cp -R programs/splat_render/golden/s3 "$out/gt"
 # shellcheck disable=SC2046 # the arguments are words without spaces
 SPLAT_TRAIN_PLY="$out/trained.ply" program --validation --frames $((iterations + 64)) \
     $("$python" tools/scene_args.py --train "$out/start") \
-    --iterations $iterations --sh-interval 500 --initial-entries 256 > "$out/train.log" 2>&1 ||
+    --iterations $iterations --sh-interval 500 --initial-entries 256 --max-splats 4096 > "$out/train.log" 2>&1 ||
     fail "the run exited with $?"
 "$python" "$here/check.py" "$out" "$renderer" --min-psnr 30 --min-ratio 5 --min-skipped 1 || fail "the check"

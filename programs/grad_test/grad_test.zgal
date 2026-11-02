@@ -385,7 +385,7 @@
                     state.densify state.losses cameraIndex shDegree (vec3 backgroundR backgroundG backgroundB) (vec3 targetR targetG targetB) l1 oracle))]
       [else state]))
   (run TrainGraph (splatFile splatFile) (cameraFile cameraFile) (targetFile targetFile)
-       (splatCount splatCount) (cameraIndex cameraIndex) (width width) (height height)
+       (splatCount splatCount) (maxSplats splatCount) (cameraIndex cameraIndex) (width width) (height height)
        (maxWidth width) (maxHeight height) (train #f) (historySize 0) (historySlot 0) (bias1 1.0) (bias2 1.0)
        (positionLr 0.0) (dcLr 0.0) (restLr 0.0) (opacityLr 0.0) (scalingLr 0.0) (rotationLr 0.0)
        (shDegree shDegree) (near near) (far far) (maxGroups maxGroups) (inspect #t)
