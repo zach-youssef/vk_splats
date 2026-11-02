@@ -400,8 +400,8 @@ here with their offsets.
   (center vec3)            ; 80: the camera centre in world space, −Rᵀt
   (pixelOffset uint)       ; 92: the image's first pixel in its batch
   (size uvec2)             ; 96: (width, height)
-  (imageBatch uint))       ; 104: which images_<k>.bin; 0xFFFFFFFF without an image
-                           ; then 4 bytes of padding
+  (imageBatch uint)        ; 104: which images_<k>.bin; 0xFFFFFFFF without an image
+  (heldOut uint))          ; 108: 1 for a test camera (the manifest's split), else 0
 
 (struct Projected          ; 64 bytes: one splat as one camera sees it (the preprocess's output)
   (mean vec2)              ; 0: the 2D mean, in pixels

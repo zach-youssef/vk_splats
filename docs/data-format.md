@@ -90,8 +90,8 @@ code.
   (center vec3)            ; 80: the camera centre in world space, −Rᵀt
   (pixelOffset uint)       ; 92: the image's first pixel in its batch, in pixels
   (size uvec2)             ; 96: (width, height)
-  (imageBatch uint))       ; 104: which images_<k>.bin; 0xFFFFFFFF without an image
-                           ; then 4 bytes of padding
+  (imageBatch uint)        ; 104: which images_<k>.bin; 0xFFFFFFFF without an image
+  (heldOut uint))          ; 108: 1 for a test camera (the manifest's split), else 0
 ```
 
 The convention is COLMAP's: +z looks forward, +y down, and pixel (x, y) projects at
@@ -110,7 +110,7 @@ values, used as stored (the reference code trains on them without linearizing).
 
 ```
 {
- "version": 1,
+ "version": 2,
  "splatCount": 12900,
  "shDegree": 3,
  "cameraCount": 46,
@@ -130,7 +130,8 @@ values, used as stored (the reference code trains on them without linearizing).
   times the largest distance from a camera centre to the cameras' mean centre (`getNerfppNorm`),
   over the training cameras only, as in the reference (all cameras when none is a training one).
 - A camera without an image has no `imageBatch`, `pixelOffset` or `png`.
-- `version` changes with any change to the files' layout.
+- `version` changes with any change to the files' layout. Version 2 added the Camera's `heldOut`
+  (the split, for the trainer, which can't read the manifest), in what was padding.
 
 ## INRIA PLY
 

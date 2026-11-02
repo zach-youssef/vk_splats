@@ -14,7 +14,7 @@ from scipy import ndimage
 
 from . import colmap, quaternion, splats as splat_module
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # Every 8th image, in name order, is held out for testing (the reference code's llffhold)
 TEST_EVERY = 8
@@ -207,13 +207,13 @@ def camera_extent(cameras: Sequence[PinholeCamera]) -> float:
 
 # --- std430 buffers -----------------------------------------------------------------------------------
 # (struct Camera (worldToCamera mat4) (intrinsics vec4) (center vec3) (pixelOffset uint)
-#                (size uvec2) (imageBatch uint))
+#                (size uvec2) (imageBatch uint) (heldOut uint))
 # Offsets: worldToCamera 0 (column-major), intrinsics 64 (fx, fy, cx, cy), center 80,
-# pixelOffset 92, size 96, imageBatch 104, then 4 bytes padding; 112 bytes.
+# pixelOffset 92, size 96, imageBatch 104, heldOut 108; 112 bytes.
 CAMERA_DTYPE = np.dtype({
-    "names": ["worldToCamera", "intrinsics", "center", "pixelOffset", "size", "imageBatch"],
-    "formats": [("<f4", 16), ("<f4", 4), ("<f4", 3), "<u4", ("<u4", 2), "<u4"],
-    "offsets": [0, 64, 80, 92, 96, 104],
+    "names": ["worldToCamera", "intrinsics", "center", "pixelOffset", "size", "imageBatch", "heldOut"],
+    "formats": [("<f4", 16), ("<f4", 4), ("<f4", 3), "<u4", ("<u4", 2), "<u4", "<u4"],
+    "offsets": [0, 64, 80, 92, 96, 104, 108],
     "itemsize": 112,
 })
 
@@ -246,7 +246,13 @@ def pack_images(cameras: Sequence[PinholeCamera], max_bytes: int = MAX_BUFFER_BY
     return [b"".join(b) for b in batches], placement
 
 
-def cameras_to_std430(cameras: Sequence[PinholeCamera], placement) -> bytes:
+def cameras_to_std430(cameras: Sequence[PinholeCamera], placement,
+                      held_out: Optional[Sequence[bool]] = None) -> bytes:
+    """The Camera structs: placement is pack_images', held_out marks the test cameras (heldOut 1;
+    default none), so a trainer reads the split from the buffer."""
+    held_out = [False] * len(cameras) if held_out is None else held_out
+    if len(held_out) != len(cameras):
+        raise ValueError("held_out needs one entry per camera")
     out = np.zeros(len(cameras), CAMERA_DTYPE)
     for i, (camera, (batch, offset)) in enumerate(zip(cameras, placement)):
         out[i]["worldToCamera"] = camera.world_to_camera_matrix().T.reshape(16)  # column-major
@@ -255,6 +261,7 @@ def cameras_to_std430(cameras: Sequence[PinholeCamera], placement) -> bytes:
         out[i]["pixelOffset"] = offset
         out[i]["size"] = [camera.width, camera.height]
         out[i]["imageBatch"] = batch
+        out[i]["heldOut"] = 1 if held_out[i] else 0
     return out.tobytes()
 
 
@@ -288,7 +295,7 @@ def write_scene(out_dir: str, splats: splat_module.Splats, cameras: Sequence[Pin
     with open(os.path.join(out_dir, "splats.bin"), "wb") as f:
         f.write(splat_module.to_std430(splats))
     with open(os.path.join(out_dir, "cameras.bin"), "wb") as f:
-        f.write(cameras_to_std430(cameras, placement))
+        f.write(cameras_to_std430(cameras, placement, held_out))
     image_files = []
     for k, data in enumerate(buffers):
         image_files.append(f"images_{k}.bin")

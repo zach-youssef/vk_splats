@@ -32,7 +32,8 @@
   (center vec3)            ; the camera centre in world space, -R^T t
   (pixelOffset uint)       ; the image's first pixel in its batch
   (size uvec2)             ; (width, height) in pixels
-  (imageBatch uint))       ; which images_<k>.bin; 0xFFFFFFFF without an image
+  (imageBatch uint)        ; which images_<k>.bin; 0xFFFFFFFF without an image
+  (heldOut uint))          ; 1 for a test camera (the manifest's split), else 0
 
 ;; A splat as one camera sees it: the preprocess's output, which the tile and rasterize passes read
 ;; (64 bytes). A culled splat (behind the near plane, degenerate, or off-screen) has tileCount 0.

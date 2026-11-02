@@ -42,7 +42,7 @@ def test_images_are_packed_rgba8_in_batches():
 
 def test_camera_buffer_layout():
     cameras = [camera("a", 4, 3), camera("b", 5, 2, image=False)]
-    data = scene.cameras_to_std430(cameras, [(0, 7), (scene.NO_IMAGE, 0)])
+    data = scene.cameras_to_std430(cameras, [(0, 7), (scene.NO_IMAGE, 0)], [False, True])
     assert len(data) == 2 * 112
     c = scene.cameras_from_std430(data)
     m = c[0]["worldToCamera"].reshape(4, 4).T  # column-major
@@ -53,8 +53,9 @@ def test_camera_buffer_layout():
     np.testing.assert_allclose(c[0]["intrinsics"], [50, 60, 2, 1.5])
     assert c[0]["pixelOffset"] == 7 and list(c[0]["size"]) == [4, 3] and c[0]["imageBatch"] == 0
     assert c[1]["imageBatch"] == scene.NO_IMAGE
+    assert c[0]["heldOut"] == 0 and c[1]["heldOut"] == 1
     words = np.frombuffer(data, "<u4").reshape(2, 28)
-    assert np.all(words[:, 27] == 0)  # Trailing padding
+    assert list(words[:, 27]) == [0, 1]  # heldOut, the last word
 
 
 def test_extent_is_computed_from_the_training_cameras(tmp_path):

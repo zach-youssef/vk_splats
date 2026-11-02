@@ -232,6 +232,7 @@ def test_s3_splats_and_cameras(s3):
     assert np.all(np.abs(got.sh[:, 1:]).max(axis=(0, 2)) > 0)
     assert [list(c["size"]) for c in cameras] == [[128, 128]] * 24 + [[160, 96]]
     assert manifest["test"] == [0, 8, 16] and len(manifest["train"]) == 22
+    assert [int(c["heldOut"]) for c in cameras] == [int(k in (0, 8, 16)) for k in range(25)]
     wide = [c["index"] for c in manifest["cameras"] if c["width"] != c["height"]]
     assert wide == [24] and manifest["cameras"][24]["split"] == "train"
     for k, camera in enumerate(cameras):
