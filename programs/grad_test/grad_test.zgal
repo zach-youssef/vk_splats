@@ -39,6 +39,15 @@
 ;;     matched with its probe, however late its readback arrives. --multi-batch and --stops make
 ;;     sure a run reaches the paths small scenes don't: a tile whose backward walks more than one
 ;;     batch (from the backwardRanges readback), a pixel stopped at T < 1e-4 (counted on the CPU).
+;; With --dssim lambda (and --l1), the loss is training's (1 - lambda) L1 + lambda D-SSIM
+;; (TrainGraph's dssim), and the finite differences probe the projection's colour alone, with h
+;; 1e-2 of the value, at least 1e-3: that checks what the term adds (its per-pixel gradient, the
+;; two weights, the terms summed) through the backward pass, which the other kinds share. A pixel's
+;; D-SSIM depends on its 11x11 window, so a flip leaves out its own loss but its colour's jump
+;; still moves its neighbours', which an opacity or mean step causes (at 1e-3, S2's opacity is up
+;; to 15% off, one of opposite sign; leaving out the window around a flip instead drops too much
+;; of the smooth change); a colour step flips nothing. At 1e-3 the SSIM's float noise (its
+;; variances are differences of near-equal sums) leaves the colour a few % off; at 1e-2, within 1.1%.
 ;; It fails on a mismatch, an overflowing frame (raise --capacity) or when the frames run out first.
 ;; On the web (grad_test.inputs.ts), `check` writes the frame's readbacks to the directory
 ;; $GRAD_TEST_READBACKS names instead, and web-check/grad_test_check.cpp runs the same C++ checks
@@ -91,8 +100,10 @@
 
 ;; The finite differences' step h for a field of a splat projected as p by a camera of focal
 ;; length fx (the header says why)
-(define (stepOf [s : Splat] [p : Projected] [fx : float] [field : uint]) : float
-  (cond [(< field perturbMeanX) (max (* 1e-3 (abs (fieldValue s p field))) 1e-4)]
+(define (stepOf [s : Splat] [p : Projected] [fx : float] [field : uint] [dssim : bool]) : float
+  (cond [(< field perturbMeanX) (if dssim
+                                    (max (* 1e-2 (abs (fieldValue s p field))) 1e-3)
+                                    (max (* 1e-3 (abs (fieldValue s p field))) 1e-4))]
         [(< field perturbParameter) 0.005]
         [(< field (+ perturbParameter (uint 3))) (/ (* 0.005 p.depth) fx)]
         [else (max (* 1e-3 (abs (fieldValue s p field))) 1e-3)]))
@@ -102,6 +113,9 @@
 ;; 2 the log-scale, 3 the quaternion, then the SH bands, 4 the DC to 7 the third, up to shDegree's.
 (define (kindCount [parameters : bool] [shDegree : uint]) : uint
   (if parameters (+ (uint 5) (min shDegree (uint 3))) (uint 3)))
+;; The kinds a run must check, a bit each: with --dssim the colour's alone (the header says why)
+(define (requiredKinds [parameters : bool] [shDegree : uint] [dssim : bool]) : uint
+  (if dssim (uint 2) (- (shl (uint 1) (kindCount parameters shDegree)) (uint 1))))
 (define (parameterKindOffset [kind : uint]) : uint
   (cond [(= kind (uint 0)) (uint 0)] [(= kind (uint 1)) (uint 3)] [(= kind (uint 2)) (uint 4)]
         [(= kind (uint 3)) (uint 8)] [(= kind (uint 4)) (uint 12)] [(= kind (uint 5)) (uint 15)]
@@ -156,6 +170,7 @@
   (parameter backgroundG float)
   (parameter backgroundB float)
   (parameter l1 bool)
+  (parameter dssimWeight float)
   (parameter oracle bool)
   (parameter targetR float)
   (parameter targetG float)
@@ -270,6 +285,10 @@
                  #:worst (if (and ok (not small)) (max state.worst (/ error (max scale 1e-30))) state.worst)))])))
   (on (frame dt)
     (cond
+      ;; The D-SSIM term applies to the L1 loss only, the oracle has no D-SSIM, and its finite
+      ;; differences probe the projection's colour (the header says why)
+      [(and (> dssimWeight 0.0) (or (not l1) oracle parameters))
+       (begin (print! "grad_test: FAILED, --dssim needs --l1 and neither --oracle nor --parameters") (fail) state)]
       ;; The camera's pixels must lie in the targets (the Loss kernel reads black past them)
       [(or (> targetOffset targetPixels) (> (* width height) (- targetPixels targetOffset)))
        (begin
@@ -287,10 +306,10 @@
        (begin
          (print! "grad_test: " (count state.probes) " finite differences (" state.checkedProbes " checked, "
                  state.negligible " negligible; kinds checked " state.checkedKinds " of "
-                 (- (shl (uint 1) (kindCount parameters shDegree)) (uint 1)) "), " state.failures
+                 (requiredKinds parameters shDegree (> dssimWeight 0.0)) "), " state.failures
                  " mismatches, the largest relative difference " state.worst)
          (if (and (= state.failures 0)
-                  (= state.checkedKinds (- (shl (uint 1) (kindCount parameters shDegree)) (uint 1))))
+                  (= state.checkedKinds (requiredKinds parameters shDegree (> dssimWeight 0.0))))
              (quit!)
              (begin
                (print! "grad_test: FAILED, mismatches or a kind without a gradient that isn't negligible")
@@ -326,13 +345,16 @@
                                    [i (if (<= total samples) k (/ (* k total) samples))]
                                    [s (at visible (/ i fields))]
                                    [f (+ (kindField parameters kind) (remainder i fields))])
-                              (Probe s f (fieldGradient (at g s) (at pg s) f) (stepOf (at sp s) (at p s) fx f)
+                              (Probe s f (fieldGradient (at g s) (at pg s) f) (stepOf (at sp s) (at p s) fx f (> dssimWeight 0.0))
                                      (at largest kind)))
                             #:when (let* ([fields (kindFields parameters kind)]
                                           [total (* n fields)]
                                           [i (if (<= total samples) k (/ (* k total) samples))]
                                           [s (at visible (/ i fields))])
-                                     (probed (at p s) (+ (kindField parameters kind) (remainder i fields)))))])
+                                     (and (not= (bitand (requiredKinds parameters shDegree (> dssimWeight 0.0))
+                                                        (shl (uint 1) kind))
+                                                (uint 0))
+                                          (probed (at p s) (+ (kindField parameters kind) (remainder i fields))))))])
              (if checked
                  (begin
                    (print! "grad_test: the deepest tile's backward walks " state.deepestTile " entries")
@@ -390,7 +412,7 @@
        (densifyThreshold 0.0) (cloneScale 0.0) (pruneScale 0.0) (screenPrune 0) (maxScreenSize 0) (densifySeed 0)
        (positionLr 0.0) (dcLr 0.0) (restLr 0.0) (opacityLr 0.0) (scalingLr 0.0) (rotationLr 0.0)
        (shDegree shDegree) (near near) (far far) (maxGroups maxGroups) (inspect #t)
-       (loss (if l1 lossL1 lossL2)) (finiteDifferences finiteDifferences)
+       (loss (if l1 lossL1 lossL2)) (dssim (> dssimWeight 0.0)) (dssimWeight dssimWeight) (finiteDifferences finiteDifferences)
        (capacity capacity) (background (vec3 backgroundR backgroundG backgroundB))
        (targetPixels targetPixels) (targetOffset targetOffset)
        (probe (if (= state.phase 1) (+ (* state.index (uint 2)) state.side (uint 1)) (uint 0)))
@@ -427,6 +449,8 @@
   (option backgroundG "--background-g" "the background's green" #:default 0.0)
   (option backgroundB "--background-b" "the background's blue" #:default 0.0)
   (flag l1 "--l1" "the L1 loss (training's) instead of L2")
+  (option dssimWeight "--dssim" "with --l1, the D-SSIM term's weight lambda: (1 - lambda) L1 + lambda D-SSIM, training's (0: L1 alone; above, --finite-differences probes the colour alone)"
+          #:default 0.0 #:range (0.0 1.0))
   (flag oracle "--oracle" "compare with the closed-form oracle (S1's gradient variant, a constant target)")
   (option targetR "--target-r" "the oracle's constant target's red (before the targets' 8-bit rounding)" #:default 0.0)
   (option targetG "--target-g" "the oracle's constant target's green" #:default 0.0)

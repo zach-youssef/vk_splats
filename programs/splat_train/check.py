@@ -2,7 +2,7 @@
 """check.py <out dir> <splat_render> --min-psnr <dB> --min-ratio <r> --min-skipped <n> [--grow]: checks
 a test.sh splat_train run, from its log (<out dir>/train.log) and its PLY (<out dir>/trained.ply).
 
-- the held-out PSNR splat_train reports is at least --min-psnr, and the first epoch's mean L1
+- the held-out PSNR splat_train reports is at least --min-psnr, and the first epoch's mean training loss
   is at least --min-ratio times the last's;
 - at least --min-skipped iterations were skipped for overflowing (test.sh starts the capacity
   small to cover the skip);
@@ -58,7 +58,7 @@ def main():
 
     psnr, views = number(r"held-out PSNR (\S+) dB over (\d+) views", log)
     first, last, ratio = number(r"first epoch (\S+), last epoch (\S+), ratio (\S+)", log)
-    print(f"check: held-out PSNR {float(psnr):.2f} dB over {views} views; L1 {float(first):.5f} -> "
+    print(f"check: held-out PSNR {float(psnr):.2f} dB over {views} views; loss {float(first):.5f} -> "
           f"{float(last):.5f} (ratio {float(ratio):.2f})")
     if not float(psnr) >= args.min_psnr:
         errors.append(f"the held-out PSNR {psnr} dB is below {args.min_psnr}")

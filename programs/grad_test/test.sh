@@ -10,6 +10,8 @@
 #     opacity logit, the log-scale, the quaternion and every SH band of degree 3, the DC included),
 #     each splat perturbed and projected again: on S2's cameras 0 and 1, and a subset of S3's
 #     camera 0 (--samples 24 of each kind: fewer can leave the third band's all negligible);
+#   - by finite differences of training's loss, 0.8 L1 + 0.2 D-SSIM (--l1 --dssim 0.2), through
+#     the projection's colour: on S2's cameras 0 and 1;
 #   - S2's camera 0 with the L1 loss and the 1D dispatches capped at three workgroups (the
 #     grid-stride loops go round), twice, with the hashes compared (deterministic across runs, not
 #     only across frames);
@@ -82,6 +84,9 @@ for camera in 0 24; do
 done
 for camera in 0 1; do
     run "$out/s2" $camera "s2-camera-$camera-parameters" 6000 --finite-differences --parameters > /dev/null
+done
+for camera in 0 1; do
+    run "$out/s2" $camera "s2-camera-$camera-dssim" 2000 --finite-differences --l1 --dssim 0.2 > /dev/null
 done
 run "$out/s3" 0 s3-camera-0-parameters 8000 --finite-differences --parameters --samples 24 \
     --capacity 1000000 > /dev/null

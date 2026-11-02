@@ -323,7 +323,7 @@
        (maxWidth width) (maxHeight height) (shDegree shDegree) (near near) (far far) (maxGroups groupLimit)
        (inspect #t) (finiteDifferences #f) (capacity capacity)
        (background (vec3 backgroundR backgroundG backgroundB)) (targetPixels targetPixels)
-       (targetOffset targetOffset) (loss lossL2)
+       (targetOffset targetOffset) (loss lossL2) (dssim #f) (dssimWeight 0.0)
        (probe 0) (perturbSplat 0) (perturbField perturbNone) (perturbDelta 0.0)
        (train #t) (historySize 1) (historySlot 0)
        (bias1 (- 1.0 (pow 0.9 (float (max state.iteration (uint 1))))))

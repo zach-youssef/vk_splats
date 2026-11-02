@@ -17,7 +17,8 @@
 ;;      views (cameras without an image are neither);
 ;;   1. training: iteration t (1-based) renders a training camera, popped at random from a stack
 ;;      of them refilled when empty (the reference's order; the pick is pcgHash of the seed and
-;;      t, the same on every platform), takes its L1 loss's gradients and steps Adam with the
+;;      t, the same on every platform), takes its loss's gradients ((1 - --lambda-dssim) L1 +
+;;      --lambda-dssim D-SSIM, Sec. 7's, lambda 0.2; 0 is L1 alone) and steps Adam with the
 ;;      reference's learning rates (the position's decays log-linearly from --position-lr to
 ;;      --position-lr-final over --position-lr-steps, times --extent) at SH degree
 ;;      min(--sh-degree, t / --sh-interval). Record writes its loss into history[t - 1].
@@ -119,6 +120,7 @@
   (parameter far float)
   (parameter initialEntries uint)
   (parameter background float)
+  (parameter lambdaDssim float)
   (parameter iterations uint)
   (parameter seed uint)
   (parameter extent float)
@@ -222,7 +224,7 @@
                        (fail) state)]
                [(not maxScreenSizeGiven)
                 (begin (print! "splat_train: FAILED, --max-screen-size is required: 20 prunes as the reference "
-                               "means to, 0 as it does (paper-conformance.md, departure 13)")
+                               "means to, 0 as it does (paper-conformance.md, departure 12)")
                        (fail) state)]
                [(not batched)
                 (begin (print! "splat_train: FAILED, the images span several batches (images_<k>.bin); training reads one")
@@ -281,8 +283,11 @@
                               (and ok (finiteSplat (at trained i))))])
          (for ([v (range (uint 0) (count state.test))])
            (print! "splat_train: test view " (at state.test v) " PSNR " (psnr (at h (+ iterations v))) " dB"))
-         (print! "splat_train: training loss (L1) first epoch " first ", last epoch " last ", ratio "
-                 (/ first (max last 1e-30)))
+         (if (> lambdaDssim 0.0)
+             (print! "splat_train: training loss ((1 - " lambdaDssim ") L1 + " lambdaDssim " D-SSIM) first epoch " first ", last epoch " last ", ratio "
+                     (/ first (max last 1e-30)))
+             (print! "splat_train: training loss (L1) first epoch " first ", last epoch " last ", ratio "
+                     (/ first (max last 1e-30))))
          (print! "splat_train: held-out PSNR " meanPsnr " dB over " (count state.test) " views")
          (print! "splat_train: " skipped " iterations skipped (overflowed), the most tile entries a frame needed "
                  state.mostEntries)
@@ -312,6 +317,7 @@
        (near near) (far far) (maxGroups groupLimit) (inspect #f) (finiteDifferences #f)
        (capacity state.capacity) (background (vec3 background))
        (loss (if (= state.phase phaseTraining) lossL1 lossEval))
+       (dssim (> lambdaDssim 0.0)) (dssimWeight lambdaDssim)
        (probe 0) (perturbSplat 0) (perturbField perturbNone) (perturbDelta 0.0)
        (train #t) (historySize (+ iterations cameraCount))
        (historySlot (if (= state.phase phaseTraining) (- state.iteration (uint 1)) (+ iterations state.view)))
@@ -378,6 +384,8 @@
   (option far "--far" "the depth keys' far depth" #:default 1000.0)
   (option initialEntries "--initial-entries" "the tile entries' first capacity" #:default 1048576
           #:range (1 3145728))
+  (option lambdaDssim "--lambda-dssim" "the D-SSIM term's weight in the training loss (the paper's 0.2; 0, L1 alone)"
+          #:default 0.2 #:range (0.0 1.0))
   (option background "--background" "the background's grey level (0 black, the reference's default)"
           #:default 0.0 #:range (0.0 1.0))
   (option iterations "--iterations" "the training iterations (one a frame)" #:default 30000

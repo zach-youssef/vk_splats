@@ -200,6 +200,15 @@ differences:
     `--samples 24` and `--multi-batch` (fails unless a tile's backward walks more than one batch,
     from `backwardRanges`). With `--parameters`: S2's two cameras (SH degree 3, so every band),
     and S3's camera 0 with `--samples 24` (with 8, every probe of the third band was negligible).
+    With `--l1 --dssim 0.2` (training's 0.8·L1 + 0.2·D-SSIM): S2's two cameras.
+  - With `--dssim`, only the colour is probed, with h = 1e-2 of the value (at least 1e-3). A
+    pixel's D-SSIM depends on its 11×11 window, so leaving out a flipped pixel doesn't remove its
+    colour's jump from its neighbours' losses: opacity and mean steps were up to 15% off on S2
+    (one of opposite sign), and leaving out the window around each flip dropped too much of the
+    smooth change instead. A colour step flips nothing, and the opacity and mean share the
+    backward pass from the per-pixel gradient on, which the L1 and L2 runs check. At 1e-3 the
+    SSIM's float noise (its variances are differences of near-equal sums) left colours a few %
+    off; at 1e-2 they agree within 1.1%. `--dssim` refuses `--parameters`, `--oracle` and the L2 loss.
 - `--target-pixels` (the pixels the targets file holds; `scenes.py` passes it) is required in
   effect: a camera whose pixels at `--target-offset` don't fit fails up front, which test.sh
   checks with a too-small value.

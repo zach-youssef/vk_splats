@@ -97,7 +97,13 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
 - Evaluation: PSNR on the render clamped to [0, 1], averaged over the test views.
 - `percent_dense` 0.01 (the clone/split size threshold, relative to the scene extent).
 - Pruning below opacity 0.005, and above 20 px on screen after the first opacity reset (as the
-  code is written: it never fires, [departure 13](#departures)).
+  code is written: it never fires, [departure 12](#departures)).
+- The loss: (1 − λ)·L1 + λ·D-SSIM with λ = 0.2 (splat_train's `--lambda-dssim`; 0 trains on L1
+  alone), D-SSIM = 1 − SSIM as `loss_utils.py`'s `ssim` computes it: per channel, an 11×11
+  Gaussian window with σ 1.5, C1 = 0.01², C2 = 0.03², on the rasterizer's output before any
+  clamp, and `conv2d` with padding 5, so the window is cut off at the edges and the zeros count
+  toward the means. The gradient is exact for that function rather than autograd's, checked
+  against finite differences.
 
 ## Departures
 
@@ -140,9 +146,7 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     fixed rather than the ratio times z: twice the exact derivative of J's third column. Only
     splats far outside the view (past 1.3·tan(fov/2)) are affected.
 
-11. **L1 loss only, for now**: splat_train trains on L1 alone until D-SSIM lands (T15); the
-    paper's loss adds 0.2 · D-SSIM.
-12. **Skipped iterations**: a frame whose tile entries overflow the current capacity loses
+11. **Skipped iterations**: a frame whose tile entries overflow the current capacity loses
     splats, so its gradients are incomplete; Adam skips it (the iteration is counted and reported,
     and the capacity grows for the next). The reference allocates per frame and never truncates.
     Adam's step count still advances on a skipped frame, so its bias corrections run one step
@@ -150,7 +154,7 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     densifying frame doesn't step Adam and isn't counted, as in the reference (its step finds no
     gradients on the new tensors, so it does nothing): the count is the iterations less the
     densifications.
-13. **Screen-space prune, a choice** (`maxScreenSize`): after the first opacity reset, a splat
+12. **Screen-space prune, a choice** (`maxScreenSize`): after the first opacity reset, a splat
     whose largest radius since the last densification passed `maxScreenSize` pixels is pruned, as
     the reference code means to with its `max_screen_size` of 20; 0 prunes none. The reference's
     never fires: `densification_postfix` zeroes `max_radii2D` before `prune` reads it, so its
@@ -159,17 +163,17 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     `--max-screen-size` is required). A split's halves aren't checked by radius (their radii
     aren't known; the reference's world-space check at the halves' scale applies to them, as it
     does to every splat after the first reset, with either choice).
-14. **Densification order**: the splats are compacted in place by a scan (survivors in order, a
+13. **Densification order**: the splats are compacted in place by a scan (survivors in order, a
     split's first half in its parent's place), then the additions (clones' copies and splits'
     second halves) in their parents' order. The reference appends the clones, then the halves
     after it removes the split parents, and prunes last; the set of splats is the same.
-15. **Capacity overflow**: an addition past `--max-splats` is dropped and counted: the clone isn't
+14. **Capacity overflow**: an addition past `--max-splats` is dropped and counted: the clone isn't
     made, the split isn't done (the splat is kept, with its Adam moments). The reference has no
     cap.
-16. **Split sampling**: the halves' offsets are standard normals from a PCG hash of the
+15. **Split sampling**: the halves' offsets are standard normals from a PCG hash of the
     densification's seed, the splat's index and the half (Box-Muller), not torch's generator, so
     runs are deterministic on every backend but don't match the reference's samples.
-17. **Opacity reset and Adam**: a resetting frame steps Adam, opacity included, and then resets
+16. **Opacity reset and Adam**: a resetting frame steps Adam, opacity included, and then resets
     the opacity (and zeroes its moments). The reference resets first, and its step then skips
     the opacity (the new tensor has no gradient) and leaves the opacity's step count behind the
     others'. A reset on a densifying frame steps nothing in either, and with the default schedule
@@ -182,7 +186,7 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
 ## How correctness is checked
 
 Finite differences and re-fitting check the code against itself, so they can't catch a forward
-pass that is wrong but consistent. Four checks together cover it:
+pass that is wrong but consistent. Five checks together cover it:
 
 - closed-form single-splat oracles for renders and gradients (`tests/oracle/`);
 - reprojecting every COLMAP point onto its recorded observations (the camera conventions): the
@@ -193,5 +197,10 @@ pass that is wrong but consistent. Four checks together cover it:
   |analytic − FD| ≤ 2e-2·max(|analytic|, |FD|) + 1e-5 (plus, for the quaternion, 2e-3 of its
   largest gradient: the float noise of summing the pixels' changes), skipping parameters with
   negligible gradient, for the projection's fields and every parameter group and SH band;
+- the SSIM kernels (`programs/ssim_test`): the SSIM against an independent float64 numpy SSIM on
+  an identical, a constant and a random non-square pair, every pixel's on the constant pair
+  against the closed form, zero gradients on the identical pair and the random pair's gradients
+  against GPU finite differences; then training's loss, 0.8·L1 + 0.2·D-SSIM, through the
+  backward pass by GPU finite differences of the projection's colour (grad_test's `--dssim`);
 - re-fitting a synthetic scene of known Gaussians, then a PSNR report (no target) on the cs5330
   scene.

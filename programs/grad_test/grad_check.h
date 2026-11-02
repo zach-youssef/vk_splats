@@ -148,7 +148,7 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
     hash = fnv1a(hash, &loss, sizeof loss);
     char hashText[17];
     std::snprintf(hashText, sizeof hashText, "%016llx", static_cast<unsigned long long>(hash));
-    std::cout << "grad_test: camera " << cameraIndex << ": " << splats.size() << " splats, " << (l1 ? "L1" : "L2")
+    std::cout << "grad_test: camera " << cameraIndex << ": " << splats.size() << " splats, " << (l1 ? "L1 (+ D-SSIM under --dssim)" : "L2")
               << " loss " << loss << std::endl;
 
     // The kernel against the CPU's preprocessBackward, group by group

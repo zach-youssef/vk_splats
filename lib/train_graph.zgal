@@ -2,8 +2,9 @@
 ;; camera per frame: SplatGraph's forward pass (lib/render_graph.zgal's stages 1 to 5, the same
 ;; kernels), then
 ;;   6. the loss against the camera's target image: each pixel's loss and its gradient dL/dI with
-;;      respect to the pixel's colour I = C + T bg (Loss: the L2 test loss or training's L1), and
-;;      their sum;
+;;      respect to the pixel's colour I = C + T bg (Loss: the L2 test loss or training's L1 and,
+;;      with dssim, lib/ssim.zgal's SSIM kernels adding the D-SSIM term, Sec. 7's
+;;      (1 - lambda) L1 + lambda D-SSIM), and their sum;
 ;;   7. the backward rasterize: each tile's entries back to front (BackwardRasterize), from the
 ;;      last any of its pixels blended (TileLasts), giving each entry's gradients with respect to
 ;;      its splat's projection (the 2D mean, the conic, the activated opacity and the colour);
@@ -23,7 +24,7 @@
 
 (import "render_graph.zgal")
 (import "splat_backward.zgal")  ; ProjectedGradient, preprocessBackward
-(import "ssim.zgal")            ; unpackRgb
+(import "ssim.zgal")            ; the D-SSIM term's kernels, unpackRgb
 (import random)                 ; pcgHash: the split's samples
 
 ;; ---------------------------------------------------------------------------------------------
@@ -53,7 +54,9 @@
 (define backwardBatch (uint 128))
 
 ;; The loss input's values
-(define lossL1 (uint 0))  ; mean |I - t| over the image's channels (Sec. 7's L1 term)
+;; mean |I - t| over the image's channels (Sec. 7's L1 term), times 1 - dssimWeight with dssim,
+;; plus dssimWeight D-SSIM
+(define lossL1 (uint 0))
 (define lossL2 (uint 1))  ; sum (I - t)^2 over them (smooth: the gradient tests')
 ;; The mean (clamp(I, 0, 1) - t)^2 over the channels: the evaluation's MSE, for the PSNR (the
 ;; reference clamps the render to [0, 1] before its PSNR); its dL/dI is 0, so nothing trains on it
@@ -78,9 +81,10 @@
 ;; ---------------------------------------------------------------------------------------------
 ;; 6. Each pixel's loss and dL/dI, against its target (RGBA8, the red in the low byte, at
 ;; targetOffset + the pixel's index: docs/data-format.md's images): with lossL2, (I - t)^2 summed
-;; over the channels and 2 (I - t); with lossL1, |I - t| / (3 pixels) and sign(I - t) / (3 pixels),
-;; so the sum is the mean; with lossEval, (clamp(I, 0, 1) - t)^2 summed over the channels / (3
-;; pixels) (the MSE) and 0. I is the rasterizer's C + T bg, unclamped. A pixel past the targets'
+;; over the channels and 2 (I - t); with lossL1, l1Weight |I - t| / (3 pixels) and l1Weight
+;; sign(I - t) / (3 pixels), so the sum is the mean times l1Weight (1 - lambda, the D-SSIM term's
+;; kernels in lib/ssim.zgal adding lambda D-SSIM after it; 1 without them); with lossEval,
+;; (clamp(I, 0, 1) - t)^2 summed over the channels / (3 pixels) (the MSE) and 0. I is the rasterizer's C + T bg, unclamped. A pixel past the targets'
 ;; targetPixels reads black instead of past the buffer: the app must check the camera's pixels fit
 ;; (grad_test does, up front); this only keeps a wrong offset from reading out of bounds.
 (compute-material Loss
@@ -90,7 +94,7 @@
    (targets (buffer-array uint read))
    (pixelGrads (buffer-array vec4 write))   ; dL/dI in .rgb
    (pixelLosses (buffer-array float write)))
-  (push (pixels uint) (targetOffset uint) (targetPixels uint) (loss uint))
+  (push (pixels uint) (targetOffset uint) (targetPixels uint) (loss uint) (l1Weight float))
   (compute
    (let* ([scale (/ 1.0 (* 3.0 (float pixels)))])
      (for ([i (range globalInvocationId.x pixels (* entryGroupSize workgroupCount.x))])
@@ -105,8 +109,8 @@
              (write! (at pixelGrads i) (vec4 0.0))
              (write! (at pixelLosses i) (* (dot e e) scale))))
          (when (= loss lossL1)
-           (write! (at pixelGrads i) (vec4 (* (sign r) scale) 0.0))
-           (write! (at pixelLosses i) (* (+ (abs r.x) (abs r.y) (abs r.z)) scale))))))))
+           (write! (at pixelGrads i) (vec4 (* (sign r) (* l1Weight scale)) 0.0))
+           (write! (at pixelLosses i) (* (+ (abs r.x) (abs r.y) (abs r.z)) (* l1Weight scale)))))))))
 
 ;; 7a. Each tile's [start, last, end): its range, and the entry after the last one any of its pixels
 ;; blended (the largest of its pixels' lastEntries, at least the start), three uints a tile in
@@ -840,6 +844,10 @@
   (input targetOffset (per-frame uint))
   ;; lossL1, lossL2 or lossEval (per frame: a trainer scores its held-out views with lossEval)
   (input loss (per-frame uint))
+  ;; Whether lossL1 frames' loss is (1 - dssimWeight) L1 + dssimWeight D-SSIM (Sec. 7, lambda 0.2;
+  ;; lib/ssim.zgal's kernels, with 7 vec4s of scratch a pixel), and lambda, in [0, 1]
+  (parameter dssim bool)
+  (input dssimWeight (per-frame float))
   ;; Whether the graph perturbs a projection (Perturb) and sums the loss's change (LossDelta) for
   ;; finite differences: probe 0 is unperturbed, any other perturbs field perturbField
   ;; (perturbOpacity and so on, or perturbParameter plus a parameter's offset) of splat
@@ -904,6 +912,16 @@
   (buffer pixelGrads vec4 maxPixels #:frames per-frame)
   (buffer pixelLosses float maxPixels #:frames per-frame)
   (buffer losses float 3 #:frames per-frame)  ; lossTotal, lossProbe, lossDelta
+  ;; The D-SSIM term's scratch: shared, as the graph orders a frame's use after the previous
+  ;; frame's conflicting use (FrameMode::Shared, GraphTypes.h), and in training the frames are
+  ;; serial anyway, so per-frame copies would only cost memory; dead after the loss
+  (buffer ssimRowsR vec4 maxPixels #:frames shared #:when dssim)
+  (buffer ssimRowsG vec4 maxPixels #:frames shared #:when dssim)
+  (buffer ssimRowsB vec4 maxPixels #:frames shared #:when dssim)
+  (buffer ssimRowsCross vec4 maxPixels #:frames shared #:when dssim)
+  (buffer ssimPartialsR vec4 maxPixels #:frames shared #:when dssim)
+  (buffer ssimPartialsG vec4 maxPixels #:frames shared #:when dssim)
+  (buffer ssimPartialsB vec4 maxPixels #:frames shared #:when dssim)
   (buffer entryGradients float (* (min capacity 3145728) 9) #:frames per-frame)  ; gradientStride
   (buffer entryPositions uint (min capacity 3145728) #:frames per-frame)
   (buffer splatGradients ProjectedGradient maxSplats #:frames per-frame)
@@ -959,8 +977,29 @@
             #:push ((width width) (height height) (background background))
             #:invocations ((* (/ (+ width 15) 16) 16) (* (/ (+ height 15) 16) 16)))  ; 16: tileSize, a workgroup a tile
   (material scoring Loss colours targets pixelGrads pixelLosses
-            #:push ((pixels (* width height)) (targetOffset targetOffset) (targetPixels targetPixels) (loss loss))
+            #:push ((pixels (* width height)) (targetOffset targetOffset) (targetPixels targetPixels) (loss loss)
+                    (l1Weight (if dssim (- 1.0 dssimWeight) 1.0)))
             #:invocations ((min (* width height) (* (max maxGroups 1) 256))))  ; 256: its workgroup size
+  ;; The D-SSIM kernels' weight: lambda in lossL1 frames (0: lossL1), 0 (idle) in the others
+  (material ssimRowing SsimRows colours targets (rowsR ssimRowsR) (rowsG ssimRowsG) (rowsB ssimRowsB)
+            (rowsCross ssimRowsCross)
+            #:push ((width width) (height height) (targetOffset targetOffset) (targetPixels targetPixels)
+                    (weight (if (= loss 0) dssimWeight 0.0)))
+            #:invocations ((min (* width height) (* (max maxGroups 1) 256))) #:when dssim)
+  (material ssimColumning SsimColumns (rowsR ssimRowsR) (rowsG ssimRowsG) (rowsB ssimRowsB)
+            (rowsCross ssimRowsCross) (partialsR ssimPartialsR) (partialsG ssimPartialsG)
+            (partialsB ssimPartialsB) pixelLosses
+            #:push ((width width) (height height) (weight (if (= loss 0) dssimWeight 0.0)))
+            #:invocations ((min (* width height) (* (max maxGroups 1) 256))) #:when dssim)
+  (material ssimGradRowing SsimGradRows (partialsR ssimPartialsR) (partialsG ssimPartialsG)
+            (partialsB ssimPartialsB) (rowsR ssimRowsR) (rowsG ssimRowsG) (rowsB ssimRowsB)
+            #:push ((width width) (height height) (weight (if (= loss 0) dssimWeight 0.0)))
+            #:invocations ((min (* width height) (* (max maxGroups 1) 256))) #:when dssim)
+  (material ssimGradColumning SsimGradColumns (rowsR ssimRowsR) (rowsG ssimRowsG) (rowsB ssimRowsB)
+            colours targets pixelGrads
+            #:push ((width width) (height height) (targetOffset targetOffset) (targetPixels targetPixels)
+                    (weight (if (= loss 0) dssimWeight 0.0)))
+            #:invocations ((min (* width height) (* (max maxGroups 1) 256))) #:when dssim)
   (material differencing LossDelta projected pixelLosses lastEntries plusLosses plusLasts plusProjected
             lossDeltas losses
             #:push ((pixels (* width height)) (width width) (probe probe) (splatCount splatCount) (splat perturbSplat))
@@ -1003,6 +1042,10 @@
   (dispatch rasterize rasterizing)
   ;; The loss
   (dispatch score scoring)
+  (dispatch ssimRows ssimRowing #:when dssim)
+  (dispatch ssimColumns ssimColumning #:when dssim)
+  (dispatch ssimGradRows ssimGradRowing #:when dssim)
+  (dispatch ssimGradColumns ssimGradColumning #:when dssim)
   (reduce totalLoss pixelLosses (at losses 0) #:op add #:count (* width height))  ; lossTotal
   (dispatch difference differencing #:when finiteDifferences)
   (reduce totalDelta lossDeltas (at losses 2) #:op add #:count (* width height) #:when finiteDifferences)

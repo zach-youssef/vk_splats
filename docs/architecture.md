@@ -301,6 +301,19 @@ input).
    term); with `lossEval` (a held-out view's score), (clamp(I, 0, 1) − t)² / 3WH and no gradient,
    so the image's loss is its MSE on the clamped render (PSNR's). Per-pixel values go to
    `pixelLosses` and `pixelGrads`, and a `reduce` sums the loss into `losses[0]`.
+   With the `dssim` parameter, the `lossL1` frames' loss is the paper's (1 − λ)·L1 + λ·D-SSIM
+   (λ the per-frame `dssimWeight`, splat_train's `--lambda-dssim`, 0.2): Loss scales its L1 term
+   by 1 − λ (a push constant), and `lib/ssim.zgal`'s four kernels (256-wide, grid stride) add
+   λ(1 − S) / 3WH a pixel and channel to `pixelLosses` and its gradient to `pixelGrads`, before
+   the reduce. S is the reference's SSIM (per channel, the 11×11 Gaussian window with σ 1.5,
+   zero-padded at the edges, C1 = 0.01², C2 = 0.03², on the unclamped render). The window is
+   separable, so `SsimRows` blurs x, y, x², y² and xy along the rows and `SsimColumns` along the
+   columns, giving S and the loss's partial derivatives with respect to each pixel's blurred
+   mean, mean square and product; `SsimGradRows` and `SsimGradColumns` blur those partials back
+   (the window is symmetric) into dL/dx = G∗∂μ + 2x·G∗∂(x²) + y·G∗∂(xy). Other frames (`lossL2`,
+   `lossEval`) pass λ = 0 to them, which makes them return at once. Their scratch (7 vec4s a
+   pixel at `maxWidth` × `maxHeight`, 112 bytes) is `#:frames shared` (training's frames are
+   serial: each steps the splats the next renders), and without `dssim` none of it is allocated.
 7. `TileLasts` (64-wide, grid stride over the tiles) writes each tile's start, last and end into
    `backwardRanges` (3 uints a tile), the last being the largest of its pixels' `lastEntries`.
    `BackwardRasterize`: one 16×16 workgroup per tile, as Rasterize. Each pixel starts at its
@@ -364,7 +377,7 @@ input).
       `screenPrune` (the app's: after the first opacity reset), its largest scale past
       `pruneScale` (0.1 × extent) or its largest radius past `maxScreenSize` px (the reference's
       20, which its code never applies; 0 for none: [departure
-      13](paper-conformance.md#departures)); otherwise, when its mean
+      12](paper-conformance.md#departures)); otherwise, when its mean
       gradient (`densifyGradient`: the norm sum over its frames, 0 for none) is at least
       `densifyThreshold`, **clone** when its largest scale is at most `cloneScale`
       (`percent_dense` × extent), else **split**; else **keep**. A split's halves are checked
@@ -447,6 +460,10 @@ are read too, and `history` and the trained splats when the app enables `readHis
   S3's camera 0. The S2 L1 run with `--max-groups 3` (so the grid-stride loops go round) runs
   twice, and the hashes are compared. Every run checks the gradients are finite; the others also
   check the next frames' gradients are the same bit for bit.
+  With `--l1 --dssim 0.2`, the finite differences of training's 0.8·L1 + 0.2·D-SSIM on S2's
+  cameras, probing the colour alone (the D-SSIM window spreads a flipped pixel's jump to its
+  neighbours; [building-and-testing.md](building-and-testing.md#gradient-checks) says why).
+  densify_test builds `TrainGraph` without `dssim`.
 - **SSIM tests** (`programs/ssim_test`): the four SSIM kernels alone (λ = 1) on pairs from its
   `make_pair.py`, against the float64 numpy SSIM: an image against itself (32×32, within 1e-5;
   SSIM 1 and every gradient 0), constant images (32×32, within 2e-4; every pixel whose window lies inside the image has the
@@ -474,7 +491,7 @@ build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) --max-s
 
 `--max-screen-size` is required too: the screen-space prune's radius in pixels after the first
 reset, 20 as the reference's code means to or 0 (none) as it does, since it clears the radii
-before reading them ([departure 13](paper-conformance.md#departures)). A run without it fails
+before reading them ([departure 12](paper-conformance.md#departures)). A run without it fails
 while loading.
 
 `--max-splats` is required (it has no default, since it trades memory for how far the scene may
@@ -491,7 +508,9 @@ Its phases, in one graph:
    training and test views (a camera without an image is neither).
 2. **Training**: iteration t (1-based) renders a training camera popped from a stack of them,
    refilled when empty (the reference's order; the pick is `pcgHash(pcgHash(seed) + t)` modulo the
-   stack's size, so every platform trains the same order), takes the L1 loss's gradients, and
+   stack's size, so every platform trains the same order), takes the gradients of the loss
+   (1 − λ)·L1 + λ·D-SSIM (`--lambda-dssim` λ, 0.2; 0 trains on L1 alone and skips the SSIM
+   kernels), and
    steps Adam (bias corrections 1 − 0.9ᵗ and 1 − 0.999ᵗ, computed by the app) at SH degree
    min(`--sh-degree`, t / `--sh-interval`). The position's learning rate decays log-linearly from
    `--position-lr` to `--position-lr-final` over `--position-lr-steps`, times `--extent`; the
@@ -514,7 +533,7 @@ Its phases, in one graph:
    the final SH degree; backward and Adam off) into `history[iterations + k]`.
 4. **Reading**: the history and the trained splats are read back (a readback event sees only the
    newest copy, so the losses accumulate on the GPU and are read once). The app prints each test
-   view's PSNR (10 log₁₀(1/MSE)) and their mean, the first and last epochs' mean training L1 (an
+   view's PSNR (10 log₁₀(1/MSE)) and their mean, the first and last epochs' mean training loss (an
    epoch is as many iterations as there are training views) and their ratio, the iterations
    skipped, and the splats in use (`splatCounts[splatActive]`, once the counts read back show
    every densification), the densifications and the additions dropped for `--max-splats`; then
@@ -534,7 +553,7 @@ more entries than any training view grew the capacity to fails the run after its
 the `--initial-entries` to rerun with (the most a frame was seen to need, grown). Retrying the
 view once the growth arrives would need the evaluation to wait on the counts' readback per view; a
 follow-up if real scenes hit it. The splats train in place in the splat buffer (the file isn't
-written). D-SSIM (T15) isn't in yet: the loss is L1 alone.
+written).
 
 Its `test.sh` gives the committed S3 scene a ground truth with splat_render
 (`make_synthetic.py render-gt --sh-degree 0`, the same build: native or web) and trains twice on
@@ -551,17 +570,20 @@ splat_train reported, which checks the readback, the PSNR, the count and the exp
   `--reset-interval 900` (a reset at 900, size prunes after it) and `--max-splats 4096`,
   which densification fills by iteration 800, so later additions are dropped (the overflow
   path). It requires 32 dB (35.9 on MoltenVK, from 20 at the start), a loss falling 8
-  times (16.3) and at least one skipped iteration (9: covering Adam's skip, Record's −1 and the
+  times (34.0) and at least one skipped iteration (8: covering Adam's skip, Record's −1 and the
   report).
 - **sparse**: 200 splats initialized from a tenth of the positions as the converter initializes
   COLMAP points (`make_synthetic.py sparse`), trained for 1800 iterations with `--max-splats
-  12288` and SH degree 0. Densification must grow the count (`check.py --grow`: to 5384, none
-  dropped) and the held-out PSNR reach 28 dB (32.9 on MoltenVK).
+  12288` and SH degree 0. Densification must grow the count (`check.py --grow`: to 11470 of the 12288
+  on lavapipe) and the held-out PSNR reach 28 dB (37.0 on MoltenVK).
+
+Both train on (1 − 0.2)·L1 + 0.2·D-SSIM; with `--lambda-dssim 0` (L1 alone) they score 35.9 and
+32.9 dB, the loss falling 16.3 and 8.8 times.
 
 Each run prints its held-out PSNR and splat count (and check.py its checks), so CI's log shows
 the margins on lavapipe.
 
-The test takes about 13 s on the M4 with validation (9 s on the web). From perturb's start training converges slowly: 300 iterations reach about 26 dB
+The test takes about 18 s on the M4 with validation (14 s with L1 alone). From perturb's start training converges slowly: 300 iterations reach about 26 dB
 (29 with a 10× `--feature-lr`: Adam moves a parameter about its learning rate a step, and perturb's
 random colours are up to 3.5 off), and a degree-3 ground truth about 29 dB after 5000 (22 views don't pin the random view-dependent
 colours down for the held-out ones), hence the degree-0 target and 2000 iterations.

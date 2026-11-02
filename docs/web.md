@@ -67,7 +67,7 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 - **splat_render**: S3 cameras 0 and 24 captured and compared with the same goldens at the same
   PSNR (45 dB). It has no externs, so unlike render_test it needs no `.inputs.ts`.
 - **splat_train**: the native test, its ground truth rendered by splat_render's web build and its
-  re-renders too, at the same thresholds (perturb 35.9 dB and sparse 32.9 dB natively). Its `.inputs.ts` writes
+  re-renders too, at the same thresholds (perturb 35.9 dB and sparse 37.0 dB natively, 35.9 and 36.2 on the web). Its `.inputs.ts` writes
   the PLY with Node's `fs`, so the web build's export works only under Node.
 - **render_test**: every run of the native test (S1 with the oracle, the off-centre variant, S2
   twice with the hashes compared, S3). Its checks are C++ (`render_check.h` with
