@@ -28,8 +28,9 @@ The planned layout, filled in as the M1 and M2 tasks land.
     backward rasterize, giving each splat's gradients with respect to its projection
     ([below](#train-graph)); it imports `render_graph.zgal`.
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
-  programs' inputs, the synthetic scene generator, and `scene_args.py`, which prints
-  splat_render's arguments for a scene and a camera.
+  programs' inputs, the synthetic scene generator (which also renders a scene's ground truth with
+  splat_render), and `scene_args.py`, which prints splat_render's arguments for a scene and a
+  camera, or splat_train's (`--train`) for a scene with images.
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`), Python tests and test
   data.
 - `colmap/`: the one real scene: `colmap_exports3`, a COLMAP text export (one SIMPLE_RADIAL

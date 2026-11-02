@@ -5,6 +5,7 @@ import filecmp
 import json
 import math
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -348,3 +349,70 @@ def test_degrading_refuses_unsafe_output_dirs(small_s3, tmp_path, command):
     (tmp_path / "empty").mkdir()
     ms.main([command, str(small_s3), str(tmp_path / "empty")])
     assert read_scene(tmp_path / "empty")[0]["source"]["from"]["scene"] == "s3"
+
+
+# --- Ground truth -----------------------------------------------------------------------------------
+
+FAKE_RENDERER = """\
+import sys
+import numpy as np
+from PIL import Image
+args = sys.argv[1:]
+value = lambda name: args[args.index(name) + 1]
+log = value("--capture") + ".args"
+open(log, "w").write(" ".join(args))
+width, height, camera = int(value("--width")), int(value("--height")), int(value("--camera"))
+image = np.zeros((height, width, 3), np.uint8)
+image[..., 0] = camera
+image[..., 1] = np.arange(width)[None, :] % 256
+image[..., 2] = (255 if "--validation" in args else 7) - int(value("--sh-degree"))
+Image.fromarray(image).save(value("--capture"))
+"""
+
+
+def fake_renderer(tmp_path, body=FAKE_RENDERER):
+    """A renderer that captures camera i as a PNG of the camera's size: red i, green x, blue 255
+    (7 without --validation) minus the SH degree."""
+    path = tmp_path / "fake_renderer"
+    path.write_text(f"#!{sys.executable}\n" + body)
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_render_gt(tmp_path):
+    out = tmp_path / "gt"
+    ms.main(["s3", str(out), "--count", "40"])
+    before, _, before_cameras = read_scene(out)
+    ms.main(["render-gt", str(out), fake_renderer(tmp_path), "--validation", "--background", "0.25",
+             "--sh-degree", "1"])
+    manifest, _, cameras = read_scene(out)
+    assert manifest["files"]["images"] == ["images_0.bin"]
+    assert manifest["source"]["groundTruth"] == {"generator": "make_synthetic.py", "renderer": "splat_render",
+                                                 "background": 0.25, "shDegree": 1}
+    assert manifest["test"] == before["test"] and manifest["extent"] == before["extent"]
+    data = np.frombuffer((out / "images_0.bin").read_bytes(), "<u4")
+    for i, (entry, camera) in enumerate(zip(manifest["cameras"], cameras)):
+        w, h = entry["width"], entry["height"]
+        assert camera["imageBatch"] == entry["imageBatch"] == 0
+        assert camera["pixelOffset"] == entry["pixelOffset"]
+        assert camera["heldOut"] == before_cameras[i]["heldOut"]
+        np.testing.assert_array_equal(camera["worldToCamera"], before_cameras[i]["worldToCamera"])
+        pixels = data[entry["pixelOffset"]:entry["pixelOffset"] + w * h].reshape(h, w)
+        want = i | (np.arange(w)[None, :] % 256) << 8 | 254 << 16 | 255 << 24
+        np.testing.assert_array_equal(pixels, np.broadcast_to(want, (h, w)))
+        np.testing.assert_array_equal(scene.load_rgb(str(out / entry["png"]))[..., 0], i)
+    assert data.size == sum(c["width"] * c["height"] for c in manifest["cameras"])
+    with pytest.raises(ValueError, match="already has images"):
+        ms.main(["render-gt", str(out), fake_renderer(tmp_path)])
+
+
+def test_render_gt_checks_the_renderer(tmp_path):
+    out = tmp_path / "gt"
+    ms.main(["s3", str(out), "--count", "40"])
+    failing = fake_renderer(tmp_path, "import sys\nprint('no device')\nsys.exit(3)\n")
+    with pytest.raises(RuntimeError, match="no device"):
+        ms.main(["render-gt", str(out), failing])
+    wrong_size = fake_renderer(tmp_path, FAKE_RENDERER.replace('int(value("--width"))', "5"))
+    with pytest.raises(RuntimeError, match="the capture is 5x"):
+        ms.main(["render-gt", str(out), wrong_size])
+    assert read_scene(out)[0]["files"]["images"] == []

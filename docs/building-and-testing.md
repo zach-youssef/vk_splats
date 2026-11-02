@@ -183,6 +183,8 @@ tools/make_synthetic.py s2 <out dir> [--seed <n>]
 tools/make_synthetic.py s3 <out dir> [--seed <n>] [--count <n>]
 tools/make_synthetic.py perturb <scene dir> <out dir> [--seed <n>] [--jitter <f>]
 tools/make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f>]
+tools/make_synthetic.py render-gt <scene dir> <renderer> [--background <g>] [--frames <n>] [--validation]
+                                  [--sh-degree <d>]
 ```
 
 - **S1** (`<out dir>/<variant>/`, no seed): the closed-form oracles' setups, with
@@ -233,6 +235,15 @@ tools/make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f
   (higher bands zero) and opacities in [0.05, 0.95], and keeps rotations. sparse keeps a random
   `--fraction` (0.1, at least 4) of the positions, in order, and initializes splats from them as the
   converter does from COLMAP points, coloured with the original DC colours clamped to [0, 1].
+- **render-gt** gives a scene without images its ground truth, in place: each camera rendered by
+  splat_render (`<renderer>` is the binary, or the web build's `.js`, run under `$NODE`) for
+  `--frames` (8) frames and its last frame captured, written as the converter writes images
+  (`images_<k>.bin`, `images/<name>.png`, the cameras' `imageBatch` and `pixelOffset`, the
+  manifest's `files.images` and camera entries) with `source.groundTruth`. `--sh-degree` limits
+  the SH bands rendered (default: the scene's), for a target without view-dependent colour. A scene re-fitted to
+  these images is fitted to what the renderer draws, so a training test measures the optimizer and
+  the backward pass, not a mismatch between the generator's model and the renderer's. It needs a
+  GPU, so its tests (`test_render_gt*`) run it with a fake renderer.
 
 ## GPU runs
 

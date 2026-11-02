@@ -19,6 +19,12 @@ docs/building-and-testing.md describes each scene and what it's for.
   make_synthetic.py sparse <scene dir> <out dir> [--seed <n>] [--fraction <f>]
       The scene with its splats replaced by ones initialized from a random subset of their
       positions, as the converter initializes from COLMAP points.
+  make_synthetic.py render-gt <scene dir> <renderer> [--background <g>] [--frames <n>] [--validation]
+                              [--sh-degree <d>]
+      Gives a scene without images its ground truth: each camera rendered by splat_render (the
+      binary, or the web build's .js, run under $NODE) and captured, written in place as the
+      converter writes images (images_<k>.bin, images/<name>.png, the cameras' imageBatch and
+      pixelOffset, the manifest's), so the scene re-fits to what the renderer draws.
 
 Every scene is a pure function of its arguments: the same seed writes the same bytes, with the
 same numpy version on the same platform (docs/building-and-testing.md).
@@ -31,7 +37,10 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
+import types
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -402,6 +411,72 @@ def make_sparse(scene_dir: str, out_dir: str, seed: int, fraction: float) -> dic
                           {"generator": GENERATOR, "sparse": {"seed": seed, "fraction": fraction}})
 
 
+# --- Ground truth ------------------------------------------------------------------------------------------
+
+def renderer_command(renderer: str) -> List[str]:
+    """The renderer's command: a .js (the web build) runs under $NODE (node by default)."""
+    return [os.environ.get("NODE", "node"), renderer] if renderer.endswith(".js") else [renderer]
+
+
+def render_gt(scene_dir: str, renderer: str, background: float = 0.0, frames: int = 8,
+              validation: bool = False, sh_degree: Optional[int] = None) -> dict:
+    """Renders every camera of a scene without images with splat_render (renderer), captures its
+    last frame, and writes the captures into the scene as its images (scene.write_scene's layout).
+    sh_degree limits the SH bands rendered (default: the manifest's). Returns the new manifest."""
+    import scene_args  # tools/, on the path above
+
+    with open(os.path.join(scene_dir, "manifest.json")) as f:
+        manifest = json.load(f)
+    if manifest["files"].get("images"):
+        raise ValueError(f"{scene_dir} already has images")
+    cameras_path = os.path.join(scene_dir, manifest["files"]["cameras"])
+    with open(cameras_path, "rb") as f:
+        cameras = scene.cameras_from_std430(f.read()).copy()
+    entries = manifest["cameras"]
+    views = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, entry in enumerate(entries):
+            png = os.path.join(tmp, f"{i}.png")
+            command = renderer_command(renderer) + ["--frames", str(frames), "--capture", png,
+                                                    "--background", repr(float(background))]
+            args = scene_args.scene_args(scene_dir, str(i))
+            if sh_degree is not None:
+                args[args.index("--sh-degree") + 1] = str(sh_degree)
+            command += (["--validation"] if validation else []) + args
+            run = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if run.returncode != 0:
+                raise RuntimeError(f"{' '.join(command)} failed ({run.returncode}):\n{run.stdout}")
+            image = scene.load_rgb(png)
+            if image.shape != (entry["height"], entry["width"], 3):
+                raise RuntimeError(f"camera {i}: the capture is {image.shape[1]}x{image.shape[0]}, "
+                                   f"not {entry['width']}x{entry['height']}")
+            views.append(types.SimpleNamespace(name=entry["name"], width=entry["width"], height=entry["height"],
+                                               image=image))
+    buffers, placement = scene.pack_images(views)
+    image_files = []
+    for k, data in enumerate(buffers):
+        image_files.append(f"images_{k}.bin")
+        with open(os.path.join(scene_dir, image_files[-1]), "wb") as f:
+            f.write(data)
+    os.makedirs(os.path.join(scene_dir, "images"), exist_ok=True)
+    for i, (view, (batch, offset)) in enumerate(zip(views, placement)):
+        cameras[i]["imageBatch"] = batch
+        cameras[i]["pixelOffset"] = offset
+        png = os.path.join("images", os.path.splitext(os.path.basename(view.name))[0] + ".png")
+        scene.save_png(os.path.join(scene_dir, png), view.image)
+        entries[i].update({"imageBatch": batch, "pixelOffset": offset, "png": png})
+    with open(cameras_path, "wb") as f:
+        f.write(cameras.tobytes())
+    manifest["files"]["images"] = image_files
+    manifest["source"] = {**manifest.get("source", {}),
+                          "groundTruth": {"generator": GENERATOR, "renderer": "splat_render", "background": background,
+                                          "shDegree": manifest["shDegree"] if sh_degree is None else sh_degree}}
+    with open(os.path.join(scene_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+        f.write("\n")
+    return manifest
+
+
 # --- Command line --------------------------------------------------------------------------------------------
 
 def main(argv=None) -> None:
@@ -438,6 +513,16 @@ def main(argv=None) -> None:
     c.add_argument("--seed", type=int, default=0)
     c.add_argument("--fraction", type=float, default=0.1, help="share of positions kept (default 0.1)")
     c.set_defaults(run=lambda a: make_sparse(a.scene, a.out, a.seed, a.fraction))
+
+    c = commands.add_parser("render-gt", help="a scene's images, rendered by splat_render")
+    c.add_argument("scene")
+    c.add_argument("renderer", help="splat_render's binary, or its web build's .js (run under $NODE)")
+    c.add_argument("--background", type=float, default=0.0, help="the background's grey level (default 0)")
+    c.add_argument("--frames", type=int, default=8, help="frames each render runs before its capture (default 8)")
+    c.add_argument("--validation", action="store_true", help="run the renderer with --validation")
+    c.add_argument("--sh-degree", type=int, choices=range(4), help="the SH bands rendered (default: the scene's)")
+    c.set_defaults(run=lambda a: render_gt(a.scene, a.renderer, a.background, a.frames, a.validation,
+                                           a.sh_degree))
 
     args = parser.parse_args(argv)
     if getattr(args, "count", 4) < 4:

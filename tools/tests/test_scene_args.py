@@ -1,6 +1,8 @@
 """scene_args.py: splat_render's arguments from a scene's manifest."""
 
+import json
 import os
+import sys
 
 import pytest
 
@@ -48,3 +50,45 @@ def test_golden_scene():
     assert as_dict(scene_args.scene_args(golden, "0"))["--width"] == "128"
     a = as_dict(scene_args.scene_args(golden, "cam_24_wide"))
     assert (a["--camera"], a["--width"], a["--height"], a["--splat-count"]) == ("24", "160", "96", "2000")
+
+
+def test_train_args(tmp_path):
+    out = tmp_path / "gt"
+    ms.main(["s3", str(out), "--count", "40"])
+    with pytest.raises(SystemExit, match="0 image batches"):
+        scene_args.train_args(str(out))
+    # Give it images: two sizes, so the largest of each is taken
+    fake = tmp_path / "fake"
+    fake.write_text(f"#!{sys.executable}\nimport sys, numpy as np\nfrom PIL import Image\na = sys.argv[1:]\n"
+                    "v = lambda n: a[a.index(n) + 1]\n"
+                    "Image.fromarray(np.zeros((int(v('--height')), int(v('--width')), 3), np.uint8)).save(v('--capture'))\n")
+    fake.chmod(0o755)
+    manifest = ms.render_gt(str(out), str(fake))
+    a = as_dict(scene_args.train_args(str(out)))
+    pixels = sum(c["width"] * c["height"] for c in manifest["cameras"])
+    assert a == {"--splats": os.path.join(out, "splats.bin"), "--cameras": os.path.join(out, "cameras.bin"),
+                 "--targets": os.path.join(out, "images_0.bin"), "--splat-count": "40",
+                 "--camera-count": str(manifest["cameraCount"]), "--sh-degree": "3",
+                 "--max-width": str(max(c["width"] for c in manifest["cameras"])),
+                 "--max-height": str(max(c["height"] for c in manifest["cameras"])),
+                 "--target-pixels": str(pixels), "--extent": repr(float(manifest["extent"]))}
+    assert a["--max-width"] == "160" and a["--max-height"] == "128"
+
+
+def test_train_args_checks_the_split(tmp_path):
+    """A scene from before format version 2, or whose buffer disagrees with its manifest, is refused:
+    splat_train would otherwise train on the test cameras."""
+    out = tmp_path / "s3"
+    ms.main(["s3", str(out), "--count", "40"])
+    path = out / "manifest.json"
+    manifest = json.loads(path.read_text())
+    assert manifest["test"] == [0, 8, 16]
+    path.write_text(json.dumps(dict(manifest, version=1)))
+    with pytest.raises(SystemExit, match="format version 1.*re-convert"):
+        scene_args.train_args(str(out))
+    path.write_text(json.dumps(dict(manifest, test=[0, 8])))
+    with pytest.raises(SystemExit, match=r"holds out cameras \[0, 8, 16\]"):
+        scene_args.train_args(str(out))
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(SystemExit, match="0 image batches"):  # past the split check
+        scene_args.train_args(str(out))
