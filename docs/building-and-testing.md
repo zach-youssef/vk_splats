@@ -253,7 +253,7 @@ check in the app (so the web runs them too). `make_pair.py <case> <out dir> [--w
 [--height H]` writes a pair (32×32 by default; ssim_test requires at least 11×11, the window; the
 render as vec4 floats, the target RGBA8; numpy's `default_rng`, so the pair doesn't depend on the
 C++ library) and prints ssim_test's arguments, with `--expected-ssim` the pair's SSIM in
-float64 numpy (the same definition: zero padding, C1, C2). The app checks:
+float64 numpy (`tools/splatdata/metrics.py`, the reference's definition: zero padding, C1, C2). The app checks:
 
 - the SSIM (1 − the reduced loss) within `--tolerance` (1e-5) of `--expected-ssim`, which is
   required (a `#:given` option);
@@ -350,6 +350,24 @@ tools/make_synthetic.py render-gt <scene dir> <renderer> [--background <g>] [--f
   these images is fitted to what the renderer draws, so a training test measures the optimizer and
   the backward pass, not a mismatch between the generator's model and the renderer's. It needs a
   GPU, so its tests (`test_render_gt*`) run it with a fake renderer.
+
+## Evaluating a trained scene
+
+`tools/evaluate.py` scores a trained PLY on a scene's held-out views as the reference's
+`metrics.py` does: it writes the PLY's splats into a copy of the scene's manifest and cameras,
+renders each test camera with splat_render (the binary, or the web build's `.js` under `$NODE`)
+and compares each 8-bit capture with the scene's undistorted image by the PSNR and the SSIM
+(`tools/splatdata/metrics.py`: the reference's SSIM, as in `make_pair.py`), per view and their
+mean, printed and written to `<out dir>/metrics.json`. splat_train's own PSNR scores its float
+render, so the two differ a little (within about 0.5 dB, as `check.py` requires).
+`--side-by-side <camera> ...` also writes each camera's image beside its render, each scaled to
+`--thumbnail` px on its longer side. Its tests
+(`tools/tests/test_evaluate.py`) use a fake renderer.
+
+```
+tools/evaluate.py build/data/cs5330 <trained.ply> build/splat_render/splat_render <out dir> \
+    [--validation] [--side-by-side 0 8] [--thumbnail 256]
+```
 
 ## GPU runs
 

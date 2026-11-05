@@ -3,7 +3,7 @@
 vec4 floats a pixel, the render; <out dir>/targets.bin: RGBA8 pixels, the target) and prints ssim_test's
 arguments for it: the images' size and --expected-ssim, their SSIM in float64 (the reference's: per
 channel, the 11x11 Gaussian window, sigma 1.5, zero-padded, C1 = 0.01^2, C2 = 0.03^2, the mean over the
-pixels and channels). The cases:
+pixels and channels: splatdata.metrics). The cases:
 - random: a random render in [-0.05, 1.05] (the rasterizer's render is unclamped) and a target
   correlated with it (0.7 of it plus noise, quantized), so the SSIM is neither 0 nor 1;
 - identity: a random target and the render equal to it (its bytes / 255 as floats): SSIM 1;
@@ -14,35 +14,12 @@ numpy's default_rng, so the same on every platform. Needs numpy."""
 
 import argparse
 import os
+import sys
 
 import numpy as np
 
-C1 = 0.01 ** 2
-C2 = 0.03 ** 2
-
-
-def window():
-    d = np.arange(-5, 6, dtype=np.float64)
-    g = np.exp(-d * d / (2 * 1.5 ** 2))
-    return g / g.sum()
-
-
-def blur(image):
-    """The separable window's blur of each channel of an H x W x C image, zero-padded"""
-    g = window()
-    h, w = image.shape[:2]
-    padded = np.pad(image, ((5, 5), (5, 5), (0, 0)))
-    rows = sum(g[k] * padded[:, k:k + w] for k in range(11))
-    return sum(g[k] * rows[k:k + h] for k in range(11))
-
-
-def ssim(x, y):
-    mx, my = blur(x), blur(y)
-    sx = blur(x * x) - mx * mx
-    sy = blur(y * y) - my * my
-    sxy = blur(x * y) - mx * my
-    s = (2 * mx * my + C1) * (2 * sxy + C2) / ((mx * mx + my * my + C1) * (sx + sy + C2))
-    return s.mean()
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
+from splatdata.metrics import C1, ssim  # noqa: E402
 
 
 def main():
