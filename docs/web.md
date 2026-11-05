@@ -26,7 +26,7 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | TileLasts | 3 | 1 | 0 | 0 | 64 |
 | BackwardRasterize | 7 | 1 | 0 | 14912 B (128 × (8 + 16 + 16) for a batch, 9 × 256 × 4 and 9 × 16 × 4 for the reduction) | 16 × 16 |
 | InvertEntries | 6 | 1 | 0 | 0 | 256 |
-| GatherGradients | 7 | 1 | 0 | 0 | 64 |
+| GatherGradients | 7 | 0 | 0 | 0 | 64 |
 | BackwardPreprocess | 7 | 1 | 0 | 0 | 64 |
 | Adam | 6 | 1 | 0 | 0 | 64 |
 | Record | 3 | 1 | 0 | 0 | 1 |
