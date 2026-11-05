@@ -14,14 +14,19 @@
 #   - perturb: the splats perturbed (make_synthetic.py perturb, seed 0), fitted back for 2000
 #     iterations, the SH degree rising every 500, with the opacity reset every 900 (so at 900,
 #     and the size prunes after 900). Densification fills --max-splats 4096 by iteration 800, so
-#     later additions are dropped (the overflow). It passes at a held-out PSNR of 32 dB (35.9 on
-#     MoltenVK; the start is 20) and a loss falling 8 times (34.0). The tile entries' capacity
-#     starts at 256, so the first iterations overflow and grow it: check.py requires skipped
-#     iterations (8 here), which covers Adam's skip, Record's -1 and their report;
+#     later additions are dropped (the overflow). It passes at a held-out PSNR within 0.5 dB of
+#     the native builds' (native_perturb_psnr: 35.94 on lavapipe, 35.91 on MoltenVK; the web's
+#     35.89 on lavapipe, 35.86 on Metal; the start is 20), so it is also the web's parity check
+#     (docs/web.md#training-on-the-web); a native build also fails more than 1 dB above it, so
+#     the reference can't go stale by more. It also needs a loss falling 8 times (34.0). The tile
+#     entries' capacity starts at 256, so the first iterations overflow and grow it: check.py
+#     requires skipped iterations (8 here), which covers Adam's skip, Record's -1 and their report;
 #   - sparse: initialized as the converter initializes COLMAP points from a tenth of the splats'
 #     positions (make_synthetic.py sparse, seed 0: 200 splats), trained for 1800 iterations with
 #     --max-splats 12288; densification must grow the splats (it reached 11470 of the 12288 on lavapipe) and the
-#     held-out PSNR reach 28 dB (37.0 on MoltenVK; a run ending on a reset scores about 13).
+#     held-out PSNR reach 28 dB (37.0 on MoltenVK; a run ending on a reset scores about 13). Its
+#     PSNR swings by up to 0.7 dB with the least change to its inputs (docs/web.md#training-on-the-web),
+#     so one run can't hold it within 0.5 dB of native, and it isn't held to that.
 # Both train on (1 - 0.2) L1 + 0.2 D-SSIM (--lambda-dssim's default); on L1 alone they scored 35.9
 # and 32.9 dB, the loss falling 16.3 and 8.8 times.
 # Each run prints its PSNR and splat count, so a CI log shows the margins.
@@ -79,7 +84,20 @@ train() {  # train <name> <make_synthetic.py command> <iterations> <check.py arg
     "$python" "$here/check.py" "$dir" "$renderer" $checks || fail "the $name check"
 }
 
-train perturb perturb 2000 --min-psnr 32 --min-ratio 8 --min-skipped 1 -- \
-    --initial-entries 256 --max-splats 4096 --max-screen-size 20 --reset-interval 900 --densify-until 1500
+# perturb's held-out PSNR on the native builds; every build must come within 0.5 dB of it. Update
+# it (from CI's native log) when a change to training moves it: a native build fails more than
+# 1 dB above it (test.sh's seed scores within 0.05 dB of it on lavapipe and MoltenVK), so the
+# reference, and the web's bound with it, can't fall more than 1 dB behind native. The web isn't
+# bounded above.
+native_perturb_psnr=35.9
+offset() { LC_ALL=C awk -v p="$native_perturb_psnr" -v d="$1" 'BEGIN { printf "%.2f", p + d }'; }
+case $binary in
+    *.js) ceiling= ;;
+    *) ceiling="--max-psnr $(offset 1.0)" ;;
+esac
+# shellcheck disable=SC2086 # the ceiling is no word or two, split on purpose
+train perturb perturb 2000 --min-psnr "$(offset -0.5)" $ceiling --min-ratio 8 --min-skipped 1 -- \
+    --initial-entries 256 --max-splats 4096 --max-screen-size 20 --reset-interval 900 \
+    --densify-until 1500
 train sparse sparse 1800 --min-psnr 28 --min-ratio 5 --min-skipped 0 --grow -- \
     --max-splats 12288 --max-screen-size 20 --densify-until 1500 --sh-degree 0

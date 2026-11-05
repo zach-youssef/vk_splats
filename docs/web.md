@@ -67,8 +67,9 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 - **splat_render**: S3 cameras 0 and 24 captured and compared with the same goldens at the same
   PSNR (45 dB). It has no externs, so unlike render_test it needs no `.inputs.ts`.
 - **splat_train**: the native test, its ground truth rendered by splat_render's web build and its
-  re-renders too, at the same thresholds (perturb 35.9 dB and sparse 37.0 dB natively, 35.9 and 36.2 on the web). Its `.inputs.ts` writes
-  the PLY with Node's `fs`, so the web build's export works only under Node.
+  re-renders too, at the same thresholds: perturb within 0.5 dB of the native builds' PSNR (the
+  web's parity check: [Training on the web](#training-on-the-web)), sparse at 28 dB. Its
+  `.inputs.ts` writes the PLY with Node's `fs`, so the web build's export works only under Node.
 - **render_test**: every run of the native test (S1 with the oracle, the off-centre variant, S2
   twice with the hashes compared, S3). Its checks are C++ (`render_check.h` with
   `tests/oracle/closed_form.h`), so rather than port them, the web build's `check` writes the
@@ -81,6 +82,38 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   The finite differences themselves run in the app, the same on both.
 - **densify_test**: every run of the native test; its checks are in the app.
 - **ssim_test**: every run of the native test; its checks are in the app.
+
+## Training on the web
+
+splat_train's web build trains as the native one does: the same graph, kernels and schedule, the
+camera order and the densification's seeds from `pcgHash` (in the TypeScript host too, with
+`Math.imul`), so a run differs from native only by the float rounding of the two shader
+compilers. Training needs no more than WebGPU's default limits (the table above); none bit.
+
+perturb's held-out PSNR is within 0.5 dB of native, and the test checks it; sparse's isn't in
+one run, though it is on average. Measured on S3 (test.sh's two runs; `--seed` changes only the
+camera order; test.sh runs seed 0):
+
+| Run | Native | Web | Native − web |
+|---|---|---|---|
+| perturb, CI (lavapipe both) | 35.94 | 35.89 | 0.05 |
+| perturb, M4 (MoltenVK; Dawn on Metal), `--seed` 0–4 | 35.91 to 36.49, mean 36.15 | 35.80 to 36.27, mean 36.07 | 0.08 ± 0.13, at most 0.27 |
+| sparse, CI (lavapipe both) | 37.08 | 36.33 | 0.75 |
+| sparse, M4, `--seed` 0–7, one ground truth | 36.53 to 37.08, mean 36.87 | 36.64 to 36.93, mean 36.80 | 0.07 ± 0.19 |
+
+There is no systematic gap, but sparse's single run is chaotic: densification's thresholds turn
+the least difference into different splats. Trained on ground truths differing in 10 of 1.6M
+bytes by one level (splat_render's native and web captures of S3), the same web build scored
+36.89 and 36.17 dB, native 36.99 and 37.12. So CI's 0.75 dB is noise of one run. perturb is
+steadier: at test.sh's seed every device scored within 0.1 dB (35.86 to 35.94), and across
+seeds the web trailed native by 0.08 ± 0.13 dB, at most 0.27.
+
+So only perturb is held to 0.5 dB of native in the test: every build must reach test.sh's
+`native_perturb_psnr` (35.9) less 0.5 dB, and a native build fails more than 1 dB above it, so
+the reference is updated when training improves rather than leaving the web's bound behind (the
+web isn't bounded above). sparse keeps its absolute 28 dB, the user's decision (2026-11-04):
+holding it to native would need the mean of several seeds (about 9 more minutes in the web CI
+job, past its step timeout) or a less chaotic run first.
 
 ## Not supported on the web
 

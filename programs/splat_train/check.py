@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""check.py <out dir> <splat_render> --min-psnr <dB> --min-ratio <r> --min-skipped <n> [--grow]: checks
-a test.sh splat_train run, from its log (<out dir>/train.log) and its PLY (<out dir>/trained.ply).
+"""check.py <out dir> <splat_render> --min-psnr <dB> [--max-psnr <dB>] --min-ratio <r> --min-skipped <n> [--grow]:
+checks a test.sh splat_train run, from its log (<out dir>/train.log) and its PLY (<out dir>/trained.ply).
 
-- the held-out PSNR splat_train reports is at least --min-psnr, and the first epoch's mean training loss
-  is at least --min-ratio times the last's;
+- the held-out PSNR splat_train reports is at least --min-psnr (and at most --max-psnr: a score
+  past it means the reference test.sh derives the thresholds from is stale), and the first
+  epoch's mean training loss is at least --min-ratio times the last's;
 - at least --min-skipped iterations were skipped for overflowing (test.sh starts the capacity
   small to cover the skip);
 - the splats in use, as splat_train reports them, are at most --max-splats, and with --grow more
@@ -47,6 +48,8 @@ def main():
     parser.add_argument("out")
     parser.add_argument("renderer")
     parser.add_argument("--min-psnr", type=float, required=True)
+    parser.add_argument("--max-psnr", type=float,
+                        help="fail above it: the reference the thresholds come from is out of date")
     parser.add_argument("--min-ratio", type=float, required=True)
     parser.add_argument("--min-skipped", type=int, required=True)
     parser.add_argument("--grow", action="store_true",
@@ -62,6 +65,9 @@ def main():
           f"{float(last):.5f} (ratio {float(ratio):.2f})")
     if not float(psnr) >= args.min_psnr:
         errors.append(f"the held-out PSNR {psnr} dB is below {args.min_psnr}")
+    if args.max_psnr is not None and not float(psnr) <= args.max_psnr:
+        errors.append(f"the held-out PSNR {psnr} dB is above {args.max_psnr}: training improved, so "
+                      "update test.sh's reference (native_perturb_psnr) from this score")
     if not float(ratio) >= args.min_ratio:
         errors.append(f"the loss fell {ratio} times, less than {args.min_ratio}")
     skipped, = number(r"(\d+) iterations skipped", log)

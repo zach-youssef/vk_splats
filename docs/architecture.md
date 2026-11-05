@@ -569,13 +569,17 @@ splat_train reported, which checks the readback, the PSNR, the count and the exp
   iterations from a capacity of 256 entries, which the first iterations overflow, with
   `--reset-interval 900` (a reset at 900, size prunes after it) and `--max-splats 4096`,
   which densification fills by iteration 800, so later additions are dropped (the overflow
-  path). It requires 32 dB (35.9 on MoltenVK, from 20 at the start), a loss falling 8
+  path). It requires a PSNR within 0.5 dB of the native builds' (35.9: 35.94 on lavapipe, 35.91
+  on MoltenVK, from 20 at the start; test.sh's `native_perturb_psnr`, which a native build may
+  exceed by 1 dB at most, so it's kept current), which makes it the web's parity check
+  ([web.md](web.md#training-on-the-web)), a loss falling 8
   times (34.0) and at least one skipped iteration (8: covering Adam's skip, Record's −1 and the
   report).
 - **sparse**: 200 splats initialized from a tenth of the positions as the converter initializes
   COLMAP points (`make_synthetic.py sparse`), trained for 1800 iterations with `--max-splats
   12288` and SH degree 0. Densification must grow the count (`check.py --grow`: to 11470 of the 12288
-  on lavapipe) and the held-out PSNR reach 28 dB (37.0 on MoltenVK).
+  on lavapipe) and the held-out PSNR reach 28 dB (37.0 on MoltenVK). One run's PSNR swings by
+  up to 0.7 dB with the least change to its inputs, so it isn't held to native's.
 
 Both train on (1 − 0.2)·L1 + 0.2·D-SSIM; with `--lambda-dssim 0` (L1 alone) they score 35.9 and
 32.9 dB, the loss falling 16.3 and 8.8 times.
