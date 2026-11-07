@@ -11,4 +11,5 @@ Read the docs for the area you touch:
 - [docs/data-format.md](docs/data-format.md): the converter (`tools/`) and the files the programs read: the `Splat` and `Camera` buffers, the packed images, `manifest.json`, INRIA PLY.
 - [docs/web.md](docs/web.md): the programs on WebGPU: every kernel's binding and workgroup-memory budget against WebGPU's default limits, the web tests, and what the web doesn't support.
 - [docs/paper-conformance.md](docs/paper-conformance.md): why the old code was replaced, and where the rewrite follows or departs from the paper; update it with any new departure.
+- [docs/results.md](docs/results.md): training runs on real scenes (held-out PSNR and SSIM, time, splats) and how to reproduce them.
 - ZGAL itself: `external/vulkan_test/CLAUDE.md` and the reference it points to.
