@@ -37,11 +37,13 @@
 ;;      epochs' mean training loss (an epoch is as many iterations as there are training views),
 ;;      each test view's PSNR and their mean and the splats in use, and writes those splats as
 ;;      the PLY (exportPly: to $SPLAT_TRAIN_PLY, splat_train.ply by default), then quits.
-;; The tile entries' capacity starts at --initial-entries and grows (grownTrainCapacity) after a
-;; frame that needed more, from the counts read back after iteration 1's frame (counting); Adam
+;; The tile entries' capacity starts at --initial-entries and grows (grownCapacityUpTo, at most
+;; --max-entries) after a frame that needed more, from the counts read back after iteration 1's frame (counting); Adam
 ;; skips a frame that overflowed (its gradients are incomplete), so that iteration is lost (its
-;; history is -1) and the program counts and reports it. A frame needing more than
-;; trainEntryCapacityMax entries, which no growth can hold, fails the program, as do frames
+;; history is -1) and the program counts and reports it. The backward pass runs a chunk of
+;; --chunk-entries entries at a time, as many chunks as a frame needs (TrainGraph's maxEntries and
+;; chunkEntries). A frame needing more than --max-entries entries, which no growth can hold, fails
+;; the program, as do frames
 ;; (--frames) running out before the end and an overflowing test view: each test view renders
 ;; once, so one needing more entries than the training views grew the capacity to isn't retried
 ;; (the message names the most a frame needed, for --initial-entries). On the web a tick's reads
@@ -119,6 +121,8 @@
   (parameter near float)
   (parameter far float)
   (parameter initialEntries uint)
+  (parameter maxEntries uint)
+  (parameter chunkEntries uint)
   (parameter background float)
   (parameter lambdaDssim float)
   (parameter iterations uint)
@@ -155,7 +159,7 @@
    (camera uint 0)
    (iteration uint 0)
    (view uint 0)
-   (capacity uint (grownTrainCapacity initialEntries 0))
+   (capacity uint (grownCapacityUpTo (min initialEntries maxEntries) 0 maxEntries))
    (mostEntries uint 0)
    (history (data float) (empty-data float))
    (trained (data Splat) (empty-data Splat))
@@ -170,10 +174,10 @@
     (if (not (counting state.phase state.iteration))
         state
         (let* ([total (at d countTotal)]
-               [grown (grownTrainCapacity state.capacity total)])
-          (when (> total trainEntryCapacityMax)
-            (print! "splat_train: FAILED, a frame needs " total " tile entries, more than training's cap of "
-                    trainEntryCapacityMax " (trainEntryCapacityMax: its entry gradients must fit in one binding)")
+               [grown (grownCapacityUpTo state.capacity total maxEntries)])
+          (when (> total maxEntries)
+            (print! "splat_train: FAILED, a frame needs " total " tile entries, more than --max-entries "
+                    maxEntries)
             (fail))
           (when (not= grown state.capacity)
             (print! "splat_train: a frame needed " total " tile entries, more than its capacity of " state.capacity
@@ -192,6 +196,14 @@
       (with state #:counts d #:reported (max state.reported (at d splatDensifies)))))
   (on (frame dt)
     (cond
+      ;; The graph holds at most trainChunkPassesMax backward passes (lib/train_graph.zgal)
+      [(> (trainChunkPasses maxEntries chunkEntries) trainChunkPassesMax)
+       (begin
+         (print! "splat_train: FAILED, --max-entries " maxEntries " needs "
+                 (trainChunkPasses maxEntries chunkEntries) " backward passes of --chunk-entries "
+                 chunkEntries ", more than " trainChunkPassesMax)
+         (fail)
+         state)]
       [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
        (begin
          (print! "splat_train: FAILED, " frameLimit " frames weren't enough (phase " state.phase ", iteration "
@@ -300,7 +312,7 @@
             (begin (print! "splat_train: FAILED, a loss or a trained splat isn't finite") (fail))]
            [(> overflowedViews (uint 0))
             (begin (print! "splat_train: FAILED, " overflowedViews " test views overflowed their tile entries; rerun with "
-                           "--initial-entries " (grownTrainCapacity state.capacity state.mostEntries)
+                           "--initial-entries " (grownCapacityUpTo state.capacity state.mostEntries maxEntries)
                            " (the most a frame was seen to need: " state.mostEntries ")")
                    (fail))]
            [else (quit!)])
@@ -315,6 +327,7 @@
        (targetPixels targetPixels)
        (shDegree (min shDegree (/ (if (= state.phase phaseTraining) state.iteration iterations) (max shInterval (uint 1)))))
        (near near) (far far) (maxGroups groupLimit) (inspect #f) (finiteDifferences #f)
+       (maxEntries maxEntries) (chunkEntries chunkEntries)
        (capacity state.capacity) (background (vec3 background))
        (loss (if (= state.phase phaseTraining) lossL1 lossEval))
        (dssim (> lambdaDssim 0.0)) (dssimWeight lambdaDssim)
@@ -333,6 +346,7 @@
        (screenPrune (if (> state.iteration resetInterval) (uint 1) (uint 0))) (maxScreenSize maxScreenSize)
        (densifySeed (pcgHash (+ (pcgHash (+ seed (uint 1))) state.iteration)))
        #:enabled ((findLasts (iterating state.phase state.iteration))
+                  (planChunks (iterating state.phase state.iteration))
                   (backwardRasterize (iterating state.phase state.iteration))
                   (clearPositions (iterating state.phase state.iteration))
                   (invert (iterating state.phase state.iteration))
@@ -382,8 +396,16 @@
   (option shDegree "--sh-degree" "the SH degree training reaches" #:default 3 #:range (0 3))
   (option near "--near" "the near plane" #:default 0.2)
   (option far "--far" "the depth keys' far depth" #:default 1000.0)
-  (option initialEntries "--initial-entries" "the tile entries' first capacity" #:default 1048576
-          #:range (1 3145728))
+  (option initialEntries "--initial-entries" "the tile entries' first capacity (at most --max-entries)"
+          #:default 1048576 #:range (1 33554432))
+  ;; At most 2^25 (entryCapacityMax: the keys' 128 MiB binding); the capacity, and the memory the
+  ;; entries take, grows to it only as frames need
+  (option maxEntries "--max-entries" "the most tile entries a frame may need (at most 33554432: the 128 MiB binding budget)"
+          #:default 33554432 #:range (1 33554432))
+  ;; At most 3 x 2^20 (trainChunkEntriesMax: 36 B of gradients an entry in one 128 MiB binding);
+  ;; smaller chunks take less memory and more passes (at most 64, trainChunkPassesMax)
+  (option chunkEntries "--chunk-entries" "the most tile entries one backward pass holds (at most 3145728: the 128 MiB binding budget; at least --max-entries / 64, rounded up)"
+          #:default 3145728 #:range (1 3145728))
   (option lambdaDssim "--lambda-dssim" "the D-SSIM term's weight in the training loss (the paper's 0.2; 0, L1 alone)"
           #:default 0.2 #:range (0.0 1.0))
   (option background "--background" "the background's grey level (0 black, the reference's default)"

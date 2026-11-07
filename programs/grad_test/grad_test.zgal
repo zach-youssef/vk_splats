@@ -48,6 +48,9 @@
 ;; to 15% off, one of opposite sign; leaving out the window around a flip instead drops too much
 ;; of the smooth change); a colour step flips nothing. At 1e-3 the SSIM's float noise (its
 ;; variances are differences of near-equal sums) leaves the colour a few % off; at 1e-2, within 1.1%.
+;; The backward pass runs a chunk of --chunk-entries entries at a time (TrainGraph's chunkEntries,
+;; with maxEntries the capacity), so a small one checks the chunks' gradients against one pass's
+;; (test.sh compares the hashes: they're the same, bit for bit).
 ;; It fails on a mismatch, an overflowing frame (raise --capacity) or when the frames run out first.
 ;; On the web (grad_test.inputs.ts), `check` writes the frame's readbacks to the directory
 ;; $GRAD_TEST_READBACKS names instead, and web-check/grad_test_check.cpp runs the same C++ checks
@@ -163,6 +166,7 @@
   (parameter near float)
   (parameter far float)
   (parameter capacity uint)
+  (parameter chunkEntries uint)
   (parameter maxGroups uint)
   (parameter targetOffset uint)
   (parameter targetPixels uint)
@@ -285,6 +289,11 @@
                  #:worst (if (and ok (not small)) (max state.worst (/ error (max scale 1e-30))) state.worst)))])))
   (on (frame dt)
     (cond
+      ;; The graph holds at most trainChunkPassesMax backward passes (lib/train_graph.zgal)
+      [(> (trainChunkPasses capacity chunkEntries) trainChunkPassesMax)
+       (begin (print! "grad_test: FAILED, --capacity " capacity " needs " (trainChunkPasses capacity chunkEntries)
+                      " backward passes of --chunk-entries " chunkEntries ", more than " trainChunkPassesMax)
+              (fail) state)]
       ;; The D-SSIM term applies to the L1 loss only, the oracle has no D-SSIM, and its finite
       ;; differences probe the projection's colour (the header says why)
       [(and (> dssimWeight 0.0) (or (not l1) oracle parameters))
@@ -413,6 +422,7 @@
        (positionLr 0.0) (dcLr 0.0) (restLr 0.0) (opacityLr 0.0) (scalingLr 0.0) (rotationLr 0.0)
        (shDegree shDegree) (near near) (far far) (maxGroups maxGroups) (inspect #t)
        (loss (if l1 lossL1 lossL2)) (dssim (> dssimWeight 0.0)) (dssimWeight dssimWeight) (finiteDifferences finiteDifferences)
+       (maxEntries capacity) (chunkEntries chunkEntries)
        (capacity capacity) (background (vec3 backgroundR backgroundG backgroundB))
        (targetPixels targetPixels) (targetOffset targetOffset)
        (probe (if (= state.phase 1) (+ (* state.index (uint 2)) state.side (uint 1)) (uint 0)))
@@ -440,7 +450,9 @@
   (option near "--near" "the near plane" #:default 0.2)
   (option far "--far" "the depth keys' far depth" #:default 1000.0)
   (option capacity "--capacity" "the tile entries' capacity (fixed; a frame needing more fails)"
-          #:default 262144 #:range (1 3145728))
+          #:default 262144 #:range (1 33554432))
+  (option chunkEntries "--chunk-entries" "the most tile entries one backward pass holds (fewer than a frame's: several passes; at least --capacity / 64, rounded up)"
+          #:default 3145728 #:range (1 3145728))
   (option maxGroups "--max-groups" "the most workgroups a dispatch has (groupLimit, 65535, or less to test the grid-stride loops)"
           #:default 65535 #:range (1 65535))
   (option targetOffset "--target-offset" "the camera's first pixel in the targets" #:default 0)

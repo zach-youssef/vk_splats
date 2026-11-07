@@ -26,7 +26,8 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | TileLasts | 3 | 1 | 0 | 0 | 64 |
 | BackwardRasterize | 7 | 1 | 0 | 14912 B (128 × (8 + 16 + 16) for a batch, 9 × 256 × 4 and 9 × 16 × 4 for the reduction) | 16 × 16 |
 | InvertEntries | 6 | 1 | 0 | 0 | 256 |
-| GatherGradients | 7 | 0 | 0 | 0 | 64 |
+| PlanChunks | 4 | 1 | 0 | 0 | 1 |
+| GatherGradients | 7 | 1 | 0 | 0 | 64 |
 | BackwardPreprocess | 7 | 1 | 0 | 0 | 64 |
 | Adam | 6 | 1 | 0 | 0 | 64 |
 | Record | 3 | 1 | 0 | 0 | 1 |
@@ -46,7 +47,7 @@ The largest buffers stay within `maxStorageBufferBindingSize` (128 MiB) and so w
 `maxBufferSize` (256 MiB): the rasterizer's `colours` at the programs' largest image, 2896² ×
 16 B = 134,189,056 B, and the tile entries' keys at their cap of 2²⁵ entries
 ([architecture.md](architecture.md#render-graph)), and the training graph's `entryGradients` at
-its cap of 3·2²⁰ entries, 113,246,208 B ([architecture.md](architecture.md#train-graph)), and
+one chunk pass's most, 3·2²⁰ entries, 113,246,208 B ([architecture.md](architecture.md#train-graph)), and
 its `Splat` buffers at splat_train's cap of 559240 splats (`--max-splats`), 134,217,600 B. A 1D dispatch is at most 65535 workgroups
 (`maxComputeWorkgroupsPerDimension`), as natively. ZGAL enables subgroups when the adapter has
 them, and the sort and scan kernels fall back to their variants without them otherwise; both fit.

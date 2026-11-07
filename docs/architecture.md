@@ -327,12 +327,20 @@ input).
    (same computation). For each entry, the workgroup reduces its 256 pixels' 9 values in shared
    memory (256 → 16 partial sums → 1, in a fixed order) and one invocation per value writes it to
    `entryGradients` (9 floats an entry): no float atomics (D4(b)). The entries past the tile's
-   last, which no pixel blended, get zeros.
+   last, which no pixel blended, get zeros. Steps 7's BackwardRasterize and 8's GatherGradients
+   run in chunk passes of `chunkEntries` sorted entries each (see Capacity below); pass c writes
+   only the entries in [c·chunkEntries, (c+1)·chunkEntries), at their offset in the chunk, and
+   walks a tile only from its last down to the chunk's first entry (the entries after the chunk
+   still undo the blend, so each pixel's T and R are what one pass would give).
 8. `InvertEntries` writes each sorted entry's index at its place before the sort (its splat's
    offset plus its index in the splat's tile rectangle, row by row, recovered from the key's
    tile). `GatherGradients` (one invocation per splat) then sums its entries' gradients in tile
    order into `splatGradients`. Places no entry maps to (only after a wrapped total) keep the
-   clear's 0xFFFFFFFF and are skipped, as are entries past the capacity.
+   clear's 0xFFFFFFFF and are skipped, as are entries past the capacity. In a chunk pass, a
+   splat's entries in the chunk are a contiguous run of its places (they share the depth, so they
+   sort by tile, the order of its places), found by binary search; the sum continues from the
+   previous pass's `splatGradients` (pass 0 starts at 0), so the additions and their order are
+   one pass's and the result is the same bits.
 9. `BackwardPreprocess` (64-wide, grid stride over the splats) runs `preprocessBackward`
    (`lib/splat_backward.zgal`) on each visible splat's `splatGradients`, recomputing its forward
    pass rather than storing it, into `parameterGradients`: a `Splat` of gradients (dL/dposition,
@@ -421,16 +429,34 @@ are read too, and `history` and the trained splats when the app enables `readHis
   costs one barrier per 256 entries). `TileLasts` cuts the walk at the last entry any pixel
   blended, so a saturated tile's tail past every pixel's stop costs only its zero writes. On a
   real scene it costs 4× the forward rasterize ([splat_train](#splat_train)'s numbers).
-- **Capacity**: the entry buffers are capped at 3·2²⁰ entries (`trainEntryCapacityMax`; a larger
-  `capacity` counts as that), so `entryGradients` (36 B an entry) stays within one binding's 128 MiB
-  (108 MiB). The rest of the render graph's capacity rules apply, but an app grows the capacity
-  with `grownTrainCapacity` (`grownCapacityUpTo`'s rule at most `trainEntryCapacityMax`), and a
-  frame needing more than the cap (`counts`' total past it) is truncated, the dropped entries'
-  gradients lost, so a trainer must fail on it rather than step. **Open limit**: a real scene at
-  full resolution can need 10M+ entries. Splitting `entryGradients` can't reach 2²⁵ within
-  WebGPU's 8 storage buffers (BackwardRasterize binds 7); processing the tiles in chunks past the
-  cap is left for when a real scene needs it (splat_train fails on it; the COLMAP scene at 748×748
-  needs at most 910k, before densification).
+- **Capacity**: two required parameters. `maxEntries` is the most entries a frame may hold (at
+  most 2²⁵, the 128 MiB binding of the 4-byte keys, sort and entry buffers; a larger `capacity`
+  counts as it), and `chunkEntries` the entries one backward pass holds (at most 3·2²⁰,
+  `trainChunkEntriesMax`, so `entryGradients`, 36 B an entry, fits one binding: 108 MiB).
+  `entryGradients` holds one chunk; the graph unrolls ⌈maxEntries / chunkEntries⌉ chunk passes (a
+  graph `for` of BackwardRasterize and GatherGradients nodes, each indirect), and `PlanChunks` (one
+  invocation, after the sort) writes their dispatch commands from the frame's `counts`: the
+  first ⌈entries / chunkEntries⌉ passes (at least one) get the full grid and the splats' groups,
+  the rest zero groups, so a frame runs only the passes it needs, with no host round trip or
+  extra submission. A frame that fits one chunk gets the same bits as one pass, at the cost of
+  `PlanChunks`, the unused passes' empty dispatches and the gather's binary search. Every pass
+  the graph holds is recorded every frame, an unused one as two zero-group dispatches and their
+  barriers, so the passes are at most 64 (`trainChunkPassesMax`): enough for chunks down to 2¹⁹
+  at 2²⁵ entries, and for the tests' dozens of small ones. TrainGraph can't fail, so past 64 it
+  holds only the first 64 passes, and an app refuses such parameters up front with
+  `trainChunkPasses` (splat_train's and grad_test's first frame). Splitting
+  `entryGradients` into bindings instead couldn't pass 2²⁵ within WebGPU's 8 storage buffers
+  (BackwardRasterize binds 7) and would cost the memory of a frame's whole entries at 36 B each.
+  The rest of the render graph's capacity rules apply; an app grows the capacity with
+  `grownCapacityUpTo` at most `maxEntries`, and a frame needing more than `maxEntries` (`counts`'
+  total past it) is truncated, the dropped entries' gradients lost, so a trainer must fail on it
+  rather than step. Past 2²⁵ would need the sort and the keys chunked too.
+  Memory: each entry of the capacity costs 20 B per frame in flight (the keys, the splat indices
+  and the positions, 4 B each, and the sort's scratch copies of the first two, 8 B), and
+  `entryGradients` 36 B per entry of the smaller of the capacity and a chunk. At splat_train's
+  default `--max-entries`, 2²⁵, a frame needing 25M entries (75% of it) grows the capacity to
+  2²⁵: 640 MiB per frame in flight, plus 108 MiB per frame of `entryGradients`. `--max-entries`
+  (and `--chunk-entries` for the gradients) is how an app caps that memory.
 - **Finite differences** (`finiteDifferences`, for grad_test): `Perturb` adds `perturbDelta` to
   one field (`perturbField`: opacity, a colour channel, the mean's x or y) of one splat's
   projection after the preprocess, so the tiles stay the same; or, with `perturbField` =
@@ -539,7 +565,8 @@ Its phases, in one graph:
    every densification), the densifications and the additions dropped for `--max-splats`; then
    writes the splats in use as the PLY, and fails if a loss or a splat isn't finite.
 
-The tile entries' capacity starts at `--initial-entries` and grows (`grownTrainCapacity`) after a
+The tile entries' capacity starts at `--initial-entries` and grows (`grownCapacityUpTo`, at most
+`--max-entries`, default and most 2²⁵) after a
 frame that needed more, from the counts read back after iteration 1's frame (loading's frames
 train nothing, and this way iteration 1 runs at `--initial-entries` whether a platform delivers a
 frame's reads before or after its frame event). On the web a tick's reads apply before its frame
@@ -547,7 +574,7 @@ event, so iteration 1's own counts are dropped: with `--iterations 1`, an overfl
 iteration 1 neither grows the capacity nor fails the run, it is only reported as skipped (a later
 pick of the same view is checked, so any longer run is covered). Adam skips a frame whose entries overflowed (its
 gradients are incomplete), so that iteration is lost (history −1) and counted in the report. A
-frame needing more than `trainEntryCapacityMax` entries, which no growth can hold, fails the
+frame needing more than `--max-entries` entries, which no growth can hold, fails the
 program, and so does an overflowing test view: each renders once, so a held-out camera needing
 more entries than any training view grew the capacity to fails the run after its training, with
 the `--initial-entries` to rerun with (the most a frame was seen to need, grown). Retrying the
@@ -598,7 +625,11 @@ from its points, up to 910k tile entries a frame, 500 iterations; medians): `bac
 0.08 ms. The backward's deterministic per-entry reduction (two barriers and a 9-value reduction
 per entry up to the tile's last, against the forward's one barrier per 256) is the training
 frame's largest cost, about 12 ns per entry across the GPU. Worth optimizing once densified
-scenes show it dominating (a follow-up).
+scenes show it dominating (a follow-up). These were measured before the chunk passes, when the graph had one
+`backwardRasterize` and one `gather` node. Each pass is now a node of its own (`backwardRasterize
+0`, `backwardRasterize 1`, ..., likewise `gather`), so `--timings` prints one line a pass. A
+frame's backward cost is the sum of its passes' times, and the unused passes' empty dispatches
+show up as near-zero lines.
 
 ## splat_render
 

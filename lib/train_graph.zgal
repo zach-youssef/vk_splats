@@ -10,7 +10,8 @@
 ;;      its splat's projection (the 2D mean, the conic, the activated opacity and the colour);
 ;;   8. the gather: each splat's gradients, the sum of its entries' (InvertEntries finds each of a
 ;;      splat's entries after the sort, GatherGradients sums them in a fixed order), into
-;;      splatGradients;
+;;      splatGradients. Steps 7 and 8 run in chunk passes of chunkEntries sorted entries each
+;;      (PlanChunks enables the passes a frame needs), with the same bits as one pass;
 ;;   9. the backward preprocess: each splat's gradients with respect to its parameters
 ;;      (BackwardPreprocess, lib/splat_backward.zgal's math), into parameterGradients, and the
 ;;      densification's statistics (densifyStats: the 2D mean's gradient norm and the frames that
@@ -30,17 +31,24 @@
 ;; ---------------------------------------------------------------------------------------------
 ;; Constants
 ;; ---------------------------------------------------------------------------------------------
-;; The most tile entries a training frame holds: 3 x 2^20, so their gradients (gradientStride
-;; floats, 36 bytes, an entry) stay within one binding's 128 MiB (108 MiB; docs/architecture.md).
-;; TrainGraph says 3145728 too (a graph expression can't name a constant).
-(define trainEntryCapacityMax (uint 3145728))
+;; The most tile entries one backward pass (a chunk: BackwardRasterize and GatherGradients) holds:
+;; 3 x 2^20, so their gradients (gradientStride floats, 36 bytes, an entry) stay within one
+;; binding's 128 MiB (108 MiB; docs/architecture.md). A frame's entries (at most TrainGraph's
+;; maxEntries, itself at most entryCapacityMax) take as many passes as they need of chunkEntries
+;; each. TrainGraph says 3145728 too (a graph expression can't name a constant).
+(define trainChunkEntriesMax (uint 3145728))
 
-;; A training app's capacity after a frame that needed `total` entries (grownCapacity, at most
-;; trainEntryCapacityMax). A frame needing more than trainEntryCapacityMax is truncated, its
-;; dropped entries' gradients lost, so a trainer must fail on one (counts' countTotal past
-;; trainEntryCapacityMax) rather than step on its gradients.
-(define (grownTrainCapacity [capacity : uint] [total : uint]) : uint
-  (grownCapacityUpTo capacity total trainEntryCapacityMax))
+;; The most backward passes TrainGraph holds. The graph records every pass it holds every frame,
+;; a pass the frame doesn't need as two zero-group dispatches and their barriers, so the count
+;; must stay small: 64 keeps those within 128 empty dispatches, and still lets the largest frame
+;; (2^25 entries) run in chunks down to 2^19 and the tests force dozens of passes (grad_test's
+;; 97-entry chunks of S3's 6000). An app must refuse parameters needing more (trainChunkPasses):
+;; TrainGraph can't fail, so it would hold only the first 64 passes. TrainGraph says 64 too.
+(define trainChunkPassesMax (uint 64))
+
+;; The backward passes TrainGraph's maxEntries and chunkEntries need (both at least 1)
+(define (trainChunkPasses [maxEntries : uint] [chunkEntries : uint]) : uint
+  (+ (/ (- maxEntries (uint 1)) chunkEntries) (uint 1)))
 
 ;; The floats an entry's gradients take in entryGradients, at these offsets
 (define gradientStride (uint 9))
@@ -158,6 +166,12 @@
 ;; 16 per value, then 1 of 16), so each entry's gradients are written once (entryGradients, at
 ;; gradientStride times the entry), in a fixed order: deterministic, and without float atomics.
 ;; Every invocation runs every loop (their bounds are the tile's), as the barriers need.
+;; One dispatch is one chunk: it writes the gradients of the entries in [chunkFirst, chunkFirst +
+;; chunkEntries) only, at gradientStride times (entry - chunkFirst). A tile's walk still starts at
+;; its last entry (an entry's gradients need the transmittance and colour behind it), and stops at
+;; the chunk's first, so each entry's arithmetic is the same whichever chunk holds it: the chunks'
+;; gradients are bit for bit one pass's. Only the tile straddling the chunk's end walks entries the
+;; chunk doesn't write (the next chunk's), so a chunk costs at most one tile's walk more.
 (compute-material BackwardRasterize
   (workgroup 16 16)
   (bindings
@@ -167,8 +181,8 @@
    (colours (buffer-array vec4 read))        ; the final transmittance in .w
    (lastEntries (buffer-array uint read))
    (pixelGrads (buffer-array vec4 read))     ; dL/dI in .rgb
-   (entryGradients (buffer-array float write)))
-  (push (width uint) (height uint) (background vec3))
+   (entryGradients (buffer-array float write)))  ; this chunk's entries'
+  (push (width uint) (height uint) (background vec3) (chunkFirst uint) (chunkEntries uint))
   ;; 128 x (8 + 16 + 16) + 9 x 256 x 4 + 9 x 16 x 4 bytes = 14912 (at most 16 KB:
   ;; docs/architecture.md)
   (shared
@@ -192,13 +206,19 @@
           [last (if inside (at lastEntries index) tileStart)]
           [dIdC (if inside (.rgb (at pixelGrads index)) (vec3 0.0))]
           [bgTerm (dot background dIdC)]
-          [batches (/ (+ (- tileLast tileStart) (- backwardBatch (uint 1))) backwardBatch)]
+          ;; The walk: from the tile's last entry back to the chunk's first or the tile's, none when
+          ;; the tile's entries all come after the chunk's
+          [chunkEnd (+ chunkFirst chunkEntries)]
+          [stop (max tileStart chunkFirst)]
+          [batches (if (and (< tileStart chunkEnd) (> tileLast stop))
+                       (/ (+ (- tileLast stop) (- backwardBatch (uint 1))) backwardBatch)
+                       (uint 0))]
           [(t behind lastAlpha lastColour)
            (fold ([t final.w] [behind (vec3 0.0)] [lastAlpha 0.0] [lastColour (vec3 0.0)])
                  ([b (range (uint 0) batches)])
              ;; Batch b holds [lo, hi): the last backwardBatch entries before the later batches'
              (let* ([hi (- tileLast (* b backwardBatch))]
-                    [lo (if (> (- hi tileStart) backwardBatch) (- hi backwardBatch) tileStart)]
+                    [lo (if (> (- hi stop) backwardBatch) (- hi backwardBatch) stop)]
                     [n (- hi lo)])
                (when (< lane n)
                  (let* ([p (at projected (at entrySplats (+ lo lane)))])
@@ -249,16 +269,20 @@
                        (write! (at partials lane) (sum ([i (range (uint 0) (uint 16))]) (at scratch (+ base i))))))
                    (barrier!)
                    ;; 9 invocations: value v = lane's 16 partial sums. The next entry's partials
-                   ;; are written after its first barrier, so these reads come first.
-                   (when (< lane gradientStride)
-                     (write! (at entryGradients (+ (* e gradientStride) lane))
+                   ;; are written after its first barrier, so these reads come first. Entries
+                   ;; from the chunk's end on are the next chunk's (e >= stop >= chunkFirst).
+                   (when (and (< lane gradientStride) (< e chunkEnd))
+                     (write! (at entryGradients (+ (* (- e chunkFirst) gradientStride) lane))
                              (sum ([i (range (uint 0) (uint 16))]) (at partials (+ (* lane (uint 16)) i)))))
                    (if live
                        (values before nextBehind alpha c)
                        (values t behind lastAlpha lastColour))))))])
-     ;; Entries past the tile's last (no pixel blended them): their gradients are 0
-     (for ([i (range lane (* (- tileEnd tileLast) gradientStride) (* tileSize tileSize))])
-       (write! (at entryGradients (+ (* tileLast gradientStride) i)) 0.0))
+     ;; Entries past the tile's last (no pixel blended them), the chunk's: their gradients are 0
+     (let* ([zeroFirst (max tileLast chunkFirst)]
+            [zeroEnd (min tileEnd chunkEnd)]
+            [zeros (if (> zeroEnd zeroFirst) (- zeroEnd zeroFirst) (uint 0))])
+       (for ([i (range lane (* zeros gradientStride) (* tileSize tileSize))])
+         (write! (at entryGradients (+ (* (- zeroFirst chunkFirst) gradientStride) i)) 0.0)))
      ;; The fold's values are only its state
      (when (< t 0.0) (return!)))))
 
@@ -292,6 +316,13 @@
 
 ;; 8b. Each splat's gradients: its entries' (those the frame holds), summed in the order of its
 ;; tiles, by one invocation, so the sum is the same every run. Culled splats' are 0.
+;; One dispatch is one chunk (BackwardRasterize's): it adds the splat's entries in [chunkFirst,
+;; chunkFirst + chunkEntries) to the sum the earlier chunks left in splatGradients (the first chunk
+;; starts at 0). A splat's entries have the same depth and ascending tiles, so the sort puts them
+;; in the order of its tiles: the chunk's are a run of them, found by a binary search, and the
+;; chunks add the same entries in the same order as one pass, bit for bit. Places past the frame's
+;; entries (a truncated frame's) map to none, after every entry; an entry outside the chunk (only
+;; after a wrapped total) adds nothing.
 (compute-material GatherGradients
   (workgroup 64)
   (bindings
@@ -299,31 +330,71 @@
    (offsets (buffer-array uint read))
    (counts (buffer-array uint read))
    (entryPositions (buffer-array uint read))
-   (entryGradients (buffer-array float read))
-   (splatGradients (buffer-array ProjectedGradient write))
+   (entryGradients (buffer-array float read))  ; this chunk's entries'
+   (splatGradients (buffer-array ProjectedGradient read-write))
    (splatCounts (buffer-array uint read)))
+  (push (chunkFirst uint) (chunkEntries uint))
   (compute
-   (let* ([entries (at counts countEntries)])
+   (let* ([entries (at counts countEntries)]
+          [chunkEnd (+ chunkFirst chunkEntries)]
+          [none (bitnot (uint 0))])
      (for ([s (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
        (let* ([first (at offsets s)]
-              [(mean conic opacity colour)
-               (fold ([mean (vec2 0.0)] [conic (vec3 0.0)] [opacity 0.0] [colour (vec3 0.0)])
-                     ([k (range (uint 0) (.tileCount (at projected s)))])
+              [tileCount (.tileCount (at projected s))]
+              ;; The splat's first tile whose entry is in the chunk or after it
+              [(low high)
+               (while ([low (uint 0)] [high tileCount]) (< low high)
+                 (let* ([middle (+ low (/ (- high low) (uint 2)))]
+                        [place (+ first middle)]
+                        [e (if (< place entries) (at entryPositions place) none)])
+                   (if (< e chunkFirst) (values (+ middle (uint 1)) high) (values low middle))))]
+              [sofar (if (= chunkFirst (uint 0))
+                         (ProjectedGradient (vec2 0.0) (vec3 0.0) 0.0 (vec3 0.0))
+                         (at splatGradients s))]
+              [(k more mean conic opacity colour)
+               (while ([k low] [more #t] [mean sofar.mean] [conic sofar.conic]
+                       [opacity sofar.opacity] [colour sofar.colour])
+                      (and more (< k tileCount))
                  (let* ([place (+ first k)]
-                        [e (if (< place entries) (at entryPositions place) (bitnot (uint 0)))])
-                   (if (< e entries)
-                       (let* ([b (* e gradientStride)])
-                         (values (+ mean (vec2 (at entryGradients (+ b gradientMean))
-                                               (at entryGradients (+ b gradientMean (uint 1)))))
-                                 (+ conic (vec3 (at entryGradients (+ b gradientConic))
-                                                (at entryGradients (+ b gradientConic (uint 1)))
-                                                (at entryGradients (+ b gradientConic (uint 2)))))
-                                 (+ opacity (at entryGradients (+ b gradientOpacity)))
-                                 (+ colour (vec3 (at entryGradients (+ b gradientColour))
-                                                 (at entryGradients (+ b gradientColour (uint 1)))
-                                                 (at entryGradients (+ b gradientColour (uint 2)))))))
-                       (values mean conic opacity colour))))])
+                        [e (if (< place entries) (at entryPositions place) none)])
+                   (cond
+                     [(>= e chunkEnd) (values k #f mean conic opacity colour)]
+                     [(and (>= e chunkFirst) (< e entries))
+                      (let* ([b (* (- e chunkFirst) gradientStride)])
+                        (values (+ k (uint 1)) #t
+                                (+ mean (vec2 (at entryGradients (+ b gradientMean))
+                                              (at entryGradients (+ b gradientMean (uint 1)))))
+                                (+ conic (vec3 (at entryGradients (+ b gradientConic))
+                                               (at entryGradients (+ b gradientConic (uint 1)))
+                                               (at entryGradients (+ b gradientConic (uint 2)))))
+                                (+ opacity (at entryGradients (+ b gradientOpacity)))
+                                (+ colour (vec3 (at entryGradients (+ b gradientColour))
+                                                (at entryGradients (+ b gradientColour (uint 1)))
+                                                (at entryGradients (+ b gradientColour (uint 2)))))))]
+                     [else (values (+ k (uint 1)) #t mean conic opacity colour)])))])
          (write! (at splatGradients s) (ProjectedGradient mean conic opacity colour)))))))
+
+;; 8c. Each chunk's dispatches (7b's and 8b's, which run once a chunk, after this and 8a), for
+;; the passes the graph holds: the frame's tile grid and the splats' groups for the chunks holding its entries
+;; (at least the first, which also zeroes the splats' sums), none for the rest, so the GPU runs
+;; as many chunks as the frame needs without the CPU waiting on its count.
+(compute-material PlanChunks
+  (workgroup 1)
+  (bindings
+   (counts (buffer-array uint read))
+   (splatCommands (buffer-array DispatchCommand read))
+   (backwardCommands (buffer-array DispatchCommand write))
+   (gatherCommands (buffer-array DispatchCommand write)))
+  (push (chunkEntries uint) (passes uint) (gridWidth uint) (gridHeight uint))
+  (compute
+   (let* ([entries (at counts countEntries)]
+          [needed (max (/ (+ entries (- chunkEntries (uint 1))) chunkEntries) (uint 1))])
+     (for ([c (range (uint 0) passes)])
+       (let* ([run (< c needed)])
+         (write! (at backwardCommands c)
+                 (if run (DispatchCommand gridWidth gridHeight (uint 1)) (DispatchCommand (uint 0) (uint 0) (uint 0))))
+         (write! (at gatherCommands c)
+                 (if run (at splatCommands 0) (DispatchCommand (uint 0) (uint 0) (uint 0)))))))))
 
 ;; A splat's densification statistics (12 bytes; Sec. 5.2): accumulated over the frames since the
 ;; first or the last densification (which clears them in its frame), for the densification
@@ -833,8 +904,20 @@
   (parameter maxGroups uint)
   ;; Whether the graph also reads back the scene, the projections and the gradients, for tests
   (parameter inspect bool)
-  ;; The entries' capacity this frame (at least 1), at most 3145728 (trainEntryCapacityMax): a
-  ;; larger one counts as that (counts' countCapacity says so)
+  ;; The most tile entries a frame may hold (at least 1; at most 33554432, entryCapacityMax: the
+  ;; keys' binding) and the most one backward pass holds (at least 1; at most 3145728,
+  ;; trainChunkEntriesMax: the entry gradients' binding). A frame's backward rasterize and gather
+  ;; run once a chunk of chunkEntries entries, as many chunks as its entries need: the graph holds
+  ;; ceil(maxEntries / chunkEntries) passes (chunkPasses), and PlanChunks gives the ones a frame
+  ;; doesn't need no work. Required: fewer, larger chunks take more memory (entryGradients is
+  ;; 36 B an entry of a chunk), and maxEntries bounds the capacity, and so the memory, a frame may take.
+  ;; The passes must be at most trainChunkPassesMax (64), which the app checks (trainChunkPasses):
+  ;; past it the graph holds only the first 64. The clamps below likewise only keep a bad
+  ;; caller's build bounded; the programs' option ranges refuse such values.
+  (parameter maxEntries uint)
+  (parameter chunkEntries uint)
+  ;; The entries' capacity this frame (at least 1), at most maxEntries: a larger one counts as that
+  ;; (counts' countCapacity says so)
   (input capacity (per-frame uint))
   (input background (per-frame vec3))
   ;; The targets (RGBA8 pixels, row by row: an images_<k>.bin), the pixels it holds and the
@@ -888,6 +971,10 @@
   ;; The buffers' sizes; this frame's are (/ (+ width 15) 16) and so on, written out where used
   (constant maxTileCount (* (/ (+ maxWidth 15) 16) (/ (+ maxHeight 15) 16)))
   (constant maxPixels (* maxWidth maxHeight))
+  ;; The entries' bounds (the parameters', clamped) and the backward passes
+  (constant entryMost (max (min maxEntries 33554432) 1))   ; entryCapacityMax
+  (constant chunkSize (max (min chunkEntries 3145728) 1))  ; trainChunkEntriesMax
+  (constant chunkPasses (min (/ (+ entryMost (- chunkSize 1)) chunkSize) 64))  ; trainChunkPassesMax
 
   ;; The splats: the file's, copied once into the first splatCount of `splats`
   (buffer-file splatSource Splat splatFile)
@@ -901,8 +988,8 @@
   (buffer commands DispatchCommand 1 #:frames per-frame)
   (buffer splatCounts uint 6 #:frames shared)  ; splatCountsSize
   (buffer splatCommands DispatchCommand 1 #:frames shared)
-  (buffer entryKeys uint (min capacity 3145728) #:frames per-frame)
-  (buffer entrySplats uint (min capacity 3145728) #:frames per-frame)
+  (buffer entryKeys uint (min capacity entryMost) #:frames per-frame)
+  (buffer entrySplats uint (min capacity entryMost) #:frames per-frame)
   (buffer ranges uint (* maxTileCount 2) #:frames per-frame)
   (buffer backwardRanges uint (* maxTileCount 3) #:frames per-frame)
   (buffer colours vec4 maxPixels #:frames per-frame)
@@ -922,8 +1009,12 @@
   (buffer ssimPartialsR vec4 maxPixels #:frames shared #:when dssim)
   (buffer ssimPartialsG vec4 maxPixels #:frames shared #:when dssim)
   (buffer ssimPartialsB vec4 maxPixels #:frames shared #:when dssim)
-  (buffer entryGradients float (* (min capacity 3145728) 9) #:frames per-frame)  ; gradientStride
-  (buffer entryPositions uint (min capacity 3145728) #:frames per-frame)
+  ;; One chunk's entries' (the frame's, when they're fewer)
+  (buffer entryGradients float (* (min (min capacity entryMost) chunkSize) 9) #:frames per-frame)  ; gradientStride
+  (buffer entryPositions uint (min capacity entryMost) #:frames per-frame)
+  ;; Each chunk's dispatches (PlanChunks)
+  (buffer backwardCommands DispatchCommand chunkPasses #:frames per-frame)
+  (buffer gatherCommands DispatchCommand chunkPasses #:frames per-frame)
   (buffer splatGradients ProjectedGradient maxSplats #:frames per-frame)
   (buffer parameterGradients Splat maxSplats #:frames per-frame)
   ;; Accumulated across frames, so shared: cleared in the graph's first frame (resetDensify) and by
@@ -967,7 +1058,7 @@
             #:push ((capacity maxSplats) (maxGroups maxGroups)) #:invocations (1) #:when train)
   (material resetting ResetOpacity splats adamM adamV splatCounts #:when train)
   (material planning PlanEntries counts commands
-            #:push ((capacity (min capacity 3145728)) (tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16))) (near near) (far far)
+            #:push ((capacity (min capacity entryMost)) (tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16))) (near near) (far far)
                     (maxGroups maxGroups))
             #:invocations (1))
   (material emitting EmitEntries projected offsets counts entryKeys entrySplats splatCounts
@@ -1007,14 +1098,20 @@
   (material lasting TileLasts ranges lastEntries backwardRanges
             #:push ((width width) (height height) (gridWidth (/ (+ width 15) 16)) (tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16))))
             #:invocations ((min (* (/ (+ width 15) 16) (/ (+ height 15) 16)) (* (max maxGroups 1) 64))))  ; 64: its workgroup size
+  (material chunking PlanChunks counts splatCommands backwardCommands gatherCommands
+            #:push ((chunkEntries chunkSize) (passes chunkPasses)
+                    (gridWidth (/ (+ width 15) 16)) (gridHeight (/ (+ height 15) 16)))
+            #:invocations (1))
+  ;; Run once a chunk (the loop's nodes push their chunk), with the tile grid PlanChunks gives
   (material backward BackwardRasterize projected entrySplats backwardRanges colours lastEntries pixelGrads
             entryGradients
-            #:push ((width width) (height height) (background background))
-            #:invocations ((* (/ (+ width 15) 16) 16) (* (/ (+ height 15) 16) 16)))
+            #:push ((width width) (height height) (background background) (chunkFirst 0)
+                    (chunkEntries chunkSize)))
   (material inverting InvertEntries projected offsets counts entryKeys entrySplats entryPositions
             #:push ((gridWidth (/ (+ width 15) 16))))
   (material gathering GatherGradients projected offsets counts entryPositions entryGradients
-            splatGradients splatCounts)
+            splatGradients splatCounts
+            #:push ((chunkFirst 0) (chunkEntries chunkSize)))
   (material backwardPreprocessing BackwardPreprocess splats cameras projected splatGradients
             parameterGradients densifyStats splatCounts
             #:push ((cameraIndex cameraIndex) (shDegree shDegree)))
@@ -1051,10 +1148,16 @@
   (reduce totalDelta lossDeltas (at losses 2) #:op add #:count (* width height) #:when finiteDifferences)
   ;; The backward pass
   (dispatch findLasts lasting)
-  (dispatch backwardRasterize backward)
   (clear clearPositions entryPositions #:value 4294967295)
   (dispatch invert inverting #:indirect (at commands 0))
-  (dispatch gather gathering #:indirect (at splatCommands 0))
+  ;; The backward rasterize and the gather, a chunk at a time (chunkPasses chunks, of which
+  ;; PlanChunks gives the ones the frame's entries don't reach no work)
+  (dispatch planChunks chunking)
+  (for ([chunk (range (uint 0) chunkPasses)])
+    (dispatch backwardRasterize backward #:indirect (at backwardCommands chunk)
+              #:push ((chunkFirst (* chunk chunkSize))))
+    (dispatch gather gathering #:indirect (at gatherCommands chunk)
+              #:push ((chunkFirst (* chunk chunkSize)))))
   (clear resetDensify densifyStats #:once #t)
   (dispatch backwardPreprocess backwardPreprocessing #:indirect (at splatCommands 0))
   ;; Training
