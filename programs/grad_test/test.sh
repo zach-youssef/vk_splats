@@ -15,7 +15,12 @@
 #   - S2's camera 0 with the L1 loss and the 1D dispatches capped at three workgroups (the
 #     grid-stride loops go round), twice, with the hashes compared (deterministic across runs, not
 #     only across frames);
-#   - S2's camera 1 with --target-pixels too small for it, which must fail.
+#   - the backward pass in chunks (--chunk-entries) against one pass: S3's camera 0 (5269 entries,
+#     at --capacity 6000) in chunks of 97 entries, 55 of them, so chunk boundaries fall
+#     within tiles, and its tiles past one batch (128 entries) span several chunks; and S2's camera 0 (26 entries) as
+#     above, in chunks of 5: their hashes must be one pass's, bit for bit;
+#   - S2's camera 1 with --target-pixels too small for it, and S3's camera 0 in more than 64
+#     chunks (trainChunkPassesMax), which must fail.
 # A <binary> ending in .js is the web build (test-web.sh), run under $NODE (node by default): each
 # run writes its checked frame's readbacks to <log name>-readbacks ($GRAD_TEST_READBACKS), and
 # <web-check dir>/grad_test_check runs the native checks on them; a copy with its gradients
@@ -96,6 +101,17 @@ if [ -z "$first" ] || [ "$first" != "$second" ]; then
     echo "grad_test: S2 camera 0 isn't deterministic: '$first', then '$second'" >&2
     status=1
 fi
+chunked=$(run "$out/s2" 0 s2-l1-chunked 16 --l1 --max-groups 3 --capacity 32 --chunk-entries 5)
+if [ -z "$chunked" ] || [ "$first" != "$chunked" ]; then
+    echo "grad_test: S2 camera 0 in chunks of 5 entries differs from one pass: '$first', then '$chunked'" >&2
+    status=1
+fi
+whole=$(run "$out/s3" 0 s3-camera-0-whole 16 --capacity 6000)
+chunked=$(run "$out/s3" 0 s3-camera-0-chunked 16 --capacity 6000 --chunk-entries 97)
+if [ -z "$whole" ] || [ "$whole" != "$chunked" ]; then
+    echo "grad_test: S3 camera 0 in chunks of 97 entries differs from one pass: '$whole', then '$chunked'" >&2
+    status=1
+fi
 # A camera whose pixels run past the targets must fail up front (S2's camera 1 starts at pixel
 # 4096, which is then the targets' end), not read past them
 # shellcheck disable=SC2046 # the arguments are words without spaces
@@ -104,6 +120,26 @@ if program short-targets --validation --frames 16 $("$python" "$here/scenes.py" 
         > "$out/short-targets.log" 2>&1 || ! grep -q "don't fit in --target-pixels" "$out/short-targets.log"; then
     cat "$out/short-targets.log" >&2
     echo "grad_test: FAILED, targets too short for the camera weren't refused" >&2
+    status=1
+fi
+# More backward passes than the graph holds (65 of 100 entries for --capacity 6500, past
+# trainChunkPassesMax's 64) must fail up front, not run a frame with entries left out
+# shellcheck disable=SC2046 # the arguments are words without spaces
+if program many-chunks --validation --frames 16 $("$python" "$here/scenes.py" "$out/s3" 0 \
+        "$out/many-chunks.bin") --capacity 6500 --chunk-entries 100 \
+        > "$out/many-chunks.log" 2>&1 || ! grep -q "backward passes of --chunk-entries 100, more than 64" "$out/many-chunks.log"; then
+    cat "$out/many-chunks.log" >&2
+    echo "grad_test: FAILED, more backward passes than the graph holds weren't refused" >&2
+    status=1
+fi
+# Exactly 64 passes (6400 entries of 100) is the most the graph holds, so it must run, which
+# pins the check as `>` rather than `>=`
+# shellcheck disable=SC2046 # the arguments are words without spaces
+if ! program max-chunks --validation --frames 16 $("$python" "$here/scenes.py" "$out/s3" 0 \
+        "$out/max-chunks.bin") --capacity 6400 --chunk-entries 100 \
+        > "$out/max-chunks.log" 2>&1; then
+    cat "$out/max-chunks.log" >&2
+    echo "grad_test: FAILED, exactly 64 backward passes weren't accepted" >&2
     status=1
 fi
 if [ -n "$web" ]; then

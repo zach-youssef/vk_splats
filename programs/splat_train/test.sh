@@ -27,6 +27,12 @@
 #     held-out PSNR reach 28 dB (37.0 on MoltenVK; a run ending on a reset scores about 13). Its
 #     PSNR swings by up to 0.7 dB with the least change to its inputs (docs/web.md#training-on-the-web),
 #     so one run can't hold it within 0.5 dB of native, and it isn't held to that.
+#   - chunks: the perturb start trained for 300 iterations (densifying at 100 and 200, the opacity
+#     reset at 200) twice, the backward pass in one chunk and in chunks of 997 entries (frames
+#     need up to about 12000: a dozen chunks, of 41 the graph holds at --max-entries 40000); the
+#     PLYs must be the same, byte for byte. The capacity starts above what any frame needs: when a
+#     growth lands depends on the counts' readback, so runs that grow aren't the same bit for bit;
+#   - max-entries: a run whose frames need more than --max-entries 1000 must fail, saying so.
 # Both train on (1 - 0.2) L1 + 0.2 D-SSIM (--lambda-dssim's default); on L1 alone they scored 35.9
 # and 32.9 dB, the loss falling 16.3 and 8.8 times.
 # Each run prints its PSNR and splat count, so a CI log shows the margins.
@@ -101,3 +107,36 @@ train perturb perturb 2000 --min-psnr "$(offset -0.5)" $ceiling --min-ratio 8 --
     --densify-until 1500
 train sparse sparse 1800 --min-psnr 28 --min-ratio 5 --min-skipped 0 --grow -- \
     --max-splats 12288 --max-screen-size 20 --densify-until 1500 --sh-degree 0
+
+# The backward pass in chunks trains the same splats, bit for bit, as in one
+dir="$out/chunks"
+mkdir -p "$dir"
+"$python" tools/make_synthetic.py perturb "$out/gt" "$dir/start" --seed 0 > /dev/null || fail "making the chunks start"
+for chunks in one many; do
+    log="$dir/$chunks.log"
+    case $chunks in
+        one) extra= ;;
+        *) extra="--max-entries 40000 --chunk-entries 997" ;;
+    esac
+    # shellcheck disable=SC2046,SC2086 # the arguments are words without spaces
+    SPLAT_TRAIN_PLY="$dir/$chunks.ply" program --validation --frames 364 \
+        $("$python" tools/scene_args.py --train "$dir/start") --iterations 300 --sh-interval 100 \
+        --initial-entries 20000 --max-splats 4096 --max-screen-size 20 --densify-from 100 \
+        --densify-interval 100 --reset-interval 200 --densify-until 300 $extra > "$log" 2>&1 ||
+        fail "the chunks run ($chunks) exited with $?"
+done
+log=
+cmp -s "$dir/one.ply" "$dir/many.ply" || fail "training in chunks of 997 entries differs from one chunk"
+echo "splat_train: chunks of 997 entries train the same splats as one chunk"
+
+# A frame needing more than --max-entries fails the run, naming the cap
+dir="$out/max-entries"
+mkdir -p "$dir"
+log="$dir/train.log"
+# shellcheck disable=SC2046 # the arguments are words without spaces
+if program --validation --frames 84 $("$python" tools/scene_args.py --train "$out/chunks/start") \
+        --iterations 20 --initial-entries 256 --max-entries 1000 --max-splats 4096 --max-screen-size 20 > "$log" 2>&1 ||
+        ! grep -q "tile entries, more than --max-entries 1000" "$log"; then
+    fail "a frame past --max-entries didn't fail the run"
+fi
+echo "splat_train: a frame past --max-entries fails the run"

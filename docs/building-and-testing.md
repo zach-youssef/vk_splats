@@ -215,6 +215,12 @@ differences:
 - Every run checks that the gradients are finite and prints a hash; test.sh compares two runs'
   hashes. The runs without `--finite-differences` also check that the next `--repeats` frames
   give the same bits.
+- **Chunks**: `--chunk-entries` sets how many tile entries one backward pass holds
+  ([architecture.md](architecture.md#train-graph)). test.sh checks that several passes give the
+  same hash as one: S2's camera 0 (26 entries) at 5 entries a pass, and S3's camera 0 (5269
+  entries) at 97, so a pass boundary falls inside a tile and inside a splat's entries. More
+  passes than the graph holds (`trainChunkPassesMax`, 64) must fail up front: `--capacity 6500
+  --chunk-entries 100`.
 
 ## Densification check
 
