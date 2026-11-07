@@ -357,6 +357,11 @@ Run GPU work (program tests, captures) one at a time on a machine. Locally that'
 Apple M4; a GPU test is done only when it passes with validation and synchronization validation and
 prints no validation message.
 
+A splat_train run that grows the tile entries' capacity isn't bit-deterministic from run to run:
+the frame a growth lands on depends on when the asynchronous counts readback arrives. Compare
+trained PLYs bit for bit only between runs that don't grow (start them with enough
+`--initial-entries`).
+
 ## Bumping the wrapper
 
 `external/vulkan_test` is pinned to a commit of github.com/zach-youssef/vulkan_testing. Bump it to
