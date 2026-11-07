@@ -553,8 +553,9 @@ Its phases, in one graph:
    `--reset-interval` (3000), or t = `--densify-from` with a white background, the frame also
    resets the opacity. The app prints each densification's counts as `readSplatCounts` brings
    them (`splat_train: densification K: N splats (P pruned, A added; O dropped for --max-splats
-   so far)`). A run ending on a reset scores the reset opacities (about 13 dB on S3), as the
-   reference would.
+   so far)`). The last iteration neither densifies nor resets: the reference scores and saves an
+   iteration before its densification and reset ([departure 17](paper-conformance.md#departures)).
+   A run ending soon after a reset still scores nearly reset opacities, as the reference would.
 3. **Evaluating**: each test view renders once with `lossEval` (the MSE of the clamped render, at
    the final SH degree; backward and Adam off) into `history[iterations + k]`.
 4. **Reading**: the history and the trained splats are read back (a readback event sees only the
@@ -607,8 +608,14 @@ splat_train reported, which checks the readback, the PSNR, the count and the exp
   12288` and SH degree 0. Densification must grow the count (`check.py --grow`: to 11470 of the 12288
   on lavapipe) and the held-out PSNR reach 28 dB (37.0 on MoltenVK). One run's PSNR swings by
   up to 0.7 dB with the least change to its inputs, so it isn't held to native's.
+- **last**: from perturb's start, 300 iterations densifying from 100 with `--reset-interval 300`:
+  iteration 200 densifies, and 300, the last, would densify and reset if it weren't (the reference
+  scores and saves an iteration before its densification and reset). It requires exactly one
+  densification (`check.py --densifications 1`), a held-out PSNR of 22 dB (26.7 on MoltenVK; a
+  reset on the last iteration scored 13.3) and a loss falling 2 times (3.3). The 22 dB bar comes
+  from MoltenVK alone; the lavapipe and web scores are recorded here after CI.
 
-Both train on (1 − 0.2)·L1 + 0.2·D-SSIM; with `--lambda-dssim 0` (L1 alone) they score 35.9 and
+perturb and sparse train on (1 − 0.2)·L1 + 0.2·D-SSIM; with `--lambda-dssim 0` (L1 alone) they score 35.9 and
 32.9 dB, the loss falling 16.3 and 8.8 times.
 
 Each run prints its held-out PSNR and splat count (and check.py its checks), so CI's log shows

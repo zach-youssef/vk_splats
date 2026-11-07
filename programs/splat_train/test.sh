@@ -3,7 +3,7 @@
 # the committed S3 scene (programs/splat_render/golden/s3) its ground truth with splat_render
 # (make_synthetic.py render-gt, the same build as <binary>: native, or the web build for a .js),
 # with SH degree 0: 22 training views can't pin down the random degree-3 colours well enough for
-# the held-out views in a short run. Two runs, at 128x128 (and the 160x96 view) with the
+# the held-out views in a short run. Two main runs, at 128x128 (and the 160x96 view) with the
 # reference's learning rates and densification schedule (from 500, every 100, the screen-space
 # prune at the reference's intended 20 px) but densifying until 1500 only, so that each run ends
 # with a few hundred plain Adam steps (as the reference's 15000 of 30000: a run ending on a
@@ -27,13 +27,18 @@
 #     held-out PSNR reach 28 dB (37.0 on MoltenVK; a run ending on a reset scores about 13). Its
 #     PSNR swings by up to 0.7 dB with the least change to its inputs (docs/web.md#training-on-the-web),
 #     so one run can't hold it within 0.5 dB of native, and it isn't held to that.
+#   - last: from perturb's start, 300 iterations densifying from 100 with --reset-interval 300, so
+#     iteration 200 densifies and the last, 300, would densify and reset if it weren't the last:
+#     the reference scores and saves an iteration before its densification and reset. It must
+#     densify once and score 22 dB (26.7 on MoltenVK, lavapipe and the web, the loss falling 3.3
+#     times; a reset on the last iteration scored 13.3);
 #   - chunks: the perturb start trained for 300 iterations (densifying at 100 and 200, the opacity
 #     reset at 200) twice, the backward pass in one chunk and in chunks of 997 entries (frames
 #     need up to about 12000: a dozen chunks, of 41 the graph holds at --max-entries 40000); the
 #     PLYs must be the same, byte for byte. The capacity starts above what any frame needs: when a
 #     growth lands depends on the counts' readback, so runs that grow aren't the same bit for bit;
 #   - max-entries: a run whose frames need more than --max-entries 1000 must fail, saying so.
-# Both train on (1 - 0.2) L1 + 0.2 D-SSIM (--lambda-dssim's default); on L1 alone they scored 35.9
+# perturb and sparse train on (1 - 0.2) L1 + 0.2 D-SSIM (--lambda-dssim's default); on L1 alone they scored 35.9
 # and 32.9 dB, the loss falling 16.3 and 8.8 times.
 # Each run prints its PSNR and splat count, so a CI log shows the margins.
 # $PYTHON (python3 by default) needs numpy and Pillow.
@@ -107,6 +112,8 @@ train perturb perturb 2000 --min-psnr "$(offset -0.5)" $ceiling --min-ratio 8 --
     --densify-until 1500
 train sparse sparse 1800 --min-psnr 28 --min-ratio 5 --min-skipped 0 --grow -- \
     --max-splats 12288 --max-screen-size 20 --densify-until 1500 --sh-degree 0
+train last perturb 300 --min-psnr 22 --min-ratio 2 --min-skipped 0 --densifications 1 -- \
+    --max-splats 4096 --max-screen-size 20 --densify-from 100 --reset-interval 300
 
 # The backward pass in chunks trains the same splats, bit for bit, as in one
 dir="$out/chunks"

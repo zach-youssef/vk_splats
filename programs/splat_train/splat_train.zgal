@@ -29,7 +29,9 @@
 ;;      a new seed each time) instead of stepping Adam (the reference's step finds no gradients on
 ;;      the new tensors, so it does nothing), and Adam's bias corrections count the steps taken. When t < --densify-until is
 ;;      a multiple of --reset-interval (or t = --densify-from with a white background), the
-;;      frame also resets the opacity. Each densification's counts are printed as they're read.
+;;      frame also resets the opacity. The last iteration does neither: the reference scores and
+;;      saves an iteration before its densification and reset. Each densification's counts are
+;;      printed as they're read.
 ;;   2. evaluating: each test view renders once with lossEval (its MSE on the clamped render) and
 ;;      the backward pass and Adam off, into history[iterations + k];
 ;;   3. reading: with Adam and Record off, the history, the splat counts (once they show every
@@ -64,14 +66,17 @@
 (define (iterating [phase : uint] [t : uint]) : bool
   (and (= phase phaseTraining) (> t (uint 0))))
 
-;; Whether iteration t densifies (the reference's: from < t < until, every interval)
-(define (densifying [t : uint] [from : uint] [until : uint] [interval : uint]) : bool
-  (and (> t from) (< t until) (= (remainder t (max interval (uint 1))) (uint 0))))
+;; Whether iteration t of last densifies (the reference's: from < t < until, every interval), except
+;; the last: the reference scores and saves iteration t before its densification and reset, so
+;; nothing it adds or resets on the last iteration is ever scored or written
+(define (densifying [t : uint] [last : uint] [from : uint] [until : uint] [interval : uint]) : bool
+  (and (> t from) (< t until) (< t last) (= (remainder t (max interval (uint 1))) (uint 0))))
 
-;; Whether iteration t resets the opacity (the reference's: every interval before until, and at
-;; from with a white background)
-(define (resetting [t : uint] [from : uint] [until : uint] [interval : uint] [white : bool]) : bool
-  (and (> t (uint 0)) (< t until) (or (= (remainder t (max interval (uint 1))) (uint 0)) (and white (= t from)))))
+;; Whether iteration t of last resets the opacity (the reference's: every interval before until,
+;; and at from with a white background), except the last, as densifying
+(define (resetting [t : uint] [last : uint] [from : uint] [until : uint] [interval : uint] [white : bool]) : bool
+  (and (> t (uint 0)) (< t until) (< t last)
+       (or (= (remainder t (max interval (uint 1))) (uint 0)) (and white (= t from)))))
 
 ;; Whether the entry counts read back now are acted on: not until training's first iteration is
 ;; under way, so loading's frames (which train nothing) don't grow the capacity and iteration 1 runs
@@ -260,7 +265,7 @@
               [pick (remainder (pcgHash (+ (pcgHash seed) t)) (count pool))])
          (with state #:iteration t #:camera (at pool pick)
                #:densifications (+ state.densifications
-                                   (if (densifying t densifyFrom densifyUntil densifyInterval) (uint 1) (uint 0)))
+                                   (if (densifying t iterations densifyFrom densifyUntil densifyInterval) (uint 1) (uint 0)))
                #:stack (collect ([j (range (uint 0) (count pool))]) (at pool j) #:when (not= j pick))))]
       [(and (or (= state.phase phaseTraining) (= state.phase phaseEvaluating))
             (< (if (= state.phase phaseTraining) (uint 0) (+ state.view (uint 1))) (count state.test)))
@@ -353,21 +358,21 @@
                   (gather (iterating state.phase state.iteration))
                   (backwardPreprocess (iterating state.phase state.iteration))
                   (adam (and (iterating state.phase state.iteration)
-                             (not (densifying state.iteration densifyFrom densifyUntil densifyInterval))))
+                             (not (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval))))
                   (record (or (iterating state.phase state.iteration) (= state.phase phaseEvaluating)))
-                  (densifyPrepare (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyMark (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyScan (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyCopySplats (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyScatter (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyCopyFirstMoments (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyScatterFirst (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyCopySecondMoments (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyScatterSecond (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyFinish (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
-                  (densifyClear (and (iterating state.phase state.iteration) (densifying state.iteration densifyFrom densifyUntil densifyInterval)))
+                  (densifyPrepare (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyMark (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyScan (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyCopySplats (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyScatter (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyCopyFirstMoments (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyScatterFirst (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyCopySecondMoments (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyScatterSecond (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyFinish (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
+                  (densifyClear (and (iterating state.phase state.iteration) (densifying state.iteration iterations densifyFrom densifyUntil densifyInterval)))
                   (resetOpacity (and (iterating state.phase state.iteration)
-                                     (resetting state.iteration densifyFrom densifyUntil resetInterval
+                                     (resetting state.iteration iterations densifyFrom densifyUntil resetInterval
                                                 (>= background 1.0))))
                   (readHistory (= state.phase phaseReading))
                   (readTrained (= state.phase phaseReading)))))

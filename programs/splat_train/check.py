@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""check.py <out dir> <splat_render> --min-psnr <dB> [--max-psnr <dB>] --min-ratio <r> --min-skipped <n> [--grow]:
-checks a test.sh splat_train run, from its log (<out dir>/train.log) and its PLY (<out dir>/trained.ply).
+"""check.py <out dir> <splat_render> --min-psnr <dB> [--max-psnr <dB>] --min-ratio <r> --min-skipped <n> [--grow]
+[--densifications <n>]: checks a test.sh splat_train run, from its log (<out dir>/train.log) and its PLY
+(<out dir>/trained.ply).
 
 - the held-out PSNR splat_train reports is at least --min-psnr (and at most --max-psnr: a score
   past it means the reference test.sh derives the thresholds from is stale), and the first
@@ -8,7 +9,7 @@ checks a test.sh splat_train run, from its log (<out dir>/train.log) and its PLY
 - at least --min-skipped iterations were skipped for overflowing (test.sh starts the capacity
   small to cover the skip);
 - the splats in use, as splat_train reports them, are at most --max-splats, and with --grow more
-  than the start's, after at least one densification;
+  than the start's, after at least one densification; with --densifications, exactly that many ran;
 - the PLY holds the splats in use, all finite;
 - the PLY, written into a copy of the start scene (its manifest's splatCount the PLY's) and rendered by splat_render from each
   held-out camera, scores within 0.5 dB of the PSNR splat_train reported for that view against
@@ -54,6 +55,8 @@ def main():
     parser.add_argument("--min-skipped", type=int, required=True)
     parser.add_argument("--grow", action="store_true",
                         help="require densification to have grown the splats")
+    parser.add_argument("--densifications", type=int,
+                        help="require exactly this many densifications")
     args = parser.parse_args()
     with open(os.path.join(args.out, "train.log")) as f:
         log = f.read()
@@ -86,6 +89,8 @@ def main():
         errors.append(f"splat_train started from {start_count} splats, not the scene's {manifest['splatCount']}")
     if in_use > most:
         errors.append(f"{in_use} splats are in use, more than --max-splats {most}")
+    if args.densifications is not None and densifications != args.densifications:
+        errors.append(f"{densifications} densifications ran, not {args.densifications}")
     if args.grow and not (in_use > start_count and densifications > 0):
         errors.append(f"densification didn't grow the splats ({start_count} to {in_use}, {densifications} densifications)")
     trained = splats.read_ply(os.path.join(args.out, "trained.ply"))

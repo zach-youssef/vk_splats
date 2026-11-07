@@ -69,7 +69,9 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   PSNR (45 dB). It has no externs, so unlike render_test it needs no `.inputs.ts`.
 - **splat_train**: the native test, its ground truth rendered by splat_render's web build and its
   re-renders too, at the same thresholds: perturb within 0.5 dB of the native builds' PSNR (the
-  web's parity check: [Training on the web](#training-on-the-web)), sparse at 28 dB. Its
+  web's parity check: [Training on the web](#training-on-the-web)), sparse at 28 dB, and last (one
+  densification, the last iteration neither densifying nor resetting) at 22 dB, a bar taken from
+  MoltenVK's 26.7 that the first web run will confirm. Its
   `.inputs.ts` writes the PLY with Node's `fs`, so the web build's export works only under Node.
 - **render_test**: every run of the native test (S1 with the oracle, the off-centre variant, S2
   twice with the hashes compared, S3). Its checks are C++ (`render_check.h` with
@@ -92,7 +94,7 @@ camera order and the densification's seeds from `pcgHash` (in the TypeScript hos
 compilers. Training needs no more than WebGPU's default limits (the table above); none bit.
 
 perturb's held-out PSNR is within 0.5 dB of native, and the test checks it; sparse's isn't in
-one run, though it is on average. Measured on S3 (test.sh's two runs; `--seed` changes only the
+one run, though it is on average. Measured on S3 (test.sh's perturb and sparse runs; `--seed` changes only the
 camera order; test.sh runs seed 0):
 
 | Run | Native | Web | Native − web |

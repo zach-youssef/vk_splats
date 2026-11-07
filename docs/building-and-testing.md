@@ -43,7 +43,9 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   A training test ends several hundred iterations after its last densification or opacity reset
   (splat_train's `--densify-until 1500` in 2000 and 1800-iteration runs): right after one, fresh
   clones and splits are untrained and a reset has just cut every opacity, so the score says
-  little about the trainer (a sparse run ending on a reset scores about 13 dB instead of 33).
+  little about the trainer (a sparse run ending just after a reset scores about 13 dB instead of 33).
+  The last iteration itself never densifies or resets (paper-conformance.md, departure 17),
+  which splat_train's `last` run checks.
   A test that runs another program (splat_train's renders its ground truth with splat_render)
   names that build in its `program.mk`: `test-<name>: $(OUT)/<other>/<other>` and
   `test-web-<name>: $(OUT)/web/<other>`.

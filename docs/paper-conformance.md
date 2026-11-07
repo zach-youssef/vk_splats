@@ -182,6 +182,10 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     `--densify-from`, and every reset when `--reset-interval` isn't a multiple of
     `--densify-interval`. On those the opacity takes one more step before the reset's clamp to
     0.01, and its bias corrections count that frame.
+17. **The last iteration**: it neither densifies nor resets the opacity (the reference scores and
+    saves iteration t before its densification and reset, so what those do on the last iteration
+    is never scored or written), but it steps Adam, which the reference's last iteration doesn't
+    (`if iteration < opt.iterations`): the scored splats have had one more step, one of N.
 
 ## How correctness is checked
 
