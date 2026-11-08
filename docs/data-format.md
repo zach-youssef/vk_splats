@@ -151,13 +151,110 @@ writes degree 3, with zero normals.
 
 ## Stream files
 
-A stream is one file of splats that a viewer can draw while it downloads; its header carries a
-default camera. `tests/cpp/default_camera_test.cpp` checks the camera.
+A stream is one little-endian file of splats that a viewer can draw while it downloads:
+
+```
+[StreamHeader (432 B)][base record × splatCount][SH record × splatCount]
+```
+
+Once the base records have arrived every splat can be drawn (at degree 0); the SH records add the
+higher bands as they follow. Each field group has its own encoding, given in the header, so
+changing the precision needs no rebuild. The format, `checkStreamHeader` and the decode are
+`lib/splat_stream.zgal` (so the shaders, the C++ and the TypeScript run the same code); the
+encoder is `lib/native/stream_encoder.h`. `tests/cpp/splat_stream_test.cpp` checks them, and
+`tests/cpp/default_camera_test.cpp` the default camera.
+
+### Header
+
+std430, no padding; offsets in bytes:
+
+| Offset | Field | |
+|---|---|---|
+| 0 | `magic` | `"SPLS"` (`streamMagic`, 1397510227 as a little-endian uint) |
+| 4 | `version` | 1 |
+| 8 | `splatCount` | at most 559,240 (`streamMaxSplats`: the f32 `Splat` buffer's 128 MiB) |
+| 12 | `shDegree` | 0–3: the SH record holds bands 1 to `shDegree` |
+| 16 | `baseStride` | bytes per base record, a multiple of 4, at most 56 |
+| 20 | `shStride` | bytes per SH record, a multiple of 4, at most 180, and 0 at degree 0 |
+| 24 | `baseOffset` | 432 |
+| 28 | `shOffset` | `baseOffset + splatCount · baseStride`; the file ends at `shOffset + splatCount · shStride` |
+| 32 | `camera` | a `Camera` (112 B): the default camera, below |
+| 144 | `fields[6]` | one `StreamField` (48 B) per group |
+
+The groups, in `fields` order, with `Splat`'s components:
+
+| Group | Record | Components |
+|---|---|---|
+| 0 position | base | xyz |
+| 1 scale | base | log-scale xyz |
+| 2 rotation | base | (w, x, y, z) |
+| 3 opacity | base | the logit |
+| 4 DC | base | `sh[0..2]` |
+| 5 SH | SH | `sh[3..]`: 3·((d+1)² − 1), `sh[3k + c]` order |
+
+A `StreamField` is `encoding`, `components`, `offset` (the first component's byte within its
+record; the components follow it, `encodingSize` bytes each) and `sharedRange` (uints), then
+`low` and `stepSize` (vec4s). The encodings:
+
+| Value | Encoding | Bytes | Decode |
+|---|---|---|---|
+| 0 | f32 | 4 | the bits |
+| 1 | f16 | 2 | IEEE half (the encoder rounds to nearest, ties to even) |
+| 2 | u16 | 2 | `low + stepSize · q` in float32 |
+| 3 | u8 | 1 | `low + stepSize · q` in float32 |
+
+A quantized component's range is `low[c]` and `stepSize[c]`, or `.x` of both for every component
+when `sharedRange` is 1 (required for SH, whose components outnumber a vec4's). The encoder
+computes `stepSize = (high − low) / (2^bits − 1)` in float32 and stores it, so a decode needn't
+redo the division; `low` and `stepSize` are zero for f32 and f16. A component sits within one
+little-endian word (offsets are aligned to the component's size and records start on words), so
+`decodeComponent` decodes it from that word and its byte offset.
+
+`checkStreamHeader` returns `streamOk` (0) or the first problem: 1 magic, 2 version, 3 SH degree,
+4 too many splats, 5 a stride not a multiple of 4, above its maximum, or a nonzero `shStride` at
+degree 0, 6 `baseOffset` or
+`shOffset` not where they must be, 7 an encoding, 8 a group's component count (for the SH group,
+at `shDegree`), 9 `sharedRange` (not 0 or 1, or 0 with more than four components), 10 a field
+misaligned, past its record's stride, or overlapping another base field. It doesn't check the
+file's size, which a stream doesn't know up front: the reader fails on an early end or extra
+bytes. A stride may be larger than its fields need (the rest is padding). Each field's offset is
+bounded by its stride before its end is computed, so with the stride caps no offset computed from
+a checked header overflows a uint, and the largest stream (131,981,072 B) fits one 128 MiB
+binding.
+
+### Encoder
+
+`encodeStream(splats, config, out, report)` takes an `EncodeConfig`: `shDegree` and, per group,
+the encoding and how a quantized range is chosen: `kRangeData` (the data's minimum and maximum, per
+component, or over every component for SH) or `kRangeExplicit` (`lo`, `hi`, per component or
+`[0]` for SH; values outside are clamped). f32 and f16 groups must say `kRangeNone`. A quantized
+rotation is normalized first; an f32 one is copied as it is. Each value is encoded to the code
+whose float32 decode is nearest.
+
+`streamLayout` gives the header's layout: base fields are placed largest component first (group
+order within a size), so only the stride's rounding to 4 pads a record, and padding bytes are
+zero, so the bytes are deterministic. The presets' records:
+
+| Preset | Position | Scale | Rotation | Opacity | DC | SH | Base / SH stride |
+|---|---|---|---|---|---|---|---|
+| full | f32 | f32 | f32 | f32 | f32 | f32 | 56 / 180 |
+| f16 | f32 | f16 | f16 | f16 | f16 | f16 | 36 / 92 |
+| web | f32 | f16 | u8, [−1, 1] | u8, data | f16 | u8, data | 32 / 48 |
+
+The report gives each group's largest error over every splat and component, raw and activated
+(exp of the scale, sigmoid of the opacity, the angle in radians between the rotations, the value
+itself otherwise; an exp overflow that changes the value counts as infinite), decoding through
+`decodeComponent`, so it measures what the shaders read. The entry points (and `defaultCamera`)
+take plain structs and spans and return a status, never throwing. `encodeStream`'s statuses: a bad
+config (with the group; `groupCount` for `shDegree`), too many splats, an output of the wrong size,
+a range too wide for a float step (with the group), out of memory, and, with the group and the
+splat, a non-finite input value, a zero quantized rotation or an f16 overflow (|v| ≥ 65520).
+Values the stream drops (SH above `shDegree`) aren't checked.
 
 ### Default camera
 
-`lib/native/default_camera.h` gives a default camera framing a scene, so a viewer opening a scene
-without cameras still sees it. Per axis, the order statistics at
+The encoder writes a default camera into the header (`lib/native/default_camera.h`), so a viewer
+opening a scene without cameras still sees it. Per axis, the order statistics at
 `floor(p (N − 1))` for p = 0.05 and 0.95 bound a box (robust to a few floaters), with centre c and
 radius r, half its diagonal (1 for a point; an empty scene has c = 0, r = 1). The camera is
 1280×720 with a 60° vertical field of view (fx = fy = 360√3, principal point at the centre),

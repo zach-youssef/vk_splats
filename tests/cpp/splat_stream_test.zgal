@@ -1,0 +1,23 @@
+;; The stream format for its C++ test (splat_stream_test.cpp includes the generated
+;; splat_stream_test.zgal.h, whose namespace is this file's name, and the encoder in lib/native/ on
+;; top of it). The probe material calls the header check and the decode, so the build also compiles
+;; them to GLSL (glslc checks them); the test never runs it.
+(import "../../lib/splat_stream.zgal")
+
+(compute-material SplatStreamProbe
+  (workgroup 64)
+  (bindings
+   (headers (buffer-array StreamHeader))
+   (words (buffer-array uint))
+   (decoded (buffer-array float))
+   (codes (buffer-array uint)))
+  (push (count uint))
+  (compute
+   (let* ([i globalInvocationId.x])
+     (when (< i count)
+       (let* ([h (at headers 0)]
+              [f (at h.fields (remainder i groupCount))]
+              [c (remainder i (uint 4))]
+              [byteOffset (+ h.baseOffset (* i h.baseStride) (componentOffset f c))])
+         (write! (at decoded i) (decodeComponent f c (at words (shr byteOffset (uint 2))) byteOffset))
+         (write! (at codes i) (checkStreamHeader h)))))))

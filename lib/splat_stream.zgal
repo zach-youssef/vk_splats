@@ -1,0 +1,213 @@
+;; The splat stream format (docs/data-format.md, "Stream files"): one file, [StreamHeader][base
+;; record x N][SH record x N], so a viewer can draw every splat once its base records have arrived and
+;; add the higher SH bands as their records follow. Each field group (position, scale, rotation,
+;; opacity, DC, SH) has its own encoding, given in the header, so changing the precision needs no
+;; rebuild. The encoder is C++ (lib/native/stream_encoder.h); the decode and the header check are
+;; here, so the shaders, the C++ encoder's error report and the TypeScript (web) openers all run the
+;; same code. Every function here is pure, so ZGAL compiles it to GLSL, C++ and TypeScript.
+(import "splat_math.zgal")
+
+;; ---------------------------------------------------------------------------------------------
+;; Structs
+;; ---------------------------------------------------------------------------------------------
+;; One field group's encoding (48 bytes). Its components are consecutive in its record, from byte
+;; `offset`, each `encodingSize encoding` bytes. A quantized component q decodes to
+;; low + stepSize q, with low and stepSize per component (.x to .w), or both from .x for every
+;; component when sharedRange is 1 (the SH group, whose components outnumber a vec4's). low and
+;; stepSize are zero for f32 and f16.
+(struct StreamField
+  (encoding uint)          ; encodingF32, encodingF16, encodingU16 or encodingU8
+  (components uint)        ; how many, groupComponents of the group
+  (offset uint)            ; the first component's byte offset within the record
+  (sharedRange uint)       ; 1: every component uses low.x and stepSize.x; 0: per component
+  (low vec4)
+  (stepSize vec4))         ; (high - low) / (2^bits - 1), computed by the encoder in float32
+
+;; The stream's header (432 bytes, std430 with no padding). The base records start at baseOffset
+;; (= streamHeaderSize), the SH records at shOffset = baseOffset + splatCount baseStride, and the
+;; file ends at shOffset + splatCount shStride.
+(struct StreamHeader
+  (magic uint)             ; streamMagic
+  (version uint)           ; streamVersion
+  (splatCount uint)
+  (shDegree uint)          ; 0-3: the SH record holds the bands 1 to shDegree
+  (baseStride uint)        ; bytes per base record, a multiple of 4
+  (shStride uint)          ; bytes per SH record, a multiple of 4 (0 at degree 0, required)
+  (baseOffset uint)
+  (shOffset uint)
+  (camera Camera)          ; a default camera framing the scene (the encoder's), at offset 32
+  (fields (array StreamField 6)))  ; indexed by group, at offset 144
+
+;; ---------------------------------------------------------------------------------------------
+;; Constants
+;; ---------------------------------------------------------------------------------------------
+;; "SPLS" in the file's first four bytes, read as a little-endian uint
+(define streamMagic (uint 1397510227))
+(define streamVersion (uint 1))
+(define streamHeaderSize (uint 432))
+;; The f32 Splat working buffer's binding limit (128 MiB / 240 B), docs/architecture.md's budgets
+(define streamMaxSplats (uint 559240))
+
+;; Encodings: f32 is a bit copy, f16 IEEE half precision (rounded to nearest even), u16 and u8 an
+;; unsigned integer q decoding to low + stepSize q
+(define encodingF32 (uint 0))
+(define encodingF16 (uint 1))
+(define encodingU16 (uint 2))
+(define encodingU8 (uint 3))
+(define encodingCount (uint 4))
+
+;; The field groups, in the header's order; the first five are in the base record, SH in the SH
+;; record. Their components are Splat's: position xyz, logScale xyz, rotation (w, x, y, z), opacity
+;; (the logit), DC sh[0..2] and SH sh[3..] (bands 1 to shDegree, sh[3k + c] order).
+(define groupPosition (uint 0))
+(define groupScale (uint 1))
+(define groupRotation (uint 2))
+(define groupOpacity (uint 3))
+(define groupDc (uint 4))
+(define groupSh (uint 5))
+(define groupCount (uint 6))
+
+;; The largest strides: every field f32, which is also the tightest layout of every field f32, so
+;; the stream at streamMaxSplats is 432 + 236 559,240 = 131,981,072 bytes, within one 128 MiB
+;; binding; with checkField keeping each field within its stride (bounding the offset before adding
+;; to it), no offset computed from a checked header can overflow a uint
+(define maxBaseStride (uint 56))
+(define maxShStride (uint 180))
+
+;; checkStreamHeader's results
+(define streamOk (uint 0))
+(define streamBadMagic (uint 1))
+(define streamBadVersion (uint 2))
+(define streamBadShDegree (uint 3))
+(define streamTooManySplats (uint 4))
+(define streamBadStride (uint 5))         ; not a multiple of 4, above the maximum, or SH at degree 0
+(define streamBadOffset (uint 6))         ; baseOffset or shOffset not where they must be
+(define streamBadEncoding (uint 7))
+(define streamBadComponents (uint 8))     ; not the group's count at this shDegree
+(define streamBadSharedRange (uint 9))    ; neither 0 nor 1, or 0 with more than 4 components
+(define streamBadFieldLayout (uint 10))   ; misaligned, past its record's stride, or overlapping
+
+;; ---------------------------------------------------------------------------------------------
+;; Layout
+;; ---------------------------------------------------------------------------------------------
+;; Bytes per component of an encoding (a valid one)
+(define (encodingSize [encoding : uint]) : uint
+  (cond [(= encoding encodingF32) (uint 4)]
+        [(= encoding encodingU8) (uint 1)]
+        [else (uint 2)]))
+
+;; Bits of a quantized encoding's integers (16 for u16, 8 for u8)
+(define (encodingBits [encoding : uint]) : uint
+  (if (= encoding encodingU8) (uint 8) (uint 16)))
+
+(define (isQuantized [encoding : uint]) : bool
+  (or (= encoding encodingU16) (= encoding encodingU8)))
+
+;; SH coefficients per channel above the DC term at a degree: (d + 1)^2 - 1
+(define (shCoefficients [shDegree : uint]) : uint
+  (- (* (+ shDegree (uint 1)) (+ shDegree (uint 1))) (uint 1)))
+
+;; A group's component count at an SH degree
+(define (groupComponents [group : uint] [shDegree : uint]) : uint
+  (cond [(= group groupRotation) (uint 4)]
+        [(= group groupOpacity) (uint 1)]
+        [(= group groupSh) (* (uint 3) (shCoefficients shDegree))]
+        [else (uint 3)]))
+
+;; The byte just past a field's last component
+(define (fieldEnd [f : StreamField]) : uint
+  (+ f.offset (* f.components (encodingSize f.encoding))))
+
+;; Component c's byte offset within its record
+(define (componentOffset [f : StreamField] [c : uint]) : uint
+  (+ f.offset (* c (encodingSize f.encoding))))
+
+;; Whether two fields' bytes overlap (empty fields overlap nothing)
+(define (fieldsOverlap [a : StreamField] [b : StreamField]) : bool
+  (and (> a.components (uint 0)) (> b.components (uint 0))
+       (< a.offset (fieldEnd b)) (< b.offset (fieldEnd a))))
+
+;; One field's own checks against its group and record stride, streamOk when it passes
+(define (checkField [f : StreamField] [group : uint] [shDegree : uint] [stride : uint]) : uint
+  (cond [(>= f.encoding encodingCount) streamBadEncoding]
+        [(not= f.components (groupComponents group shDegree)) streamBadComponents]
+        [(or (> f.sharedRange (uint 1)) (and (= f.sharedRange (uint 0)) (> f.components (uint 4))))
+         streamBadSharedRange]
+        ;; The offset is bounded before fieldEnd adds to it, so a crafted offset near 2^32 can't wrap
+        ;; to a small end (components is at most 45 here, so the size can't overflow)
+        [(or (not= (remainder f.offset (encodingSize f.encoding)) (uint 0)) (> f.offset stride)
+             (> (* f.components (encodingSize f.encoding)) (- stride f.offset)))
+         streamBadFieldLayout]
+        [else streamOk]))
+
+;; Checks a header before anything reads the records: streamOk, or the first problem found. It
+;; doesn't check the file's size, which a stream doesn't know up front: the reader fails on an early
+;; end or extra bytes.
+(define (checkStreamHeader [h : StreamHeader]) : uint
+  (cond
+    [(not= h.magic streamMagic) streamBadMagic]
+    [(not= h.version streamVersion) streamBadVersion]
+    [(> h.shDegree (uint 3)) streamBadShDegree]
+    [(> h.splatCount streamMaxSplats) streamTooManySplats]
+    [(or (not= (remainder h.baseStride (uint 4)) (uint 0)) (> h.baseStride maxBaseStride)
+         (not= (remainder h.shStride (uint 4)) (uint 0)) (> h.shStride maxShStride)
+         (and (= h.shDegree (uint 0)) (not= h.shStride (uint 0))))
+     streamBadStride]
+    [(or (not= h.baseOffset streamHeaderSize)
+         (not= h.shOffset (+ h.baseOffset (* h.splatCount h.baseStride))))
+     streamBadOffset]
+    [else
+     ;; Each field's own checks, then the base fields' overlaps, keeping the first problem
+     (let* ([own (fold ([result streamOk]) ([g (range 0 6)])
+                   (if (not= result streamOk)
+                       result
+                       (checkField (at h.fields g) (uint g) h.shDegree
+                                   (if (= (uint g) groupSh) h.shStride h.baseStride))))])
+       (if (not= own streamOk)
+           own
+           (fold ([result streamOk]) ([a (range 0 5)] [b (range 0 5)])
+             (if (and (< a b) (fieldsOverlap (at h.fields a) (at h.fields b)))
+                 streamBadFieldLayout
+                 result))))]))
+
+;; ---------------------------------------------------------------------------------------------
+;; Decoding
+;; ---------------------------------------------------------------------------------------------
+;; The bits of the component at byte offset `byteOffset` (aligned to its size) within the
+;; little-endian word holding it, word = the stream's uint at byteOffset / 4
+(define (componentBits [word : uint] [byteOffset : uint] [encoding : uint]) : uint
+  (cond [(= encoding encodingF32) word]
+        [(= encoding encodingU8) (bitand (shr word (* (uint 8) (bitand byteOffset (uint 3)))) (uint 255))]
+        [else (bitand (shr word (* (uint 8) (bitand byteOffset (uint 2)))) (uint 65535))]))
+
+;; An IEEE half's value from its 16 bits, exactly (every half is a float32): GLSL's unpackHalf2x16,
+;; which ZGAL doesn't have, written with bit operations
+(define (decodeHalf [h : uint]) : float
+  (let* ([signBit (shl (bitand h (uint 32768)) (uint 16))]
+         [exponent (bitand (shr h (uint 10)) (uint 31))]
+         [mantissa (bitand h (uint 1023))])
+    (uintBitsToFloat
+     (bitor signBit
+            (cond
+              ;; Zero and subnormals: mantissa 2^-24, a normal float32 (or zero), exact
+              [(= exponent (uint 0)) (floatBitsToUint (* (float mantissa) 5.9604644775390625e-8))]
+              ;; Infinities and NaNs
+              [(= exponent (uint 31)) (bitor (uint 2139095040) (shl mantissa (uint 13)))]
+              ;; Normals: rebias the exponent from 15 to 127
+              [else (bitor (shl (+ exponent (uint 112)) (uint 23)) (shl mantissa (uint 13)))])))))
+
+;; A quantized value: low + stepSize q, in float32 (the encoder's report and the shaders use this)
+(define (dequantize [q : uint] [low : float] [stepSize : float]) : float
+  (+ low (* stepSize (float q))))
+
+;; A component's value from its bits (componentBits), with its range for quantized encodings
+(define (decodeBits [bits : uint] [encoding : uint] [low : float] [stepSize : float]) : float
+  (cond [(= encoding encodingF32) (uintBitsToFloat bits)]
+        [(= encoding encodingF16) (decodeHalf bits)]
+        [else (dequantize bits low stepSize)]))
+
+;; Field f's component c, from the word holding it at byte offset `byteOffset` (in the stream or the
+;; record, any offset with the same remainder by 4: records start on words)
+(define (decodeComponent [f : StreamField] [c : uint] [word : uint] [byteOffset : uint]) : float
+  (let* ([r (if (= f.sharedRange (uint 1)) (uint 0) c)])
+    (decodeBits (componentBits word byteOffset f.encoding) f.encoding (at f.low r) (at f.stepSize r))))

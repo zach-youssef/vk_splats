@@ -35,8 +35,11 @@
   - `ssim.zgal`: the D-SSIM term's forward and backward kernels (a separable 11×11 Gaussian
     window), which add to the Loss kernel's per-pixel losses and gradients
     ([below](#train-graph)).
-  - `native/`: header-only C++ on top of the C++ ZGAL generates for those modules: the default
-    camera framing a scene (`default_camera.h`, [data-format.md](data-format.md#default-camera)).
+  - `splat_stream.zgal`: the stream format's header, its check and its decode
+    ([data-format.md](data-format.md#stream-files)); it imports `splat_math.zgal`.
+  - `native/`: header-only C++ on top of the C++ ZGAL generates for those modules: the stream
+    encoder (`stream_encoder.h`) and the default camera it writes into the header
+    (`default_camera.h`, [data-format.md](data-format.md#stream-files)).
     ZGAL puts the generated code in the namespace of the importing `.zgal` file, so an includer
     aliases it first: `#include "<x>.zgal.h"`, then `namespace splat_native { namespace gen = ::<x>; }`,
     then the header. Entry points take plain structs and spans and return status codes (no
