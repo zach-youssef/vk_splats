@@ -7,17 +7,23 @@
       read from a PLY.
   convert.py ply-to-bin <in.ply> <out splats.bin>
   convert.py bin-to-ply <in splats.bin> <out.ply>
+  convert.py stream <in.ply|splats.bin> <out dir> --config <file> [--cameras <cameras.bin>]
+      A stream (<out dir>/scene.stream) of the splats, encoded as the JSON config says (the
+      presets are tools/stream-configs/), and a copy of cameras.bin with --cameras; prints each
+      group's largest error.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from splatdata import colmap, scene, splats  # noqa: E402
+from splatdata import colmap, native, scene, splats, stream  # noqa: E402
 
 
 def convert_colmap(args) -> None:
@@ -59,6 +65,65 @@ def bin_to_ply(args) -> None:
         splats.write_ply(args.ply, splats.from_std430(f.read()))
 
 
+def convert_stream(args) -> None:
+    try:
+        config = stream.load_config(args.config)
+        extension = os.path.splitext(args.input)[1].lower()
+        if extension == ".ply":
+            data, degree = native.read_ply(args.input)
+        elif extension == ".bin":
+            data, degree = native.read_splats_bin(args.input)
+        else:
+            sys.exit(f"{args.input}: the input must be an INRIA PLY (.ply) or a splats.bin (.bin)")
+        if args.cameras:
+            with open(args.cameras, "rb") as f:
+                scene.cameras_from_std430(f.read())  # refuses a file that isn't Cameras
+        out, report = native.encode_stream(data, stream.encode_config(config, degree, args.config))
+    except native.EncodeError as e:
+        # An explicit range too wide for a float step is the config's; anything else the input's
+        explicit = (e.status == native.ENCODE_RANGE_OVERFLOW and e.group < native.GROUP_COUNT
+                    and stream.range_modes(config)[e.group] == "explicit")
+        sys.exit(f"{args.config if explicit else args.input}: {e}")
+    except (OSError, ValueError) as e:
+        sys.exit(str(e))
+    path = os.path.join(args.out, "scene.stream")
+    try:
+        write_outputs(args.out, {"scene.stream": out}, {"cameras.bin": args.cameras} if args.cameras else {})
+    except OSError as e:
+        sys.exit(f"{args.out}: writing the outputs failed: {e}")
+    print(f"{path}: {stream.format_report(out, report, stream.range_modes(config))}")
+
+
+def write_outputs(out_dir: str, contents: dict, copies: dict) -> None:
+    """Writes each file of `contents` (name: bytes) and copies each of `copies` (name: source)
+    into out_dir, each to a temporary file first, renamed once all are written, so a failure
+    leaves no partial file and no stream without its cameras. A copy onto itself is skipped."""
+    os.makedirs(out_dir, exist_ok=True)
+    temporary = {}
+    try:
+        for name, data in contents.items():
+            fd, temporary[name] = tempfile.mkstemp(prefix=f".{name}.", dir=out_dir)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        for name, source in copies.items():
+            target = os.path.join(out_dir, name)
+            if os.path.exists(target) and os.path.samefile(source, target):
+                continue
+            fd, temporary[name] = tempfile.mkstemp(prefix=f".{name}.", dir=out_dir)
+            os.close(fd)
+            shutil.copyfile(source, temporary[name])
+        for name, path in temporary.items():
+            os.replace(path, os.path.join(out_dir, name))
+            temporary[name] = None
+    finally:
+        for path in temporary.values():
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -81,6 +146,14 @@ def main(argv=None) -> None:
     b.add_argument("bin")
     b.add_argument("ply")
     b.set_defaults(run=bin_to_ply)
+
+    s = commands.add_parser("stream", help="a stream file of an INRIA PLY or a splats.bin")
+    s.add_argument("input", help="an INRIA PLY (.ply) or a splats.bin (.bin)")
+    s.add_argument("out", help="output directory: scene.stream, and cameras.bin with --cameras")
+    s.add_argument("--config", required=True,
+                   help="the JSON encoding config (docs/data-format.md; presets in tools/stream-configs/)")
+    s.add_argument("--cameras", help="a cameras.bin to copy beside the stream")
+    s.set_defaults(run=convert_stream)
 
     args = parser.parse_args(argv)
     if getattr(args, "max_size", None) is not None and args.max_size < 1:

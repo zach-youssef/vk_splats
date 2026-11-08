@@ -1,0 +1,9 @@
+{
+  "shDegree": "data",
+  "position": {"encoding": "f32"},
+  "scale": {"encoding": "f32"},
+  "rotation": {"encoding": "f32"},
+  "opacity": {"encoding": "f32"},
+  "dc": {"encoding": "f32"},
+  "sh": {"encoding": "f32"}
+}

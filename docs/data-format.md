@@ -10,13 +10,17 @@ the `tools/splatdata` package; its tests are `tools/tests/`.
 tools/convert.py colmap <model dir> <out dir> [--images <dir>] [--max-size <px>] [--splats <ply>]
 tools/convert.py ply-to-bin <in.ply> <out splats.bin>
 tools/convert.py bin-to-ply <in splats.bin> <out.ply>
+tools/convert.py stream <in.ply|splats.bin> <out dir> --config <file> [--cameras <cameras.bin>]
 ```
+
+`stream` writes a [stream file](#stream-files) instead of a scene.
 
 For example, the real scene:
 `tools/convert.py colmap colmap/colmap_exports3 build/data/cs5330 --images colmap/cs5330_dense_resized`
 (about 15 s).
 
-Reading a PLY (`ply-to-bin`, `colmap --splats`, `evaluate.py`) goes through the native library,
+Reading a PLY (`ply-to-bin`, `colmap --splats`, `stream`, `evaluate.py`) and encoding a stream go
+through the native library,
 so build it first: `make native` ([building and testing](building-and-testing.md#the-native-library)).
 
 `colmap` reads a COLMAP text export (`cameras.txt`, `images.txt`, `points3D.txt`; other files are
@@ -171,8 +175,69 @@ Once the base records have arrived every splat can be drawn (at degree 0); the S
 higher bands as they follow. Each field group has its own encoding, given in the header, so
 changing the precision needs no rebuild. The format, `checkStreamHeader` and the decode are
 `lib/splat_stream.zgal` (so the shaders, the C++ and the TypeScript run the same code); the
-encoder is `lib/native/stream_encoder.h`. `tests/cpp/splat_stream_test.cpp` checks them, and
-`tests/cpp/default_camera_test.cpp` the default camera.
+encoder is `lib/native/stream_encoder.h`. `tests/cpp/splat_stream_test.cpp` checks them,
+`tests/cpp/default_camera_test.cpp` the default camera, and `tools/tests/test_stream.py` the
+converter.
+
+### Converter
+
+```
+tools/convert.py stream <in.ply|splats.bin> <out dir> --config <file> [--cameras <cameras.bin>]
+```
+
+reads the splats (an INRIA PLY, `.ply`, or a splats.bin, `.bin`, through the native library's
+readers), encodes them with the C++ encoder as the JSON config says, and writes
+`<out dir>/scene.stream`; with `--cameras` it checks that the file is whole `Camera`s and copies it
+to `<out dir>/cameras.bin`. The outputs are written to temporary files and renamed once all are
+written, so a failure leaves neither a partial file nor a stream without its cameras. A PLY and the
+splats.bin of the same splats give the same bytes when the PLY is of degree 3 (as `write_ply` and
+splat_train write them) or the config gives `shDegree` as a number: a splats.bin is always of
+degree 3, so under `"data"` a lower-degree PLY gives a lower-degree stream. Then
+it prints the layout and, per group, the encoding, the largest error (raw and activated, as the
+[encoder](#encoder) reports them) and the range the header holds (low to low + stepSize ·
+(2^bits − 1)). The web preset on the tests' fixture (`stream_fixture.py out --count 40 --seed 1`):
+
+```
+out/scene.stream: 40 splats, SH degree 3, 80 B per splat (base 32, SH 48): 3632 B, the SH records from byte 1712
+  group     encoding  max error  activated  (of)         range
+  position  f32               0          0  value        -
+  scale     f16         0.00193   0.000153  exp          -
+  rotation  u8          0.00392     0.0136  angle (rad)  explicit [-1, 1]
+  opacity   u8           0.0756      0.017  sigmoid      data [-20, 20]
+  dc        f16         0.00025    0.00025  value        -
+  sh        u8          0.00572    0.00572  value        data [-1.42, 1.501]
+```
+
+The config gives the SH degree and every group, with no defaults, since each choice trades size
+for precision (`tools/splatdata/stream.py` checks it, naming the file and key of any problem):
+
+```json
+{"shDegree": "data",
+ "position": {"encoding": "f32"},
+ "scale": {"encoding": "f16"},
+ "rotation": {"encoding": "u8", "range": [-1, 1]},
+ "opacity": {"encoding": "u8", "range": "data"},
+ "dc": {"encoding": "f16"},
+ "sh": {"encoding": "u8", "range": "data"}}
+```
+
+- `shDegree`: 0–3, or `"data"`, the input's degree (a splats.bin's is always 3; a PLY's is its
+  `f_rest` count's). A degree above the input's is refused.
+- The groups, `position`, `scale`, `rotation`, `opacity`, `dc` and `sh`, each take an `encoding`:
+  `f32`, `f16`, `u16` or `u8`. A quantized one (`u16`, `u8`) needs a `range`, which f32 and f16
+  don't take: `"data"` (the data's minimum and maximum, per component, or over every component
+  for SH), `[lo, hi]` for every component, or one `[lo, hi]` per component (not for SH, which
+  shares one range). Values outside an explicit range are clamped; `lo` ≤ `hi`, finite in
+  float32.
+- Unknown keys are refused.
+
+The presets in the table below are `tools/stream-configs/{full,f16,web}.json`, all at
+`"shDegree": "data"`. The encoder's refusals (a non-finite value, a zero quantized rotation, an f16
+overflow, too many splats, a range too wide for a float32 step) are printed with the group and
+splat, prefixed with the input's path, or the config's for an explicit range, and nothing is
+written; so are a bad config, an unreadable input and a failed write.
+`tools/tests/stream_fixture.py <out dir> [--count <n>] [--seed <n>]` writes the tests' fixture,
+the same splats as `fixture.ply` and `splats.bin`, with the values the encodings have edges at.
 
 ### Header
 
@@ -243,7 +308,7 @@ whose float32 decode is nearest.
 
 `streamLayout` gives the header's layout: base fields are placed largest component first (group
 order within a size), so only the stride's rounding to 4 pads a record, and padding bytes are
-zero, so the bytes are deterministic. The presets' records:
+zero, so the bytes are deterministic. The presets' records (`tools/stream-configs/`):
 
 | Preset | Position | Scale | Rotation | Opacity | DC | SH | Base / SH stride |
 |---|---|---|---|---|---|---|---|
