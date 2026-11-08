@@ -21,23 +21,23 @@ LIBRARY = os.environ.get("SPLAT_NATIVE_LIB") or os.path.join(
 
 SPLAT_SIZE = 240  # The std430 Splat (lib/splat_math.zgal), as splats.SPLAT_DTYPE
 
-# lib/native/ply_reader.h's results
-PLY_OK = 0
-PLY_CANNOT_READ = 1
-PLY_INVALID = 2
-PLY_OUT_OF_MEMORY = 3
-PLY_MESSAGE_SIZE = 256
+# The readers' results (lib/native/read_status.h)
+READ_OK = 0
+READ_CANNOT_READ = 1
+READ_INVALID = 2
+READ_OUT_OF_MEMORY = 3
+READ_MESSAGE_SIZE = 256
 
 
-class _Ply(ctypes.Structure):
-    """c_api.cpp's SplatNativePly"""
+class _Splats(ctypes.Structure):
+    """c_api.cpp's SplatNativeSplats"""
     _fields_ = [
         ("splats", ctypes.c_void_p),
         ("count", ctypes.c_uint64),
         ("shDegree", ctypes.c_uint32),
         ("systemError", ctypes.c_int32),
         ("owner", ctypes.c_void_p),
-        ("message", ctypes.c_char * PLY_MESSAGE_SIZE),
+        ("message", ctypes.c_char * READ_MESSAGE_SIZE),
     ]
 
 
@@ -53,14 +53,15 @@ def library() -> ctypes.CDLL:
         lib = ctypes.CDLL(LIBRARY)
         lib.splat_native_splat_size.argtypes = []
         lib.splat_native_splat_size.restype = ctypes.c_uint32
-        lib.splat_native_ply_size.argtypes = []
-        lib.splat_native_ply_size.restype = ctypes.c_uint32
-        lib.splat_native_read_ply.argtypes = [ctypes.c_char_p, ctypes.POINTER(_Ply)]
-        lib.splat_native_read_ply.restype = ctypes.c_uint32
-        lib.splat_native_free_ply.argtypes = [ctypes.POINTER(_Ply)]
-        lib.splat_native_free_ply.restype = None
+        lib.splat_native_splats_struct_size.argtypes = []
+        lib.splat_native_splats_struct_size.restype = ctypes.c_uint32
+        for reader in (lib.splat_native_read_ply, lib.splat_native_read_splats_bin):
+            reader.argtypes = [ctypes.c_char_p, ctypes.POINTER(_Splats)]
+            reader.restype = ctypes.c_uint32
+        lib.splat_native_free_splats.argtypes = [ctypes.POINTER(_Splats)]
+        lib.splat_native_free_splats.restype = None
         sizes = {"Splat": (lib.splat_native_splat_size(), SPLAT_SIZE),
-                 "SplatNativePly": (lib.splat_native_ply_size(), ctypes.sizeof(_Ply))}
+                 "SplatNativeSplats": (lib.splat_native_splats_struct_size(), ctypes.sizeof(_Splats))}
         for name, (theirs, ours) in sizes.items():
             if theirs != ours:
                 raise RuntimeError(f"{LIBRARY}: its {name} is {theirs} bytes, the binding's {ours}: "
@@ -69,26 +70,38 @@ def library() -> ctypes.CDLL:
     return _library
 
 
-def read_ply(path: str) -> tuple[bytes, int]:
-    """Reads an INRIA PLY (lib/native/ply_reader.h): its splats as std430 Splat structs (SPLAT_SIZE
-    bytes each) and the SH degree (0–3) the file has. Raises OSError when the file can't be read,
-    ValueError when it isn't a PLY the reader supports and MemoryError when the splats don't fit."""
+def _read(reader, path: str) -> tuple[bytes, int]:
+    """Runs one of the library's readers on `path`: its splats as std430 bytes and its SH degree."""
     encoded = os.fsencode(path)
     if b"\0" in encoded:  # c_char_p would cut the path there
         raise ValueError(f"{path!r}: the path has a NUL byte")
     lib = library()
-    ply = _Ply()
-    status = lib.splat_native_read_ply(encoded, ctypes.byref(ply))
-    if status != PLY_OK:
-        message = f"{path}: {ply.message.decode('utf-8', 'replace')}"
-        if status == PLY_CANNOT_READ:
-            raise OSError(ply.systemError, f"{message} ({os.strerror(ply.systemError)})", path)
-        if status == PLY_INVALID:
+    out = _Splats()
+    status = getattr(lib, reader)(encoded, ctypes.byref(out))
+    if status != READ_OK:
+        message = f"{path}: {out.message.decode('utf-8', 'replace')}"
+        if status == READ_CANNOT_READ:
+            raise OSError(out.systemError, f"{message} ({os.strerror(out.systemError)})", path)
+        if status == READ_INVALID:
             raise ValueError(message)
-        if status == PLY_OUT_OF_MEMORY:
+        if status == READ_OUT_OF_MEMORY:
             raise MemoryError(message)
         raise RuntimeError(f"{message} (unknown status {status})")
     try:
-        return ctypes.string_at(ply.splats, ply.count * SPLAT_SIZE) if ply.count else b"", ply.shDegree
+        return ctypes.string_at(out.splats, out.count * SPLAT_SIZE) if out.count else b"", out.shDegree
     finally:
-        lib.splat_native_free_ply(ctypes.byref(ply))
+        lib.splat_native_free_splats(ctypes.byref(out))
+
+
+def read_ply(path: str) -> tuple[bytes, int]:
+    """Reads an INRIA PLY (lib/native/ply_reader.h): its splats as std430 Splat structs (SPLAT_SIZE
+    bytes each) and the SH degree (0–3) the file has. Raises OSError when the file can't be read,
+    ValueError when it isn't a PLY the reader supports and MemoryError when the splats don't fit."""
+    return _read("splat_native_read_ply", path)
+
+
+def read_splats_bin(path: str) -> tuple[bytes, int]:
+    """Reads a splats.bin (lib/native/splats_bin_reader.h): its std430 Splat structs as stored, and
+    SH degree 3 (a Splat holds every band). Raises as read_ply does; ValueError when the size isn't
+    a whole number of Splats."""
+    return _read("splat_native_read_splats_bin", path)

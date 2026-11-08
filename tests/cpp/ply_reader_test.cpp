@@ -64,7 +64,7 @@ void append(std::string& bytes, T value) {
 }
 
 struct Read {
-    splat_native::PlyStatus status;
+    splat_native::ReadStatus status;
     std::vector<ply_reader_test::Splat> splats;
     uint32_t shDegree = 99;
 };
@@ -85,7 +85,7 @@ TEST_CASE("degree 3 in the reference's order: f_rest is channel-major, rot_0..3 
         for (std::size_t i = 0; i < names.size(); ++i) append(bytes, 1000.0f * v + static_cast<float>(i));
     file.write(bytes);
     const Read r = read(file);
-    REQUIRE(r.status.code == splat_native::kPlyOk);
+    REQUIRE(r.status.code == splat_native::kReadOk);
     CHECK(r.shDegree == 3);
     REQUIRE(r.splats.size() == 2);
     for (int v = 0; v < 2; ++v) {
@@ -126,7 +126,7 @@ TEST_CASE("degree 1, reordered, other types, a face element after: the other ban
     TempFile file("degree1.ply");
     file.write(header + body);
     const Read r = read(file);
-    REQUIRE(r.status.code == splat_native::kPlyOk);
+    REQUIRE(r.status.code == splat_native::kReadOk);
     CHECK(r.shDegree == 1);
     REQUIRE(r.splats.size() == 1);
     const auto& s = r.splats[0];
@@ -146,7 +146,7 @@ TEST_CASE("degree 0 and no vertices") {
     TempFile file("empty.ply");
     file.write(floatHeader(inriaNames(0), 0));
     const Read r = read(file);
-    CHECK(r.status.code == splat_native::kPlyOk);
+    CHECK(r.status.code == splat_native::kReadOk);
     CHECK(r.shDegree == 0);
     CHECK(r.splats.empty());
 }
@@ -157,7 +157,7 @@ TEST_CASE("errors: each status, with a message") {
         file.write(bytes);
         const Read r = read(file);
         CAPTURE(name);
-        CHECK(r.status.code == splat_native::kPlyInvalid);
+        CHECK(r.status.code == splat_native::kReadInvalid);
         CHECK(std::strstr(r.status.message, message) != nullptr);
     };
     auto names = inriaNames(15);
@@ -173,6 +173,6 @@ TEST_CASE("errors: each status, with a message") {
 
     TempFile missing("missing-file.ply");
     const Read r = read(missing);
-    CHECK(r.status.code == splat_native::kPlyCannotRead);
+    CHECK(r.status.code == splat_native::kReadCannotRead);
     CHECK(r.status.systemError == ENOENT);
 }

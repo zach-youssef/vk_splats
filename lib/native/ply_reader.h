@@ -22,6 +22,8 @@
 //   #include "<relative path>/lib/native/ply_reader.h"
 #pragma once
 
+#include "read_status.h"
+
 #include <algorithm>
 #include <bit>
 #include <cerrno>
@@ -40,20 +42,6 @@ namespace splat_native {
 
 static_assert(std::endian::native == std::endian::little,
               "the reader loads the PLY's little-endian values as they are in memory");
-
-// readPly's results
-inline constexpr uint32_t kPlyOk = 0;
-inline constexpr uint32_t kPlyCannotRead = 1;    // opening or reading the file failed (systemError)
-inline constexpr uint32_t kPlyInvalid = 2;       // not a PLY this reader supports (message says why)
-inline constexpr uint32_t kPlyOutOfMemory = 3;   // the splats couldn't be allocated
-
-inline constexpr std::size_t kPlyMessageSize = 256;
-
-struct PlyStatus {
-    uint32_t code = kPlyOk;
-    int systemError = 0;              // kPlyCannotRead: the errno of the call that failed
-    char message[kPlyMessageSize]{};  // anything but kPlyOk: what went wrong (truncated to fit)
-};
 
 namespace ply_detail {
 
@@ -163,14 +151,14 @@ inline bool readLine(std::FILE* f, std::string& line, Failure& failure) {
         int c = std::fgetc(f);
         if (c == EOF) {
             if (std::ferror(f)) {
-                failure = {kPlyCannotRead, errno, "reading the header failed"};
+                failure = {kReadCannotRead, errno, "reading the header failed"};
                 return false;
             }
             return !line.empty();
         }
         if (c == '\n') return true;
         if (c > 0x7F) {
-            failure = {kPlyInvalid, 0, "the header isn't ASCII"};
+            failure = {kReadInvalid, 0, "the header isn't ASCII"};
             return false;
         }
         line.push_back(static_cast<char>(c));
@@ -190,13 +178,13 @@ inline bool readPlyOrFail(const char* path, std::vector<gen::Splat>& splats, uin
     errno = 0;
     file.f = std::fopen(path, "rb");
     if (!file.f) {
-        failure = {kPlyCannotRead, errno, "opening the file failed"};
+        failure = {kReadCannotRead, errno, "opening the file failed"};
         return false;
     }
     std::FILE* f = file.f;
 
     std::string line;
-    failure = {kPlyInvalid, 0, ""};
+    failure = {kReadInvalid, 0, ""};
     if (!readLine(f, line, failure)) {
         if (failure.message.empty()) failure.message = "not a PLY file";
         return false;
@@ -327,12 +315,12 @@ inline bool readPlyOrFail(const char* path, std::vector<gen::Splat>& splats, uin
     // memory than the file holds
     const long dataStart = std::ftell(f);
     if (dataStart < 0 || std::fseek(f, 0, SEEK_END) != 0) {
-        failure = {kPlyCannotRead, errno, "seeking in the file failed"};
+        failure = {kReadCannotRead, errno, "seeking in the file failed"};
         return false;
     }
     const long fileEnd = std::ftell(f);
     if (fileEnd < 0 || std::fseek(f, dataStart, SEEK_SET) != 0) {
-        failure = {kPlyCannotRead, errno, "seeking in the file failed"};
+        failure = {kReadCannotRead, errno, "seeking in the file failed"};
         return false;
     }
     const uint64_t available = static_cast<uint64_t>(fileEnd - dataStart);
@@ -353,7 +341,7 @@ inline bool readPlyOrFail(const char* path, std::vector<gen::Splat>& splats, uin
         const std::size_t n = std::min(kChunk, splats.size() - first);
         if (std::fread(chunk.data(), stride, n, f) != n) {
             const bool error = std::ferror(f) != 0;
-            failure = {error ? kPlyCannotRead : kPlyInvalid, error ? errno : 0, "reading the vertices failed"};
+            failure = {error ? kReadCannotRead : kReadInvalid, error ? errno : 0, "reading the vertices failed"};
             return false;
         }
         for (std::size_t i = 0; i < n; ++i) {
@@ -376,10 +364,10 @@ inline bool readPlyOrFail(const char* path, std::vector<gen::Splat>& splats, uin
 }  // namespace ply_detail
 
 // Reads the PLY at `path` (see the top of this file) into `splats` (replacing what it held) and its
-// SH degree (0-3) into `shDegree`. Never throws: kPlyOk, or an error with `splats` and `shDegree`
-// unspecified (kPlyCannotRead with the errno, kPlyInvalid, kPlyOutOfMemory) and the message set.
-inline PlyStatus readPly(const char* path, std::vector<gen::Splat>& splats, uint32_t& shDegree) noexcept {
-    PlyStatus status;
+// SH degree (0-3) into `shDegree`. Never throws: kReadOk, or an error with `splats` and `shDegree`
+// unspecified (kReadCannotRead with the errno, kReadInvalid, kReadOutOfMemory) and the message set.
+inline ReadStatus readPly(const char* path, std::vector<gen::Splat>& splats, uint32_t& shDegree) noexcept {
+    ReadStatus status;
     auto fail = [&](uint32_t code, int systemError, const char* message) {
         status.code = code;
         status.systemError = systemError;
@@ -387,14 +375,14 @@ inline PlyStatus readPly(const char* path, std::vector<gen::Splat>& splats, uint
         return status;
     };
     try {
-        ply_detail::Failure failure{kPlyOk, 0, {}};
+        ply_detail::Failure failure{kReadOk, 0, {}};
         if (!ply_detail::readPlyOrFail(path, splats, shDegree, failure))
             return fail(failure.code, failure.systemError, failure.message.c_str());
         return status;
     } catch (const std::bad_alloc&) {
-        return fail(kPlyOutOfMemory, 0, "out of memory");
+        return fail(kReadOutOfMemory, 0, "out of memory");
     } catch (const std::length_error&) {
-        return fail(kPlyOutOfMemory, 0, "out of memory");
+        return fail(kReadOutOfMemory, 0, "out of memory");
     }
 }
 

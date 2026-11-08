@@ -1,5 +1,6 @@
 """libsplat_native through its ctypes binding (splatdata.native): every C function, the PLY
-reader's layout, SH degrees, property types and errors."""
+reader's layout, SH degrees, property types and errors, and the splats.bin reader. The stream
+encoder's functions are tested in test_stream.py."""
 
 import errno
 
@@ -75,7 +76,7 @@ def assert_same(a, b):
 def test_library_matches_the_binding():
     lib = native.library()
     assert lib.splat_native_splat_size() == native.SPLAT_SIZE == splats.SPLAT_DTYPE.itemsize
-    assert lib.splat_native_ply_size() == native.ctypes.sizeof(native._Ply)
+    assert lib.splat_native_splats_struct_size() == native.ctypes.sizeof(native._Splats)
 
 
 @pytest.mark.parametrize("degree", [0, 1, 2, 3])
@@ -189,3 +190,25 @@ def test_many_properties_allocate_what_the_file_holds(tmp_path):
     assert len(data) == native.SPLAT_SIZE and degree == 3
     assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit - before < 200 << 20
 
+
+
+def test_splats_bin_reader(tmp_path):
+    rng = np.random.default_rng(5)
+    s = splats.Splats(position=rng.normal(size=(7, 3)), log_scale=rng.normal(size=(7, 3)),
+                      rotation=rng.normal(size=(7, 4)), opacity_logit=rng.normal(size=7),
+                      sh=rng.normal(size=(7, 16, 3)))
+    data = splats.to_std430(s)
+    (tmp_path / "a.bin").write_bytes(data)
+    assert native.read_splats_bin(str(tmp_path / "a.bin")) == (data, 3)
+    (tmp_path / "empty.bin").write_bytes(b"")
+    assert native.read_splats_bin(str(tmp_path / "empty.bin")) == (b"", 3)
+    (tmp_path / "partial.bin").write_bytes(data[:-4])
+    with pytest.raises(ValueError, match="1676 bytes isn't a whole number of 240-byte Splats"):
+        native.read_splats_bin(str(tmp_path / "partial.bin"))
+    with pytest.raises(FileNotFoundError):
+        native.read_splats_bin(str(tmp_path / "missing.bin"))
+    with pytest.raises(ValueError, match="NUL"):
+        native.read_splats_bin(str(tmp_path / "a.bin") + "\0b")
+    (tmp_path / "directory.bin").mkdir()
+    with pytest.raises((OSError, ValueError), match="not a regular file|directory"):
+        native.read_splats_bin(str(tmp_path / "directory.bin"))

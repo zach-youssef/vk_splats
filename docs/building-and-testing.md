@@ -47,7 +47,9 @@ header in `lib/native/` (and its C++ test), its wrapper in `c_api.cpp`, its sign
 `lib/native/c_api.zgal`, which imports the modules whose structs it uses.
 
 It holds the INRIA PLY reader (`lib/native/ply_reader.h`), which `splatdata.splats.read_ply`
-calls, so the data tools' tests and every tool reading a PLY need the library built. The PLY
+calls, so the data tools' tests and every tool reading a PLY need the library built, and the
+splats.bin reader (`lib/native/splats_bin_reader.h`). Both return a `ReadStatus`
+(`lib/native/read_status.h`), which the binding raises as `OSError`, `ValueError` or `MemoryError`. The PLY
 writer is the one piece still duplicated in Python ([data-format.md](data-format.md#inria-ply)).
 
 ## Adding programs and tests
