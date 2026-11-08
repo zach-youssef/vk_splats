@@ -1,0 +1,3 @@
+;; The types lib/native/c_api.cpp wraps (the generated c_api.zgal.h, namespace c_api): the Splat of
+;; lib/splat_math.zgal, which the PLY reader fills.
+(import "../splat_math.zgal")

@@ -37,9 +37,13 @@
     ([below](#train-graph)).
   - `splat_stream.zgal`: the stream format's header, its check and its decode
     ([data-format.md](data-format.md#stream-files)); it imports `splat_math.zgal`.
-  - `native/`: header-only C++ on top of the C++ ZGAL generates for those modules: the stream
-    encoder (`stream_encoder.h`) and the default camera it writes into the header
-    (`default_camera.h`, [data-format.md](data-format.md#stream-files)).
+  - `native/`: header-only C++ that the data tools share with the programs, on top of the C++ ZGAL
+    generates for those modules: the stream encoder (`stream_encoder.h`), the default camera it
+    writes into the header (`default_camera.h`, [data-format.md](data-format.md#stream-files)) and
+    the INRIA PLY reader (`ply_reader.h`, [data-format.md](data-format.md#inria-ply)).
+    `c_api.cpp` wraps the reader in a C ABI for the tools' ctypes binding
+    (`tools/splatdata/native.py`), built into `build/native/libsplat_native`
+    ([building-and-testing.md](building-and-testing.md#the-native-library)).
     ZGAL puts the generated code in the namespace of the importing `.zgal` file, so an includer
     aliases it first: `#include "<x>.zgal.h"`, then `namespace splat_native { namespace gen = ::<x>; }`,
     then the header. Entry points take plain structs and spans and return status codes (no

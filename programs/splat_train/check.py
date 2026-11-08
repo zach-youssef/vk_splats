@@ -94,6 +94,15 @@ def main():
     if args.grow and not (in_use > start_count and densifications > 0):
         errors.append(f"densification didn't grow the splats ({start_count} to {in_use}, {densifications} densifications)")
     trained = splats.read_ply(os.path.join(args.out, "trained.ply"))
+    # Until read_ply moves onto it: the shared C++ reader (libsplat_native) reads the same splats
+    from splatdata import native  # noqa: E402
+    data, degree = native.read_ply(os.path.join(args.out, "trained.ply"))
+    shared = splats.from_std430(data)
+    if degree != 3 or not all(np.array_equal(getattr(shared, name), getattr(trained, name), equal_nan=True)
+                              for name in ("position", "log_scale", "rotation", "opacity_logit", "sh")):
+        errors.append(f"the shared reader read the PLY differently (SH degree {degree})")
+    else:
+        print(f"check: the shared reader reads the same {len(shared)} splats")
     if len(trained) != in_use:
         errors.append(f"the PLY holds {len(trained)} splats, not the {in_use} in use")
     fields = [trained.position, trained.log_scale, trained.rotation, trained.opacity_logit, trained.sh]

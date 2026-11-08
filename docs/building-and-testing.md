@@ -8,20 +8,45 @@ has the details and the platform paths). The data tools need Python 3 with pytes
 scipy and Pillow (`tools/requirements.txt`); a virtualenv in `.venv/` is ignored by git, e.g.
 `python3 -m venv .venv && .venv/bin/pip install -r tools/requirements.txt`, then
 `make test PYTHON=.venv/bin/python`. Clone with `--recursive`, or run `git submodule update --init --recursive`.
+The data tools also call C++ through the native library ([below](#the-native-library)), so they
+need it built (`make native`, which the test targets do first), and with it the C++ compiler and
+Racket (for its ZGAL-generated header).
 
 ## Make targets
 
-- `make`: builds every program into `build/<name>/<name>`.
+- `make`: builds every program into `build/<name>/<name>`, and the native library
+  ([below](#the-native-library)).
+- `make native`: builds the native library alone.
 - `make test`: runs, in order,
-  - `test-tools`: pytest over every `test_*.py` under `tools/` and `tests/`;
+  - `test-tools`: pytest over every `test_*.py` under `tools/` and `tests/`, after building the
+    native library;
   - `test-cpp`: each `tests/cpp/<name>.cpp`, built into `build/tests/<name>` and run;
-  - `test-programs`: each program's `test.sh` (`make test-<name>` runs one).
+  - `test-programs`: each program's `test.sh` (`make test-<name>` runs one), after building the
+    native library (their checks run the data tools).
 - `make web`: builds every program for the web into `build/web/<name>`.
 - `make test-web`: each program's `test-web.sh` under Node (`make test-web-<name>` runs one),
-  after building its web-check tools; it needs Python as `make test` does (`PYTHON=...`).
+  after building its web-check tools and the native library; it needs Python as `make test` does
+  (`PYTHON=...`).
 - `make clean`: removes `build/`.
 - `ZGAL_ROOT=<checkout>` builds against another wrapper checkout; `CXX=...` another compiler
   (clang by default); `PYTHON=...` another Python.
+
+## The native library
+
+Logic that both the data tools (Python) and the C++ programs need lives once, in C++: header-only in
+`lib/native/` ([architecture.md](architecture.md)). The tools call it through
+`build/native/libsplat_native.so` (`.dylib` on macOS), which make builds from
+`lib/native/c_api.cpp`, a C ABI over those headers (plain structs and status codes, nothing thrown
+across it), with `-O2`; `tools/splatdata/native.py` binds it with ctypes (the standard library, so
+nothing is vendored) and loads it on first use: make's build, whose path make exports to its recipes
+as `$SPLAT_NATIVE_LIB` (so `OUT=...` builds and tests its own), or `build/native/`'s outside make.
+ctypes doesn't check the signatures, so the binding refuses a library whose structs' sizes differ
+from its own, and `tools/tests/test_native.py` calls every C function. Adding a function means: the
+header in `lib/native/` (and its C++ test), its wrapper in `c_api.cpp`, its signature in
+`native.py`, and a test in `test_native.py`. The library's generated header comes from
+`lib/native/c_api.zgal`, which imports the modules whose structs it uses.
+
+It holds the INRIA PLY reader (`lib/native/ply_reader.h`, bound as `native.read_ply`).
 
 ## Adding programs and tests
 
@@ -100,7 +125,8 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
     archive: 7.4, 1.26, 1.11 and 10.2 on 24.04), `test-cpp` and `test-programs` (on lavapipe,
     with validation). The data tools' and the C++ tests need no program, so only this shard runs
     them (`cpu-tests`); every other shard would repeat them.
-  - `web`: `make web`, then `test-web` (Node with Dawn on lavapipe).
+  - `web`: `make web`, then `test-web` (Node with Dawn on lavapipe), which builds the native
+    library first (splat_train's check reads PLYs through it).
   Each test step runs even if an earlier one failed, and the program tests with `make -k`, so one
   failing program doesn't stop the others. On failure or cancellation a job uploads `build/test`
   and `build/test-web` (each program's logs, as `test-outputs-<sha>-<suite>`); the program tests'

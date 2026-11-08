@@ -1,7 +1,7 @@
 # Gaussian splatting (Kerbl et al. 2023) in ZGAL. Each program is a ZGAL program,
 # programs/<name>/<name>.zgal (importing shared modules from lib/), built with the wrapper's rules
 # (zgal.mk) into build/<name>/<name>. Adding a program needs no change here.
-#   make           - build every program
+#   make           - build every program and the native library (build/native/libsplat_native)
 #   make test      - the data tools' tests (pytest), the C++ tests (tests/cpp/*.cpp) and every
 #                    program's headless test (programs/<name>/test.sh)
 #   make web       - build every program for the web into build/web/<name>
@@ -48,7 +48,25 @@ $(foreach p,$(PROGRAMS),$(eval $(call zgal-program,programs/$(p)/$(p).zgal,$(OUT
 # render_test's render_check.h, which includes tests/oracle's)
 $(foreach p,$(PROGRAMS),$(eval $(patsubst %.cpp,$(OUT)/$(p)/%.o,$(notdir $(wildcard programs/$(p)/*.cpp))): $(wildcard programs/$(p)/*.h tests/oracle/*.h)))
 
-all: $(foreach p,$(PROGRAMS),$(OUT)/$(p)/$(p))
+# ---------------------------------------------------------------------------
+# The native library: lib/native/c_api.cpp, a C ABI over lib/native/'s headers (on the C++ ZGAL
+# generates for lib/native/c_api.zgal), for the data tools' ctypes binding (tools/splatdata/native.py).
+# Optimized, since the tools read whole scenes through it. The data tools' tests and the program tests
+# (whose checks run the tools) build it first.
+# ---------------------------------------------------------------------------
+NATIVE_LIB = $(OUT)/native/libsplat_native.$(if $(filter Darwin,$(ZGAL_OS)),dylib,so)
+# The binding loads this build of it (another OUT's too), from every recipe's tools
+export SPLAT_NATIVE_LIB = $(abspath $(NATIVE_LIB))
+
+$(eval $(call zgal-rule,lib/native/c_api.zgal,$(OUT)/native/gen,$(OUT)/native/spv))
+
+$(NATIVE_LIB): lib/native/c_api.cpp $(wildcard lib/native/*.h) $(OUT)/native/gen/c_api.zgal.stamp
+	@mkdir -p $(dir $@)
+	$(CXX) -shared -fPIC -fvisibility=hidden -O2 -o $@ $< $(CXXFLAGS) $(ZGAL_CFLAGS) -I$(OUT)/native/gen
+
+native: $(NATIVE_LIB)
+
+all: $(foreach p,$(PROGRAMS),$(OUT)/$(p)/$(p)) $(NATIVE_LIB)
 
 # For the web (WebGPU): the same programs, compiled to TypeScript and WGSL and built to JavaScript
 $(foreach p,$(PROGRAMS),$(eval $(call zgal-web-program,programs/$(p)/$(p).zgal,$(OUT)/web/$(p))))
@@ -62,7 +80,7 @@ web: $(foreach p,$(PROGRAMS),$(OUT)/web/$(p))
 # unique (there are no __init__.py files)
 PY_TESTS = $(shell find tools tests -name 'test_*.py' 2>/dev/null)
 
-test-tools:
+test-tools: $(NATIVE_LIB)
 ifneq ($(PY_TESTS),)
 	$(PYTHON) -m pytest -q $(PY_TESTS)
 else
@@ -94,7 +112,7 @@ test-cpp: $(foreach t,$(CPP_TESTS),$(OUT)/tests/$(t))
 # test.sh <binary> <output dir>, runs the program headless with --validation
 TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test.sh),$(p)))
 
-$(foreach p,$(TESTED_PROGRAMS),$(eval test-$(p): $(OUT)/$(p)/$(p) ; programs/$(p)/test.sh $(OUT)/$(p)/$(p) $(OUT)/test/$(p)))
+$(foreach p,$(TESTED_PROGRAMS),$(eval test-$(p): $(OUT)/$(p)/$(p) $(NATIVE_LIB) ; programs/$(p)/test.sh $(OUT)/$(p)/$(p) $(OUT)/test/$(p)))
 
 test-programs: $(foreach p,$(TESTED_PROGRAMS),test-$(p))
 
@@ -123,11 +141,11 @@ $(foreach s,$(WEB_CHECK_SOURCES),$(eval $(call web-check-rule,$(s))))
 # dir> under Node, after its program's web build and its web-check tools
 WEB_TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test-web.sh),$(p)))
 
-$(foreach p,$(WEB_TESTED_PROGRAMS),$(eval test-web-$(p): $(OUT)/web/$(p) $(call web-check-tools,$(p)) ; programs/$(p)/test-web.sh $(OUT)/web/$(p)/$(p).zgal.main.js $(OUT)/test-web/$(p) $(OUT)/web-check))
+$(foreach p,$(WEB_TESTED_PROGRAMS),$(eval test-web-$(p): $(OUT)/web/$(p) $(call web-check-tools,$(p)) $(NATIVE_LIB) ; programs/$(p)/test-web.sh $(OUT)/web/$(p)/$(p).zgal.main.js $(OUT)/test-web/$(p) $(OUT)/web-check))
 
 test-web: $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
 
-.PHONY: all web test test-tools test-cpp test-programs test-web clean \
+.PHONY: all native web test test-tools test-cpp test-programs test-web clean \
 	$(foreach p,$(TESTED_PROGRAMS),test-$(p)) $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
 
 clean:

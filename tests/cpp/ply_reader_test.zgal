@@ -1,0 +1,3 @@
+;; The Splat for lib/native/ply_reader.h's C++ test (ply_reader_test.cpp includes the generated
+;; ply_reader_test.zgal.h, whose namespace is this file's name).
+(import "../../lib/splat_math.zgal")

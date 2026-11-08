@@ -101,8 +101,8 @@ jobs:
           make -j"$(nproc)" $TARGETS
 
       # The test steps run whatever an earlier one's outcome, once the build has succeeded (the
-      # data tools' tests need no build), and `make -k` keeps going past a failing program, so one
-      # failure doesn't hide another
+      # data tools' tests build the native library they need themselves), and `make -k` keeps
+      # going past a failing program, so one failure doesn't hide another
       - name: Data tool tests (pytest)
         if: ${{ !cancelled() && matrix.suite.cpu-tests }}
         run: make test-tools
