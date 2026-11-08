@@ -21,6 +21,9 @@
   - `ssim_test`: the SSIM kernels against a float64 numpy reference (an image against itself,
     constant images, a random pair) and GPU finite differences, every check in the app
     ([below](#train-graph)).
+  - `stream_test`: the stream decode kernels on fixture streams (every encoding, precision and SH
+    degree, arriving in chunks) against an independent numpy reference, and the refused headers,
+    every check in the app ([data-format.md](data-format.md#decode)).
 - `lib/`: ZGAL modules the programs share, imported by relative path:
   `(import "../../lib/<module>.zgal")`. A module's name is a C++ namespace (ZGAL compiles its
   functions to C++ too), so it uses underscores, not hyphens.

@@ -1,0 +1,9 @@
+{
+  "shDegree": 1,
+  "position": {"encoding": "u16", "range": "data"},
+  "scale": {"encoding": "u16", "range": "data"},
+  "rotation": {"encoding": "u16", "range": [-1, 1]},
+  "opacity": {"encoding": "u16", "range": "data"},
+  "dc": {"encoding": "u16", "range": "data"},
+  "sh": {"encoding": "u16", "range": "data"}
+}

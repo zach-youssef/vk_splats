@@ -37,6 +37,8 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | ResetOpacity | 4 | 0 | 0 | 0 | 64 |
 | Perturb, LossDelta (grad_test only) | 3, 8 (at the limit) | 1 | 0 | 0 | 1, 256 |
 | Prepare, Difference (ssim_test only) | 5, 3 | 1 | 0 | 0 | 256 |
+| PlanDecode | 4 | 1 | 0 | 0 | 1 |
+| DecodeBase, DecodeSh | 4 | 0 | 0 | 0 | 64 |
 | ZgalSortCount | 4 | 1 | 0 | 64 B (16 atomic bins) | 256 |
 | ZgalSortOffsets | 1 | 1 | 0 | 260 B with subgroups, 1028 B without (256 lanes and a carry) | 256 |
 | ZgalSortScatter | 6 | 1 | 0 | 8320 B with subgroups (2048 subgroup counts), 1152 B without (256 digits, 16 next, 16 bins) | 256 |
@@ -48,7 +50,7 @@ The largest buffers stay within `maxStorageBufferBindingSize` (128 MiB) and so w
 16 B = 134,189,056 B, and the tile entries' keys at their cap of 2²⁵ entries
 ([architecture.md](architecture.md#render-graph)), and the training graph's `entryGradients` at
 one chunk pass's most, 3·2²⁰ entries, 113,246,208 B ([architecture.md](architecture.md#train-graph)), and
-its `Splat` buffers at splat_train's cap of 559240 splats (`--max-splats`), 134,217,600 B. A 1D dispatch is at most 65535 workgroups
+its `Splat` buffers at splat_train's cap of 559240 splats (`--max-splats`), 134,217,600 B, and a stream at that cap, all f32 at degree 3, 432 + 559240 × 236 = 131,981,072 B ([data-format.md](data-format.md#stream-files)). A 1D dispatch is at most 65535 workgroups
 (`maxComputeWorkgroupsPerDimension`), as natively. ZGAL enables subgroups when the adapter has
 them, and the sort and scan kernels fall back to their variants without them otherwise; both fit.
 
@@ -85,6 +87,8 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   The finite differences themselves run in the app, the same on both.
 - **densify_test**: every run of the native test; its checks are in the app.
 - **ssim_test**: every run of the native test; its checks are in the app.
+- **stream_test**: every run of the native test; its checks, `checkStreamHeader` among them, are
+  in the app, so the web runs the TypeScript export.
 
 ## Training on the web
 

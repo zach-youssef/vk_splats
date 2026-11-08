@@ -331,6 +331,45 @@ which against C2 = 9e-4 moves S by up to about 1e-4, as in the reference's float
 `random --finite-differences` at 40×24 (non-square, so a kernel swapping the width and height
 fails).
 
+## Stream decode check
+
+`programs/stream_test` runs `lib/splat_stream.zgal`'s decode kernels
+([data-format.md](data-format.md#decode)) on a stream file, read through `buffer-file`, every
+check in the app (so the web runs them too, `checkStreamHeader` through its TypeScript export).
+Each frame it makes `--chunk` more bytes of the stream arrive (`arrived` = min(`--stream-bytes`,
+frame × chunk)): a small kernel (CopyArrived) copies only the arrived words into the buffer the
+decode reads and fills the rest with 0xFFFFFFFF (a NaN as f32 or f16, all ones quantized), and
+after the decode another (CheckUndecoded) counts, into `counts[7]`, the splats past the decoded
+records that aren't still zero. So a kernel that decodes a record before it has arrived fails,
+even though a later frame decodes it again correctly. It checks each counts readback on its own
+(PlanDecode records its `arrived`):
+before the header nothing decoded (and, for a chunk under 432, at least one such readback: a
+read event handles only the newest finished copy, so with a larger chunk frame 0's may never be
+handled); after it, the code is `checkStreamHeader`'s (or 11 above
+`--splats`, the working buffer's capacity) and equals `--expect-code`, and the decoded counts are
+exactly the complete records, never going back, with no splat written past them. A stream that passes must be seen partly decoded when some
+frame's `arrived` holds the header but not the whole stream. Once every byte has arrived, every one of a
+splat's 59 values must match `--reference` within `--tolerances` (two N × 60 float32 files in the
+`Splat` layout): a tolerance of 0 means bit for bit; and the header PlanDecode copied out (its
+camera included) must match the stream's first 108 words. `--splats`, `--stream-bytes`, `--chunk` and
+`--expect-code` are required (`#:given`); the chunk and the size must be multiples of 4.
+
+`make_case.py <dir> [--refused] [--set FIELD=VALUE ...]` writes the reference from the format's
+definition in numpy, independently of the decoder: f32 values as they are, f16 through numpy's
+float16 (both at tolerance 0), and quantized ones as low + step·q (q read from the stream, so a
+rounding tie doesn't matter) within 4 ulp of max(|low|, |high|). `--set` patches the header
+(`fields.N.key` for a field), and `--refused` writes zeros, since nothing may decode. It prints
+stream_test's arguments.
+
+`test.sh` writes fixtures with `tools/tests/stream_fixture.py` and `convert.py stream`, and runs
+with validation: the presets full, f16 and web and the configs in `configs/` (u16 at degree 1, u8
+with per-component ranges at degree 2, f16 and mixed at degree 0) at 300 splats in 1000-byte
+chunks (a record split across chunks); full all at once; web at 20 splats one word a frame; and
+headers refused for each `checkStreamHeader` code (1 to 10) and for a valid header at the cap (559,240
+splats) above `--splats` (11). Two runs must fail on a check's `MISMATCH` (not a crash, a
+validation message or the frames running out): the f16 case expecting code 1, and with one
+reference value's lowest bit flipped.
+
 ## Synthetic scenes
 
 `tools/make_synthetic.py` writes test scenes in the converter's format (`docs/data-format.md`),

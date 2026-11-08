@@ -176,8 +176,8 @@ higher bands as they follow. Each field group has its own encoding, given in the
 changing the precision needs no rebuild. The format, `checkStreamHeader` and the decode are
 `lib/splat_stream.zgal` (so the shaders, the C++ and the TypeScript run the same code); the
 encoder is `lib/native/stream_encoder.h`. `tests/cpp/splat_stream_test.cpp` checks them,
-`tests/cpp/default_camera_test.cpp` the default camera, and `tools/tests/test_stream.py` the
-converter.
+`tests/cpp/default_camera_test.cpp` the default camera, `tools/tests/test_stream.py` the
+converter, and `programs/stream_test` the [decode](#decode) on the GPU.
 
 ### Converter
 
@@ -330,8 +330,9 @@ Each frame:
    field, leaving `sh[3..]`.
 3. **DecodeSh** likewise writes the new SH records' `sh[3..]` (none at degree 0).
 
-The kernels take the stream's size on trust: whatever supplies `arrived` (an app, or the
-streaming buffer later) keeps it within the buffer.
+The kernels take the stream's size on trust: whatever supplies `arrived` (the app in stream_test, the
+streaming buffer later) keeps it within the buffer. `programs/stream_test` tests them
+([building-and-testing.md](building-and-testing.md#stream-decode-check)).
 
 ### Encoder
 

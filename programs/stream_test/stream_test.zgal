@@ -1,0 +1,314 @@
+;; The stream decode's test (lib/splat_stream.zgal's PlanDecode, DecodeBase and DecodeSh) on the GPU,
+;; with every check in the app, so the web runs the same checks through the TypeScript export. The
+;; graph reads a stream (--stream, a scene.stream from `convert.py stream`) whole through
+;; buffer-file, and the app feeds it to the decode as if it were streaming in: frame f's `arrived`
+;; is min(f --chunk, --stream-bytes), so most frames end inside a record. Only the arrived bytes
+;; are copied (CopyArrived) into the buffer the decode reads; the words past them hold
+;; undecodedWord, and after the decode CheckUndecoded counts the splats past the decoded records
+;; that aren't still zero (counts[undecodedSplats], checked with each counts readback), so a kernel
+;; that decodes a record before it has arrived fails even though a later frame decodes it again. Each frame's counts
+;; readback is checked against the header PlanDecode copied out (read back too):
+;;   - before arrived covers the header: nothing decoded, the header not yet checked;
+;;   - after: the GPU's code is the app's checkStreamHeader of the same header (streamOverCapacity
+;;     when it passes with more splats than --splats, the working buffer's), and --expect-code;
+;;   - the records decoded are exactly the whole ones arrived holds (completeRecords), none when the
+;;     code isn't streamOk.
+;; Once the whole stream has arrived, the decoded splats are compared with --reference (Splats)
+;; value by value, each to its --tolerances entry (a Splat of tolerances, test.sh's make_case.py):
+;; 0 means bit for bit (f32 and f16 fields, and the zeros of the SH above the stream's degree and of
+;; everything a refused header leaves), otherwise the largest |decoded - reference| allowed (the
+;; quantized fields), and the header PlanDecode copied out with the stream's first words (headerWord).
+;; A stream that passes must have been seen partly decoded at least once when
+;; some frame's arrived holds the header but not all of it (partlyArrives).
+;; And when the header takes several frames to arrive (--chunk under 432), some readback must have
+;; come before it. With a larger chunk only frame 0's comes before it, and a read event handles the
+;; newest finished copy, skipping older ones, so that one may never be handled (on the web it
+;; often isn't), so it isn't required.
+;; It fails on a mismatch or when the frames run out first.
+
+(import "../../lib/splat_stream.zgal")
+
+;; The words past `arrived` in the decode's stream buffer: a NaN as f32 or as f16, all ones as u8 or
+;; u16, so a record decoded from them is never all zeros
+(define undecodedWord (uint #xFFFFFFFF))
+;; counts' element past decodeCountsSize: CheckUndecoded's count, never reset
+(define undecodedSplats (uint 7))
+
+;; Writes the decode's stream buffer each frame, one word an invocation: the whole stream's (`file`)
+;; words below `arrived` (a multiple of 4), undecodedWord past them
+(compute-material CopyArrived
+  (workgroup 256)
+  (bindings
+   (file (buffer-array uint read))
+   (stream (buffer-array uint write)))
+  (push (arrived uint) (words uint))
+  (compute
+   (for ([i (range globalInvocationId.x words (* 256 workgroupCount.x))])
+     (write! (at stream i) (if (< i (shr arrived (uint 2))) (at file i) undecodedWord)))))
+
+;; Adds to counts[undecodedSplats] the splats that have a value written past the records decoded:
+;; any base value (position, opacity, logScale, rotation, sh[0..2]) at or past decodeBaseDecoded, any
+;; sh[3..] at or past decodeShDecoded (the buffer starts zeroed)
+(compute-material CheckUndecoded
+  (workgroup 64)
+  (bindings
+   (counts (buffer-array uint read-write))
+   (splats (buffer-array Splat read)))
+  (push (splatCount uint))
+  ;; The bits of a Splat's values [from, to), or'd: 0 when they are all +0.0
+  (define (valueBits [s : Splat] [from : uint] [to : uint]) : uint
+    (fold ([acc (uint 0)]) ([k (range from to)])
+      (bitor acc (floatBitsToUint
+                  (cond [(< k (uint 3)) (at s.position k)]
+                        [(= k (uint 3)) s.opacity]
+                        [(< k (uint 7)) (at s.logScale (- k (uint 4)))]
+                        [(< k (uint 11)) (at s.rotation (- k (uint 7)))]
+                        [else (at s.sh (- k (uint 11)))])))))
+  (compute
+   (for ([i (range globalInvocationId.x splatCount (* 64 workgroupCount.x))])
+     ;; values 0-13: position, opacity, logScale, rotation, sh[0..2]; 14-58: sh[3..]
+     (let* ([s (at splats i)]
+            [base (valueBits s (uint 0) (uint 14))]
+            [sh (valueBits s (uint 14) (uint 59))])
+       (when (or (and (>= i (at counts decodeBaseDecoded)) (not= base (uint 0)))
+                 (and (>= i (at counts decodeShDecoded)) (not= sh (uint 0))))
+         (atomic-add! (at counts undecodedSplats) (uint 1)))))))
+
+(graph StreamTestGraph
+  (parameter splatCount uint)
+  (parameter streamWords uint)
+  (input streamFile path)
+  (input referenceFile path)
+  (input toleranceFile path)
+  (input arrived (per-frame uint))
+
+  (buffer-file file uint streamFile)
+  (buffer stream uint streamWords #:frames shared)  ; 0xFFFFFFFF past arrived, which the decode must not reach
+  (buffer-file reference Splat referenceFile)
+  (buffer-file tolerances Splat toleranceFile)
+  (buffer splats Splat splatCount #:frames shared)
+  (buffer header StreamHeader 1 #:frames shared)
+  (buffer counts uint 8 #:frames shared)  ; decodeCountsSize, then undecodedSplats
+  (buffer commands DispatchCommand 2 #:frames shared)  ; decodeBaseCommand, decodeShCommand
+
+  (material copying CopyArrived file stream
+            #:push ((arrived arrived) (words streamWords)) #:invocations (streamWords))
+  (material planning PlanDecode stream header counts commands
+            #:push ((arrived arrived) (capacity splatCount)) #:invocations (1))
+  (material decodingBase DecodeBase stream header counts splats)
+  (material decodingSh DecodeSh stream header counts splats)
+  (material checking CheckUndecoded counts splats #:push ((splatCount splatCount)) #:invocations (splatCount))
+
+  (dispatch copy copying)
+  (dispatch plan planning)
+  (dispatch decodeBase decodingBase #:indirect (at commands 0))
+  (dispatch decodeSh decodingSh #:indirect (at commands 1))
+  (dispatch check checking)
+  (readback readCounts counts)
+  (readback readHeader header)
+  (readback readSplats splats)
+  (readback readFile file #:once #t)
+  (readback readReference reference #:once #t)
+  (readback readTolerances tolerances #:once #t))
+
+;; The values of a Splat compared, k from 0 to splatValues - 1: position, opacity, logScale,
+;; rotation, sh
+(define splatValues (uint 59))
+(define (splatValue [s : Splat] [k : uint]) : float
+  (cond [(< k (uint 3)) (at s.position k)]
+        [(= k (uint 3)) s.opacity]
+        [(< k (uint 7)) (at s.logScale (- k (uint 4)))]
+        [(< k (uint 11)) (at s.rotation (- k (uint 7)))]
+        [else (at s.sh (- k (uint 11)))]))
+
+;; Word k of a header as the stream holds it (k below streamHeaderSize / 4), from its members: the
+;; scalars, the camera (streamCameraWord, std430: the matrix's columns first) and the field groups
+;; (streamFieldsWord, streamFieldWords each), so the header PlanDecode copied out is compared with
+;; the stream's bytes word for word
+(define (fieldWord [f : StreamField] [k : uint]) : uint
+  (cond [(= k (uint 0)) f.encoding]
+        [(= k (uint 1)) f.components]
+        [(= k (uint 2)) f.offset]
+        [(= k (uint 3)) f.sharedRange]
+        [(< k (uint 8)) (floatBitsToUint (at f.low (- k (uint 4))))]
+        [else (floatBitsToUint (at f.stepSize (- k (uint 8))))]))
+(define (cameraWord [c : Camera] [k : uint]) : uint
+  (cond [(< k (uint 16)) (floatBitsToUint (at (at c.worldToCamera (/ k (uint 4))) (remainder k (uint 4))))]
+        [(< k (uint 20)) (floatBitsToUint (at c.intrinsics (- k (uint 16))))]
+        [(< k (uint 23)) (floatBitsToUint (at c.center (- k (uint 20))))]
+        [(= k (uint 23)) c.pixelOffset]
+        [(= k (uint 24)) c.size.x]
+        [(= k (uint 25)) c.size.y]
+        [(= k (uint 26)) c.imageBatch]
+        [else c.heldOut]))
+(define (headerWord [h : StreamHeader] [k : uint]) : uint
+  (cond [(= k (uint 0)) h.magic]
+        [(= k (uint 1)) h.version]
+        [(= k (uint 2)) h.splatCount]
+        [(= k (uint 3)) h.shDegree]
+        [(= k (uint 4)) h.baseStride]
+        [(= k (uint 5)) h.shStride]
+        [(= k (uint 6)) h.baseOffset]
+        [(= k (uint 7)) h.shOffset]
+        [(< k streamFieldsWord) (cameraWord h.camera (- k streamCameraWord))]
+        [else (fieldWord (at h.fields (/ (- k streamFieldsWord) streamFieldWords))
+                         (remainder (- k streamFieldsWord) streamFieldWords))]))
+
+;; Whether a decoded value matches its reference: bit for bit at tolerance 0 (so -0.0 isn't 0.0),
+;; otherwise within the tolerance (never for a NaN)
+(define (valueMatches [decoded : float] [reference : float] [tolerance : float]) : bool
+  (if (= tolerance 0.0)
+      (= (floatBitsToUint decoded) (floatBitsToUint reference))
+      (<= (abs (- decoded reference)) tolerance)))
+
+;; The code PlanDecode must give a header, with a working buffer of `capacity` splats
+(define (decodeCode [h : StreamHeader] [capacity : uint]) : uint
+  (let* ([checked (checkStreamHeader h)])
+    (if (and (= checked streamOk) (> h.splatCount capacity)) streamOverCapacity checked)))
+
+;; The base and SH records PlanDecode must have decoded once `arrived` bytes are in
+;; Whether some frame's arrived holds the header but not the whole stream (so a stream that passes
+;; must be seen partly decoded): the first multiple of chunk covering the header is short of it.
+(define (partlyArrives [chunk : uint] [streamBytes : uint]) : bool
+  (< (* (/ (+ streamHeaderSize (- chunk (uint 1))) chunk) chunk) streamBytes))
+
+(define (expectedDecoded [h : StreamHeader] [code : uint] [arrived : uint]) : uvec2
+  (if (= code streamOk)
+      (uvec2 (completeRecords arrived h.baseOffset h.baseStride h.splatCount)
+             (completeRecords arrived h.shOffset h.shStride h.splatCount))
+      (uvec2 0 0)))
+
+(app StreamTest
+  (parameter streamFile path)
+  (parameter referenceFile path)
+  (parameter toleranceFile path)
+  (parameter splatCount uint)
+  (parameter splatsGiven bool)
+  (parameter streamBytes uint)
+  (parameter bytesGiven bool)
+  (parameter chunk uint)
+  (parameter chunkGiven bool)
+  (parameter expectCode uint)
+  (parameter codeGiven bool)
+  ;; Exits the program with status 1
+  (extern (fail) : void)
+  (state
+   (headerDue bool #f)     ; a counts readback has shown the header checked: the next header readback has it
+   (headerData (data StreamHeader) (empty-data StreamHeader))
+   (file (data uint) (empty-data uint))  ; the whole stream, for its header's words
+   (reference (data Splat) (empty-data Splat))
+   (tolerances (data Splat) (empty-data Splat))
+   (early uint 0)          ; counts readbacks before the header was in
+   (verified uint 0)       ; counts readbacks checked against the header
+   (partial uint 0)        ; ... of which some records, but not all, were decoded
+   (failures uint 0)       ; counts readbacks that didn't match
+   (splatsDue bool #f)     ; a verified counts readback has shown the whole stream decoded
+   (compared bool #f)
+   (mismatches uint 0)
+   (headerMismatches uint 0))
+  (on (read readFile d) (with state #:file d))
+  (on (read readReference d) (with state #:reference d))
+  (on (read readTolerances d) (with state #:tolerances d))
+  (on (read readHeader d)
+    (if (and state.headerDue (= (count state.headerData) (uint 0))) (with state #:headerData d) state))
+  (on (read readCounts d)
+    (let* ([arrived (at d decodeArrived)]
+           [base (at d decodeBaseDecoded)]
+           [sh (at d decodeShDecoded)]
+           [code (at d decodeHeaderCode)]
+           [undecoded (at d undecodedSplats)])
+      (unless (= undecoded (uint 0))
+        (print! "stream_test: MISMATCH at " arrived " bytes: " undecoded
+                " splats (summed over frames) written past the records decoded"))
+      (cond
+        ;; Before the header: nothing
+        [(= (at d decodeHeaderState) (uint 0))
+         (let* ([ok (and (< arrived streamHeaderSize) (= base (uint 0)) (= sh (uint 0)) (= undecoded (uint 0)))])
+           (unless ok
+             (print! "stream_test: MISMATCH before the header (arrived " arrived "): base " base ", SH " sh))
+           (with state #:early (+ state.early 1) #:failures (+ state.failures (if ok 0 1))))]
+        [(= (count state.headerData) (uint 0)) (with state #:headerDue #t)]
+        [else
+         (let* ([h (at state.headerData 0)]
+                [expected (decodeCode h splatCount)]
+                [records (expectedDecoded h expected arrived)]
+                [ok (and (= code expected) (= code expectCode) (= base records.x) (= sh records.y) (= undecoded (uint 0))
+                         (<= (at d decodeBaseFrom) base) (<= (at d decodeShFrom) sh))]
+                [isPartial (or (and (> base (uint 0)) (< base h.splatCount)) (and (> sh (uint 0)) (< sh h.splatCount)))])
+           (unless ok
+             (print! "stream_test: MISMATCH at " arrived " bytes: code " code " (the app's " expected ", expected "
+                     expectCode "), base records " base " (expected " records.x "), SH records " sh
+                     " (expected " records.y ")"))
+           (with state #:verified (+ state.verified 1) #:partial (+ state.partial (if isPartial 1 0))
+                 #:failures (+ state.failures (if ok 0 1))
+                 #:splatsDue (or state.splatsDue (= arrived streamBytes))))])))
+  (on (read readSplats d)
+    (if (and state.splatsDue (not state.compared) (= (count state.reference) splatCount)
+             (= (count state.tolerances) splatCount) (= (count d) splatCount)
+             (>= (* (count state.file) (uint 4)) streamHeaderSize))
+        (let* ([words (/ streamHeaderSize (uint 4))]
+               [header (fold ([acc (uvec2 0 0)]) ([k (range (uint 0) words)])
+                         (if (= (headerWord (at state.headerData 0) k) (at state.file k))
+                             acc
+                             (if (= acc.x (uint 0)) (uvec2 1 k) (uvec2 (+ acc.x 1) acc.y))))]
+               [result (fold ([acc (uvec3 0 0 0)]) ([i (range (uint 0) splatCount)] [k (range (uint 0) splatValues)])
+                         (if (valueMatches (splatValue (at d i) k) (splatValue (at state.reference i) k)
+                                           (splatValue (at state.tolerances i) k))
+                             acc
+                             (if (= acc.x (uint 0)) (uvec3 1 i k) (uvec3 (+ acc.x 1) acc.y acc.z))))])
+          (if (= result.x (uint 0))
+              (print! "stream_test: " splatCount " splats decoded as the reference")
+              (print! "stream_test: MISMATCH, " result.x " values off the reference, the first splat "
+                      result.y "'s value " result.z ": " (splatValue (at d result.y) result.z) " (reference "
+                      (splatValue (at state.reference result.y) result.z) ", tolerance "
+                      (splatValue (at state.tolerances result.y) result.z) ")"))
+          (if (= header.x (uint 0))
+              (print! "stream_test: the header copied out as the stream holds it")
+              (print! "stream_test: MISMATCH, " header.x " header words off the stream's, the first word "
+                      header.y ": " (headerWord (at state.headerData 0) header.y) " (the stream's "
+                      (at state.file header.y) ")"))
+          (with state #:compared #t #:mismatches result.x #:headerMismatches header.x))
+        state))
+  (on (frame dt)
+    (cond
+      [(not (and splatsGiven bytesGiven chunkGiven codeGiven))
+       (begin (print! "stream_test: FAILED, --splats, --stream-bytes, --chunk and --expect-code are required")
+              (fail) state)]
+      [(or (= chunk (uint 0)) (not= (remainder chunk (uint 4)) (uint 0)) (not= (remainder streamBytes (uint 4)) (uint 0)))
+       (begin (print! "stream_test: FAILED, --chunk and --stream-bytes must be multiples of 4 (and --chunk not 0)")
+              (fail) state)]
+      [(and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))
+       (begin
+         (print! "stream_test: FAILED, " frameLimit " frames weren't enough (" state.verified
+                 " counts readbacks verified, whole stream decoded: " state.splatsDue ")")
+         (fail)
+         state)]
+      [state.compared
+       (let* ([ok (and (= state.failures (uint 0)) (= state.mismatches (uint 0)) (= state.headerMismatches (uint 0))
+                       (or (>= chunk streamHeaderSize) (> state.early (uint 0)))
+                       (or (not= expectCode streamOk) (not (partlyArrives chunk streamBytes))
+                           (> state.partial (uint 0))))])
+         (print! "stream_test: " state.early " readbacks before the header, " state.verified " after ("
+                 state.partial " partly decoded), " state.failures " mismatched")
+         (if ok
+             (begin (print! "stream_test: passed") (quit!))
+             (begin (print! "stream_test: FAILED") (fail)))
+         state)]
+      [else state]))
+  (run StreamTestGraph (streamFile streamFile) (referenceFile referenceFile) (toleranceFile toleranceFile)
+       (splatCount splatCount) (streamWords (max (uint 1) (/ streamBytes (uint 4))))
+       ;; Frames x --chunk is far below 2^32 in test.sh (the uint product wraps natively, not in TS)
+       (arrived (min streamBytes (* frameNumber chunk)))
+       #:enabled ((readSplats state.splatsDue))))
+
+(main StreamTest
+  (about "Checks the stream decode: the header check and the records decoded as a stream arrives")
+  (timestep #:max 0.1 #:fixed 0.016)
+  (option streamFile "--stream" "the stream (scene.stream)" #:default "scene.stream")
+  (option referenceFile "--reference" "the splats it must decode to (Splats)" #:default "reference.bin")
+  (option toleranceFile "--tolerances" "each value's tolerance, 0 for bit for bit (Splats)" #:default "tolerances.bin")
+  (option splatCount "--splats" "the working buffer's splats, and the reference's (required)" #:default 1
+          #:range (1 559240) #:given splatsGiven)
+  (option streamBytes "--stream-bytes" "the stream's size in bytes (required)" #:default 0 #:given bytesGiven)
+  (option chunk "--chunk" "the bytes arriving each frame, a multiple of 4 (required)" #:default 4 #:given chunkGiven)
+  (option expectCode "--expect-code" "PlanDecode's code for the header (required)" #:default 0 #:given codeGiven))
