@@ -6,6 +6,7 @@
 #                    program's headless test (programs/<name>/test.sh)
 #   make web       - build every program for the web into build/web/<name>
 #   make test-web  - every program's web test under Node (programs/<name>/test-web.sh)
+#   make test-pages - every program's page test in headless Chromium (programs/<name>/test-page.sh)
 # docs/building-and-testing.md has the conventions.
 
 # Compiler: clang, the one the wrapper is tested with (Apple's c++ on macOS, clang++ on Linux),
@@ -145,8 +146,18 @@ $(foreach p,$(WEB_TESTED_PROGRAMS),$(eval test-web-$(p): $(OUT)/web/$(p) $(call 
 
 test-web: $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
 
-.PHONY: all native web test test-tools test-cpp test-programs test-web clean \
-	$(foreach p,$(TESTED_PROGRAMS),test-$(p)) $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
+# Page tests: programs/<name>/test-page.sh, run as test-page.sh <web build dir> <output dir>
+# <chromium.ts> after its program's web build: its page (<name>.zgal.html) in headless Chromium on
+# SwiftShader, through the wrapper's checker. A missing Chromium fails them (CHROMIUM names one).
+PAGE_TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test-page.sh),$(p)))
+
+$(foreach p,$(PAGE_TESTED_PROGRAMS),$(eval test-pages-$(p): $(OUT)/web/$(p) ; programs/$(p)/test-page.sh $(OUT)/web/$(p) $(OUT)/test-pages/$(p) $(ZGAL_ROOT)/web/tools/chromium.ts))
+
+test-pages: $(foreach p,$(PAGE_TESTED_PROGRAMS),test-pages-$(p))
+
+.PHONY: all native web test test-tools test-cpp test-programs test-web test-pages clean \
+	$(foreach p,$(TESTED_PROGRAMS),test-$(p)) $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p)) \
+	$(foreach p,$(PAGE_TESTED_PROGRAMS),test-pages-$(p))
 
 clean:
 	rm -rf $(OUT)

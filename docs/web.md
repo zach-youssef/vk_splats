@@ -118,12 +118,20 @@ web isn't bounded above). sparse keeps its absolute 28 dB, the user's decision (
 holding it to native would need the mean of several seeds (about 9 more minutes in the web CI
 job, past its step timeout) or a less chaotic run first.
 
+`make test-pages` runs the programs' pages (`<name>.zgal.html`) in headless Chromium on
+SwiftShader, which the Node tests don't reach:
+
+- **splat_render**: its present path, in the page's canvas: S3 camera 0 for 8 frames at a
+  128x128 canvas (`--size 128x128`, so the canvas is the image's size), the canvas screenshotted
+  and compared with the native golden at 45 dB. SwiftShader matches it bit for bit (inf dB) on an
+  M4; a page rendering camera 1 instead scores 20.8 dB and fails.
+
 ## Not supported on the web
 
 - **tile_test**: builds, but its checks are native only (its `.inputs.ts` stubs throw), so it has
   no web test.
-- **The window**: splat_render's present path runs only in a page (`splat_render.zgal.html`), and
-  no test covers it; the tests are headless under Node.
+- **The window**: splat_render's present path runs only in a page (`splat_render.zgal.html`):
+  the Node tests are headless, and the page test ([Tests](#tests)) covers it in Chromium.
 - **Paths in externs**: a ZGAL extern can't take a `path` (or string) parameter, so
   render_test's and grad_test's readback directories and splat_train's PLY are environment
   variables rather than options.

@@ -27,6 +27,12 @@ Racket (for its ZGAL-generated header).
 - `make test-web`: each program's `test-web.sh` under Node (`make test-web-<name>` runs one),
   after building its web-check tools and the native library; it needs Python as `make test` does
   (`PYTHON=...`).
+- `make test-pages`: each program's `test-page.sh` (`make test-pages-<name>` runs one), after its
+  web build: its page in headless Chromium on SwiftShader, through the wrapper's
+  `web/tools/chromium.ts`. It needs Python as `make test` does, and Chromium's headless shell:
+  `CHROMIUM=<path>`, else the newest one Playwright installed
+  (`npx playwright install chromium-headless-shell`). A missing Chromium fails it, unlike the
+  wrapper's `make test-pages`, which skips one it doesn't find.
 - `make clean`: removes `build/`.
 - `ZGAL_ROOT=<checkout>` builds against another wrapper checkout; `CXX=...` another compiler
   (clang by default); `PYTHON=...` another Python.
@@ -87,6 +93,13 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   under Node with Dawn, where WebGPU validation errors fail a `--validation` run). The programs'
   `test-web.sh` call their `test.sh`, which runs a `.js` binary under `$NODE` (`node` by default),
   so the web runs the native tests ([web.md](web.md#tests)).
+- **A page test**: `programs/<name>/test-page.sh`, run from the repository's root as
+  `test-page.sh <web build dir> <output dir> <chromium.ts>`. It serves the program's page
+  (`<name>.zgal.html`, its options and positional arguments in the query string) and its inputs
+  from one directory under its output directory (`chromium.ts --serve`, which follows symlinks),
+  runs it in Chromium, and checks what it shows (`--screenshot`, `--keys`), failing when the
+  checker exits non-zero, 3 (no Chromium) included. SwiftShader is slow, so a page test uses a
+  tiny scene: splat_render's renders S3 (2000 splats) at 128x128 ([web.md](web.md#tests)).
 - **A web-check tool**: `programs/<name>/web-check/<tool>.cpp`, a host program a web test runs on
   what the web run wrote, for checks written in C++ (render_test's `render_test_check`). It's built
   like a C++ test (with `tests/` on the include path, and a `<tool>.zgal` beside it for a generated
