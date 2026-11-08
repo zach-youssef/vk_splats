@@ -16,6 +16,9 @@ For example, the real scene:
 `tools/convert.py colmap colmap/colmap_exports3 build/data/cs5330 --images colmap/cs5330_dense_resized`
 (about 15 s).
 
+Reading a PLY (`ply-to-bin`, `colmap --splats`, `evaluate.py`) goes through the native library,
+so build it first: `make native` ([building and testing](building-and-testing.md#the-native-library)).
+
 `colmap` reads a COLMAP text export (`cameras.txt`, `images.txt`, `points3D.txt`; other files are
 ignored) and writes a scene:
 
@@ -135,7 +138,11 @@ values, used as stored (the reference code trains on them without linearizing).
 
 ## INRIA PLY
 
-This is the reference code's format, read and written by `splatdata.splats`. It is binary
+This is the reference code's format, read and written by `splatdata.splats`: `read_ply` calls the
+C++ reader the programs share (`lib/native/ply_reader.h`, through `libsplat_native`,
+[building-and-testing.md](building-and-testing.md#the-native-library)), while `write_ply` is
+still Python, the one remaining duplicate of C++ (splat_train's export), until that writer moves
+to `lib/native/` too. It is binary
 little-endian, with one `vertex` element of float properties:
 
 ```
@@ -145,8 +152,11 @@ x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2 rot_0..3
 - `f_rest` is channel-major: coefficient k (1–15) of channel c is `f_rest_{c·15 + k − 1}`.
 - The scales are logs, the opacity is a logit, and `rot` is (w, x, y, z).
 
-The reader accepts properties in any order and of any numeric type, SH of degree 0–2 (fewer
-`f_rest`, padded with zeros) and elements after the vertices. It ignores the normals. The writer
+The reader accepts properties in any order and of any numeric type (each converted to double,
+then float), SH of degree 0–2 (fewer `f_rest`, padded with zeros; it reports the degree) and
+elements after the vertices. It ignores the normals. It refuses anything else (another format, a
+list or duplicate vertex property, missing properties, `f_rest` not numbered from 0, fewer
+vertices than declared) with a message. The writer
 writes degree 3, with zero normals.
 
 ## Stream files

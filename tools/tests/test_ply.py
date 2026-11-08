@@ -21,7 +21,12 @@ def assert_same(a, b):
 def test_ply_round_trip(tmp_path):
     original = random_splats(257)
     splats.write_ply(str(tmp_path / "a.ply"), original)
-    assert_same(splats.read_ply(str(tmp_path / "a.ply")), original)
+    read = splats.read_ply(str(tmp_path / "a.ply"))
+    assert_same(read, original)
+    # Its own arrays, as the Python reader's were: float32, contiguous and writable
+    for name in ("position", "log_scale", "rotation", "opacity_logit", "sh"):
+        a = getattr(read, name)
+        assert a.dtype == np.float32 and a.flags.c_contiguous and a.flags.writeable, name
 
 
 def write_raw_ply(path, names, rows, extra_header=()):

@@ -189,22 +189,3 @@ def test_many_properties_allocate_what_the_file_holds(tmp_path):
     assert len(data) == native.SPLAT_SIZE and degree == 3
     assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit - before < 200 << 20
 
-
-# --- Until the Python parser is deleted: both readers agree -----------------------------------------
-
-@pytest.mark.parametrize("degree", [0, 1, 2, 3])
-@pytest.mark.parametrize("mixed_types", [False, True])
-def test_agrees_with_the_python_reader(tmp_path, degree, mixed_types):
-    path = str(tmp_path / "a.ply")
-    random_fixture(path, degree, seed=10 + degree, mixed_types=mixed_types)
-    assert_same(read_native(path)[0], splats.read_ply(path))
-
-
-@pytest.mark.parametrize("name", sorted(INVALID))
-def test_both_readers_refuse(tmp_path, name):
-    path = tmp_path / f"{name}.ply"
-    path.write_bytes(INVALID[name][0])
-    with pytest.raises(ValueError):
-        native.read_ply(str(path))
-    with pytest.raises((ValueError, UnicodeDecodeError)):
-        splats.read_ply(str(path))

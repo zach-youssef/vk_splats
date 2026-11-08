@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial import cKDTree
 
+from . import native
+
 SH_DEGREE = 3
 SH_COEFFICIENTS = (SH_DEGREE + 1) ** 2  # 16
 SH_C0 = 0.28209479177387814  # Y_0^0 = 1 / (2 sqrt(pi))
@@ -119,13 +121,9 @@ def from_std430(data: bytes) -> Splats:
 # The reference code's format: binary little-endian, one vertex element of float properties
 # x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2 rot_0..3. f_rest is channel-major: the
 # coefficient k (1–15) of channel c is f_rest_{c·15 + k − 1}. Scales are logs, opacity a logit and
-# rot (w, x, y, z), unnormalized.
-
-_PLY_TYPES = {
-    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1", "short": "i2", "int16": "i2",
-    "ushort": "u2", "uint16": "u2", "int": "i4", "int32": "i4", "uint": "u4", "uint32": "u4",
-    "float": "f4", "float32": "f4", "double": "f8", "float64": "f8",
-}
+# rot (w, x, y, z), unnormalized. The reader is the C++ one the programs share (lib/native/
+# ply_reader.h, through splatdata.native); the writer is still Python, the one duplicate of
+# splat_train's C++ (exportPly), until that moves to lib/native/ too.
 
 
 def ply_property_names(rest_per_channel: int = SH_COEFFICIENTS - 1):
@@ -149,69 +147,13 @@ def write_ply(path: str, splats: Splats) -> None:
 
 
 def read_ply(path: str) -> Splats:
-    """Reads an INRIA-format PLY: binary little-endian, with its vertex element first. Properties
-    may be in any order and any numeric type; SH of degree below 3 (fewer f_rest) is padded with
-    zeros, and normals are ignored."""
-    with open(path, "rb") as f:
-        if f.readline().strip() != b"ply":
-            raise ValueError(f"{path}: not a PLY file")
-        fmt, count, props, element = None, None, [], None
-        while True:
-            line = f.readline()
-            if not line:
-                raise ValueError(f"{path}: no end_header")
-            tokens = line.decode("ascii").split()
-            if not tokens or tokens[0] in ("comment", "obj_info"):
-                continue
-            if tokens[0] == "end_header":
-                break
-            if tokens[0] == "format":
-                fmt = tokens[1]
-            elif tokens[0] == "element":
-                if element == "vertex":  # Later elements (faces) are ignored
-                    element = "after"
-                elif element is None:
-                    if tokens[1] != "vertex":
-                        raise ValueError(f"{path}: the first element is {tokens[1]}, not vertex")
-                    element, count = "vertex", int(tokens[2])
-            elif tokens[0] == "property" and element == "vertex":
-                if tokens[1] == "list":
-                    raise ValueError(f"{path}: list property {tokens[-1]} in vertex")
-                if tokens[1] not in _PLY_TYPES:
-                    raise ValueError(f"{path}: property {tokens[2]} has unknown type {tokens[1]}")
-                props.append((tokens[2], "<" + _PLY_TYPES[tokens[1]]))
-        if fmt != "binary_little_endian":
-            raise ValueError(f"{path}: format {fmt}; only binary_little_endian is supported")
-        if count is None:
-            raise ValueError(f"{path}: no vertex element")
-        dtype = np.dtype(props)
-        data = np.frombuffer(f.read(count * dtype.itemsize), dtype)
-        if len(data) != count:
-            raise ValueError(f"{path}: {count} vertices declared, {len(data)} present")
-
-    names = set(dtype.names)
-    required = ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity"] + \
-        [f"scale_{i}" for i in range(3)] + [f"rot_{i}" for i in range(4)]
-    missing = [name for name in required if name not in names]
-    if missing:
-        raise ValueError(f"{path}: missing properties {', '.join(missing)}")
-    rest_names = sorted((name for name in names if name.startswith("f_rest_")), key=lambda s: int(s[7:]))
-    if [int(name[7:]) for name in rest_names] != list(range(len(rest_names))):
-        raise ValueError(f"{path}: f_rest properties aren't numbered 0..{len(rest_names) - 1}")
-    per_channel = len(rest_names) // 3
-    if len(rest_names) % 3 or per_channel + 1 not in (1, 4, 9, 16):
-        raise ValueError(f"{path}: {len(rest_names)} f_rest properties: not SH of degree 0–3")
-
-    col = lambda name: data[name].astype(np.float64)  # noqa: E731
-    sh = np.zeros((count, SH_COEFFICIENTS, 3))
-    for c in range(3):
-        sh[:, 0, c] = col(f"f_dc_{c}")
-        for k in range(1, per_channel + 1):
-            sh[:, k, c] = col(f"f_rest_{c * per_channel + k - 1}")
-    return Splats(
-        position=np.stack([col("x"), col("y"), col("z")], 1),
-        log_scale=np.stack([col(f"scale_{i}") for i in range(3)], 1),
-        rotation=np.stack([col(f"rot_{i}") for i in range(4)], 1),
-        opacity_logit=col("opacity"),
-        sh=sh,
-    )
+    """Reads an INRIA-format PLY with lib/native/ply_reader.h: binary little-endian, with its vertex
+    element first. Properties may be in any order and any numeric type; SH of degree below 3 (fewer
+    f_rest) is padded with zeros, and normals are ignored. Raises ValueError for a file it doesn't
+    support and OSError for one it can't read."""
+    data, _ = native.read_ply(path)
+    a = np.frombuffer(data, SPLAT_DTYPE)
+    # Copies, so the arrays are contiguous and writable
+    return Splats(position=a["position"].copy(), log_scale=a["logScale"].copy(),
+                  rotation=a["rotation"].copy(), opacity_logit=a["opacity"].copy(),
+                  sh=a["sh"].reshape(len(a), SH_COEFFICIENTS, 3).copy())

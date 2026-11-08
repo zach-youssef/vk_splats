@@ -46,7 +46,9 @@ header in `lib/native/` (and its C++ test), its wrapper in `c_api.cpp`, its sign
 `native.py`, and a test in `test_native.py`. The library's generated header comes from
 `lib/native/c_api.zgal`, which imports the modules whose structs it uses.
 
-It holds the INRIA PLY reader (`lib/native/ply_reader.h`, bound as `native.read_ply`).
+It holds the INRIA PLY reader (`lib/native/ply_reader.h`), which `splatdata.splats.read_ply`
+calls, so the data tools' tests and every tool reading a PLY need the library built. The PLY
+writer is the one piece still duplicated in Python ([data-format.md](data-format.md#inria-ply)).
 
 ## Adding programs and tests
 
