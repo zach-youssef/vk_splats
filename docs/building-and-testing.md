@@ -49,8 +49,12 @@ header in `lib/native/` (and its C++ test), its wrapper in `c_api.cpp`, its sign
 It holds the INRIA PLY reader (`lib/native/ply_reader.h`), which `splatdata.splats.read_ply`
 calls, so the data tools' tests and every tool reading a PLY need the library built, and the
 splats.bin reader (`lib/native/splats_bin_reader.h`). Both return a `ReadStatus`
-(`lib/native/read_status.h`), which the binding raises as `OSError`, `ValueError` or `MemoryError`. The PLY
-writer is the one piece still duplicated in Python ([data-format.md](data-format.md#inria-ply)).
+(`lib/native/read_status.h`), which the binding raises as `OSError`, `ValueError` or `MemoryError`. It
+also holds the stream encoder and the default camera (`lib/native/stream_encoder.h`,
+`default_camera.h`; [data-format.md](data-format.md#stream-files)): the binding mirrors the
+encoder's `EncodeConfig` and `EncodeReport` as ctypes structs and raises a refusal as
+`native.EncodeError`, naming the group and splat. The PLY writer is the one piece still
+duplicated in Python ([data-format.md](data-format.md#inria-ply)).
 
 ## Adding programs and tests
 

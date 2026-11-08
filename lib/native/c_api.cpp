@@ -10,10 +10,12 @@ namespace gen = ::c_api;
 
 #include "ply_reader.h"
 #include "splats_bin_reader.h"
+#include "stream_encoder.h"
 
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <span>
 #include <vector>
 
 #define SPLAT_NATIVE_EXPORT extern "C" __attribute__((visibility("default")))
@@ -85,4 +87,55 @@ SPLAT_NATIVE_EXPORT uint32_t splat_native_read_splats_bin(const char* path, Spla
 SPLAT_NATIVE_EXPORT void splat_native_free_splats(SplatNativeSplats* out) {
     delete static_cast<std::vector<c_api::Splat>*>(out->owner);
     *out = SplatNativeSplats{};
+}
+
+// ---------------------------------------------------------------------------------------------
+// The stream encoder (lib/native/stream_encoder.h) and the default camera (default_camera.h). The
+// config and the report are the encoder's own plain structs; the binding mirrors them and checks
+// their sizes.
+// ---------------------------------------------------------------------------------------------
+SPLAT_NATIVE_EXPORT uint32_t splat_native_encode_config_size(void) { return sizeof(splat_native::EncodeConfig); }
+SPLAT_NATIVE_EXPORT uint32_t splat_native_encode_report_size(void) { return sizeof(splat_native::EncodeReport); }
+SPLAT_NATIVE_EXPORT uint32_t splat_native_stream_header_size(void) { return sizeof(c_api::StreamHeader); }
+SPLAT_NATIVE_EXPORT uint32_t splat_native_camera_size(void) { return sizeof(c_api::Camera); }
+// streamMaxSplats, so the binding's copy (and its errors) can't drift from the encoder's
+SPLAT_NATIVE_EXPORT uint32_t splat_native_stream_max_splats(void) { return c_api::streamMaxSplats; }
+
+// The size in bytes of the stream of `splatCount` splats under `config` into `size`: returns
+// kEncodeOk, kEncodeBadConfig with `group` (groupCount for shDegree) or kEncodeTooManySplats
+SPLAT_NATIVE_EXPORT uint32_t splat_native_stream_size(const splat_native::EncodeConfig* config, uint64_t splatCount,
+                                                      uint64_t* size, uint32_t* group) {
+    *size = 0;
+    *group = 0;
+    if (splatCount > c_api::streamMaxSplats) return splat_native::kEncodeTooManySplats;
+    c_api::StreamHeader header;
+    const uint32_t status = splat_native::streamLayout(*config, static_cast<uint32_t>(splatCount), header, *group);
+    if (status == splat_native::kEncodeOk) *size = splat_native::streamSize(header);
+    return status;
+}
+
+// Encodes `count` Splats (std430, 240 bytes each) at `splats` under `config` into the `outSize`
+// bytes at `out`, which must be splat_native_stream_size's, and fills `report`: returns kEncodeOk
+// or the first problem (report's status, with its group and splat), as encodeStream does
+SPLAT_NATIVE_EXPORT uint32_t splat_native_encode_stream(const void* splats, uint64_t count,
+                                                        const splat_native::EncodeConfig* config, void* out,
+                                                        uint64_t outSize, splat_native::EncodeReport* report) {
+    if (count > c_api::streamMaxSplats) {
+        *report = splat_native::EncodeReport{};
+        report->status = splat_native::kEncodeTooManySplats;
+        return report->status;
+    }
+    return splat_native::encodeStream(
+        std::span(static_cast<const c_api::Splat*>(splats), static_cast<std::size_t>(count)), *config,
+        std::span(static_cast<uint8_t*>(out), static_cast<std::size_t>(outSize)), *report);
+}
+
+// The default camera framing `count` Splats at `splats` into `camera` (a 112-byte std430 Camera):
+// returns kDefaultCameraOk, or kDefaultCameraOutOfMemory with `camera` unchanged
+SPLAT_NATIVE_EXPORT uint32_t splat_native_default_camera(const void* splats, uint64_t count, void* camera) {
+    c_api::Camera result;
+    const uint32_t status = splat_native::defaultCamera(
+        std::span(static_cast<const c_api::Splat*>(splats), static_cast<std::size_t>(count)), result);
+    if (status == splat_native::kDefaultCameraOk) std::memcpy(camera, &result, sizeof result);
+    return status;
 }

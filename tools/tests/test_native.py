@@ -1,6 +1,7 @@
 """libsplat_native through its ctypes binding (splatdata.native): every C function, the PLY
-reader's layout, SH degrees, property types and errors, and the splats.bin reader. The stream
-encoder's functions are tested in test_stream.py."""
+reader's layout, SH degrees, property types and errors, the splats.bin reader, and the stream
+encoder and default camera as the binding passes them (their encoding is tests/cpp/'s, the
+converter's test_stream.py)."""
 
 import errno
 
@@ -77,6 +78,11 @@ def test_library_matches_the_binding():
     lib = native.library()
     assert lib.splat_native_splat_size() == native.SPLAT_SIZE == splats.SPLAT_DTYPE.itemsize
     assert lib.splat_native_splats_struct_size() == native.ctypes.sizeof(native._Splats)
+    assert lib.splat_native_encode_config_size() == native.ctypes.sizeof(native.EncodeConfig)
+    assert lib.splat_native_encode_report_size() == native.ctypes.sizeof(native.EncodeReport)
+    assert lib.splat_native_stream_header_size() == native.STREAM_HEADER_SIZE
+    assert lib.splat_native_camera_size() == native.CAMERA_SIZE
+    assert lib.splat_native_stream_max_splats() == native.STREAM_MAX_SPLATS
 
 
 @pytest.mark.parametrize("degree", [0, 1, 2, 3])
@@ -212,3 +218,94 @@ def test_splats_bin_reader(tmp_path):
     (tmp_path / "directory.bin").mkdir()
     with pytest.raises((OSError, ValueError), match="not a regular file|directory"):
         native.read_splats_bin(str(tmp_path / "directory.bin"))
+
+
+def random_splats(n, seed):
+    rng = np.random.default_rng(seed)
+    return splats.Splats(position=rng.normal(size=(n, 3)), log_scale=rng.normal(size=(n, 3)),
+                         rotation=rng.normal(size=(n, 4)), opacity_logit=rng.normal(size=n),
+                         sh=rng.normal(size=(n, 16, 3)))
+
+
+def encode_config(encodings, sh_degree=3, range_mode=native.RANGE_DATA):
+    """An EncodeConfig of these per-group encodings, quantized groups taking `range_mode` (an
+    explicit range is [-1, 1])."""
+    config = native.EncodeConfig()
+    config.shDegree = sh_degree
+    for g, encoding in enumerate(encodings):
+        group = config.groups[g]
+        group.encoding = encoding
+        quantized = encoding in (native.ENCODING_U16, native.ENCODING_U8)
+        group.rangeMode = range_mode if quantized else native.RANGE_NONE
+        for c in range(4):
+            group.lo[c], group.hi[c] = -1.0, 1.0
+    return config
+
+
+FULL = [native.ENCODING_F32] * native.GROUP_COUNT
+
+
+def test_encoder_full_precision_copies_the_splats():
+    s = random_splats(9, seed=6)
+    data = splats.to_std430(s)
+    config = encode_config(FULL)
+    assert native.stream_size(config, 9) == native.STREAM_HEADER_SIZE + 9 * (56 + 180)
+    stream, report = native.encode_stream(data, config)
+    assert len(stream) == native.STREAM_HEADER_SIZE + 9 * (56 + 180)
+    header = np.frombuffer(stream[:32], "<u4")
+    assert list(header) == [1397510227, 1, 9, 3, 56, 180, 432, 432 + 9 * 56]
+    assert stream[32:144] == native.default_camera(data)
+    assert report.status == native.ENCODE_OK
+    assert all(report.groups[g].maxError == 0 and report.groups[g].maxActivatedError == 0
+               for g in range(native.GROUP_COUNT))
+    # Every base and SH value is in the stream (f32 copies the bits), whatever the record's order
+    base = np.frombuffer(stream, "<f4", 9 * 14, 432).reshape(9, 14)
+    sh = np.frombuffer(stream, "<f4", 9 * 45, 432 + 9 * 56).reshape(9, 45)
+    f = np.frombuffer(data, "<f4").reshape(9, 60)
+    assert np.array_equal(sh, f[:, 15:60])
+    expected = np.concatenate([f[:, 0:3], f[:, 4:7], f[:, 8:12], f[:, 12:15], f[:, 3:4]], 1)
+    assert np.array_equal(np.sort(base, 1), np.sort(expected, 1))
+
+
+def test_encoder_reports_quantization_error():
+    data = splats.to_std430(random_splats(50, seed=7))
+    _, report = native.encode_stream(data, encode_config([native.ENCODING_U8] * native.GROUP_COUNT))
+    assert all(report.groups[g].maxError > 0 for g in range(native.GROUP_COUNT))
+    assert native.encode_stream(b"", encode_config(FULL, sh_degree=0))[0][:16] == \
+        np.array([1397510227, 1, 0, 0], "<u4").tobytes()
+
+
+def test_encoder_errors_name_the_group_and_splat():
+    s = random_splats(4, seed=8)
+    bad = encode_config(FULL)
+    bad.groups[2].encoding = 7
+    with pytest.raises(native.EncodeError, match="the config of rotation is invalid") as error:
+        native.encode_stream(splats.to_std430(s), bad)
+    assert (error.value.status, error.value.group) == (native.ENCODE_BAD_CONFIG, 2)
+    with pytest.raises(native.EncodeError, match="the config of shDegree is invalid"):
+        native.stream_size(encode_config(FULL, sh_degree=4), 1)
+    with pytest.raises(native.EncodeError, match="more than 559240 splats"):
+        native.stream_size(encode_config(FULL), native.STREAM_MAX_SPLATS + 1)
+    with pytest.raises(ValueError, match="whole number of 240-byte Splats"):
+        native.encode_stream(b"\0" * 100, encode_config(FULL))
+    s.opacity_logit[2] = np.nan
+    with pytest.raises(native.EncodeError, match="splat 2's opacity isn't finite") as error:
+        native.encode_stream(splats.to_std430(s), encode_config(FULL))
+    assert error.value.splat == 2
+    s.opacity_logit[2] = 0
+    s.log_scale[3, 1] = 70000
+    with pytest.raises(native.EncodeError, match="splat 3's scale is too large for f16"):
+        native.encode_stream(splats.to_std430(s), encode_config([native.ENCODING_F16] * native.GROUP_COUNT))
+    s.log_scale[3, 1] = 0
+    s.rotation[1] = 0
+    rotation_u8 = encode_config(FULL[:2] + [native.ENCODING_U8] + FULL[3:], range_mode=native.RANGE_EXPLICIT)
+    with pytest.raises(native.EncodeError, match="splat 1's rotation has length 0"):
+        native.encode_stream(splats.to_std430(s), rotation_u8)
+
+
+def test_default_camera():
+    data = splats.to_std430(random_splats(5, seed=9))
+    camera = native.default_camera(data)
+    assert len(camera) == native.CAMERA_SIZE
+    assert camera == native.default_camera(data)
+    assert len(native.default_camera(b"")) == native.CAMERA_SIZE

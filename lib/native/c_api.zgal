@@ -1,3 +1,4 @@
-;; The types lib/native/c_api.cpp wraps (the generated c_api.zgal.h, namespace c_api): the Splat of
-;; lib/splat_math.zgal, which the PLY reader fills.
-(import "../splat_math.zgal")
+;; The types lib/native/c_api.cpp wraps (the generated c_api.zgal.h, namespace c_api): the stream
+;; format of lib/splat_stream.zgal, for the encoder and the default camera, and through it the Splat
+;; and Camera of lib/splat_math.zgal, which the readers fill.
+(import "../splat_stream.zgal")

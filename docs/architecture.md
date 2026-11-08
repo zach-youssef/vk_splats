@@ -44,8 +44,8 @@
     generates for those modules: the stream encoder (`stream_encoder.h`), the default camera it
     writes into the header (`default_camera.h`, [data-format.md](data-format.md#stream-files)) and
     the INRIA PLY reader (`ply_reader.h`, [data-format.md](data-format.md#inria-ply)) and the
-    splats.bin reader (`splats_bin_reader.h`). `c_api.cpp` wraps the readers in a C ABI for the tools' ctypes binding
-    (`tools/splatdata/native.py`), built into `build/native/libsplat_native`
+    splats.bin reader (`splats_bin_reader.h`). `c_api.cpp` wraps them in a C ABI for the tools'
+    ctypes binding (`tools/splatdata/native.py`), built into `build/native/libsplat_native`
     ([building-and-testing.md](building-and-testing.md#the-native-library)).
     ZGAL puts the generated code in the namespace of the importing `.zgal` file, so an includer
     aliases it first: `#include "<x>.zgal.h"`, then `namespace splat_native { namespace gen = ::<x>; }`,
