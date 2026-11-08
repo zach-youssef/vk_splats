@@ -123,6 +123,10 @@ Training adds Adam, and densification and pruning on a fixed capacity, compacted
   no kernel hard-codes 32 or 64.
 - **Shared memory**: at most 16 KB per workgroup (WebGPU's default): rasterize batches 256 splats
   forward and 128 backward.
+- **Names**: ZGAL refuses a declared name that is a GLSL or C++ keyword or type (`shared`, `half`)
+  or a GLSL built-in function (`step`, `sign`, `distance`; hence `StreamField`'s `stepSize`), and
+  a function or struct named like a body form (`values`, `count`, `sum`). The lists are
+  `external/vulkan_test/dsl/private/names.rkt`.
 - **Capacity**: the splat count is bounded by a required `--max-splats`. ZGAL recreates a buffer,
   losing its contents, when its per-frame size changes, so only scratch buffers (tile entries)
   grow: the tile entries' capacity is a per-frame input the app grows after an overflow

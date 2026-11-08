@@ -100,6 +100,9 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   the generated `<name>.zgal.h` (namespace `<name>`), and the file's shaders are compiled too, so a
   compute material there that calls the functions has glslc check them
   (`tests/cpp/splat_math_test.zgal`).
+  The generated C++ is compiled like any C++, so clang may contract `a + b · c` into an FMA (one
+  rounding instead of two): a test comparing it bit for bit with its own float32 arithmetic accepts
+  either result (`low + stepSize · q` in `splat_stream_test.cpp`).
   Seeded random test data comes from `tests/cpp/test_random.h` (`TestRandom`), not the `<random>`
   distributions: `std::mt19937`'s words are standard, but `uniform_real_distribution`,
   `normal_distribution` and `uniform_int_distribution` aren't, and libstdc++ (CI's Linux) and
