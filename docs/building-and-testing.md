@@ -151,10 +151,17 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
     them (`cpu-tests`); every other shard would repeat them.
   - `web`: `make web`, then `test-web` (Node with Dawn on lavapipe), which builds the native
     library first (splat_train's check reads PLYs through it).
+  - `pages`: `make web`, then `test-pages` (headless Chromium on SwiftShader). Only this shard
+    (`chromium`) installs Chromium's headless shell, with the steps of vulkan_test's `web.yml`:
+    Playwright's (`PLAYWRIGHT_VERSION`, cached), after lifting Ubuntu 24.04's AppArmor ban on the
+    unprivileged user namespaces its sandbox needs, and checked to be exactly one shell, which
+    `CHROMIUM` then names. Its page tests take well under a minute (splat_render's page: about
+    9 s on an M4), so the job is mostly setup, the web build and the install.
   Each test step runs even if an earlier one failed, and the program tests with `make -k`, so one
-  failing program doesn't stop the others. On failure or cancellation a job uploads `build/test`
-  and `build/test-web` (each program's logs, as `test-outputs-<sha>-<suite>`); the program tests'
-  step has a 20-min timeout of its own, so it fails before the job's 30 and the upload still runs.
+  failing program doesn't stop the others. On failure or cancellation a job uploads `build/test`,
+  `build/test-web` and `build/test-pages` (each program's logs, as `test-outputs-<sha>-<suite>`);
+  the program tests' step has a 20-min timeout of its own, so it fails before the job's 30 and
+  the upload still runs.
   `ci.yml` posts a commit's status from all its jobs: success only if every suite succeeded.
 - Why shards: in one job the program tests ran one after the other and took 17.7 min of a
   24.2-min job (run 41460382408), and D-SSIM adds per-step cost to every training test. Running
@@ -163,10 +170,10 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
   every vCPU of the 4-vCPU runner, so the two tests contend. Separate jobs run on separate
   runners: the suite's program tests are expected to take about 6 to 8 min (native) and 8 to 11
   min (web) against the 20-min step timeout, which is what the timeouts are sized from. A stack
-  of N commits is 2N jobs, against GitHub's 20 concurrent. A program's tests must not share files
-  with another program's or with the other build's (each writes only to its output directory,
-  `build/test/<name>` or `build/test-web/<name>`). Watch the slowest job's time when adding a
-  test.
+  of N commits is 3N jobs, against GitHub's 20 concurrent. A program's tests must not share files
+  with another program's or with the other suites' (each writes only to its output directory,
+  `build/test/<name>`, `build/test-web/<name>` or `build/test-pages/<name>`). Watch the slowest
+  job's time when adding a test.
 - Permissions: the jobs that run code (the repository's, the wrapper's or third-party actions)
   have a read-only `contents: read` token and check out without persisting credentials; only
   `pending` and `statuses`, which check nothing out, can write commit statuses.

@@ -1,7 +1,7 @@
 # Builds each commit's programs, native and for the web, and runs every test: the data tools'
 # (pytest, with numpy, scipy and Pillow), the C++ tests and the programs' headless tests natively on
-# lavapipe with validation (including synchronization validation), and the programs' web tests
-# under Node with Dawn (on lavapipe).
+# lavapipe with validation (including synchronization validation), the programs' web tests
+# under Node with Dawn (on lavapipe), and the programs' pages in headless Chromium (on SwiftShader).
 # Each commit is sharded: one job per (commit, suite), the suites listed in the matrix below. Each
 # job runs with a read-only token; ci.yml's pending and statuses jobs post the commit's "test"
 # status from its jobs' conclusions (named "test <sha> <suite>"), success only if every suite's
@@ -26,6 +26,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # The Playwright release whose Chromium headless shell runs the pages (vulkan_test's web.yml's)
+  PLAYWRIGHT_VERSION: 1.63.0
+
 defaults:
   run:
     shell: bash
@@ -39,6 +43,8 @@ jobs:
     # the CPU tests (run 41460382408: a 24.2-min job of which 17.7 were program tests). The step
     # timeout below leaves about 2x the web suite; the job's covers it plus that setup, with the
     # step failing first so the upload of the outputs still runs. Runner times vary by +-25%.
+    # The pages suite is far shorter: its one page takes about 9 s on an M4 (SwiftShader), so
+    # expect well under a minute of page tests plus the web build and Chromium's install.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -49,16 +55,24 @@ jobs:
         # A shard is one entry: add one (and nothing else) for a new suite. build: the make
         # targets that build what the suite runs; tests: its make targets; cpu-tests: whether the
         # shard also runs the data tools' and the C++ tests (they need no program, so one shard
-        # runs them once per commit instead of every shard repeating them).
+        # runs them once per commit instead of every shard repeating them); chromium: whether
+        # it installs Chromium's headless shell (for the page tests).
         suite:
           - name: native
             build: all
             tests: test-programs
             cpu-tests: true
+            chromium: false
           - name: web
             build: web
             tests: test-web
             cpu-tests: false
+            chromium: false
+          - name: pages
+            build: web
+            tests: test-pages
+            cpu-tests: false
+            chromium: true
     steps:
       - uses: actions/checkout@v7
         with:
@@ -92,6 +106,27 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends python3-pytest python3-numpy python3-scipy python3-pil
           python3 -c 'import numpy, scipy, pytest, PIL; print("numpy", numpy.__version__, "scipy", scipy.__version__, "pytest", pytest.__version__, "Pillow", PIL.__version__)'
 
+      # From vulkan_test's web.yml. Ubuntu 24.04's AppArmor forbids the unprivileged user namespaces
+      # Chromium's sandbox needs. CHROMIUM names the shell, so the pages fail if it's missing.
+      - name: Cache Playwright's browsers
+        if: ${{ matrix.suite.chromium }}
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ env.PLAYWRIGHT_VERSION }}-chromium-headless-shell-${{ runner.os }}
+
+      - name: Install Chromium's headless shell
+        if: ${{ matrix.suite.chromium }}
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          npx --yes "playwright@$PLAYWRIGHT_VERSION" install --with-deps chromium-headless-shell
+          shells=(~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell)
+          if [ ${#shells[@]} -ne 1 ] || [ ! -x "${shells[0]}" ]; then
+            echo "::error::Expected one Chromium headless shell, found: ${shells[*]}"
+            exit 1
+          fi
+          echo "CHROMIUM=${shells[0]}" >> "$GITHUB_ENV"
+
       - name: Build
         id: build
         env:
@@ -111,9 +146,10 @@ jobs:
         if: ${{ !cancelled() && matrix.suite.cpu-tests && steps.build.outcome == 'success' }}
         run: make -j"$(nproc)" test-cpp
 
-      # The suite's program tests: native on lavapipe with validation, or web under Node with
-      # Dawn on lavapipe. Each program's logs are files under build/test or build/test-web; the
-      # step's own timeout fails it before the job's, so they are still uploaded.
+      # The suite's program tests: native on lavapipe with validation, web under Node with Dawn on
+      # lavapipe, or pages in headless Chromium on SwiftShader. Each program's logs are files under
+      # build/test, build/test-web or build/test-pages; the step's own timeout fails it before the
+      # job's, so they are still uploaded.
       - name: Program tests (${{ matrix.suite.name }})
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 20
@@ -133,6 +169,7 @@ jobs:
           path: |
             build/test
             build/test-web
+            build/test-pages
           if-no-files-found: ignore
 
       - name: ccache statistics
