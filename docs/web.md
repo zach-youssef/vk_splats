@@ -71,7 +71,7 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   re-renders too, at the same thresholds: perturb within 0.5 dB of the native builds' PSNR (the
   web's parity check: [Training on the web](#training-on-the-web)), sparse at 28 dB, and last (one
   densification, the last iteration neither densifying nor resetting) at 22 dB, a bar taken from
-  MoltenVK's 26.7 that the first web run will confirm. Its
+  MoltenVK's 26.7. Its
   `.inputs.ts` writes the PLY with Node's `fs`, so the web build's export works only under Node.
 - **render_test**: every run of the native test (S1 with the oracle, the off-centre variant, S2
   twice with the hashes compared, S3). Its checks are C++ (`render_check.h` with

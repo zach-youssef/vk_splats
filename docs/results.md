@@ -68,8 +68,8 @@ scored.
 
 - **`--max-splats 400000`**: the reference grows without a bound. These runs were planned when the
   training render's tile entries were capped at 3·2²⁰ = 3,145,728 per frame, because their
-  gradients must fit in one 128 MiB binding. Training now runs its backward pass in chunks of at
-  most that many entries, up to 2²⁵ entries a frame (`--max-entries`;
+  gradients had to fit in one 128 MiB binding. Training now runs its backward pass in chunks of
+  at most that many entries, up to 2²⁵ entries a frame (`--max-entries`;
   [architecture.md](architecture.md), "Capacity"), but the 30k run kept the 7k runs' cap so the
   two compare.
   - At the default `--max-splats` (559,240), the run failed around iteration 3000, at 463k

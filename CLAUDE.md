@@ -1,7 +1,7 @@
 # vulkan_splatting
 
 3D Gaussian splatting (Kerbl et al., SIGGRAPH 2023) written in ZGAL, the language of the Vulkan
-wrapper in `external/vulkan_test` (git submodule), for native Vulkan and WebGPU. It is being
+wrapper in `external/vulkan_test` (git submodule), for native Vulkan and WebGPU. It was
 rewritten from scratch; the pre-ZGAL code is in git history before this rewrite.
 
 Read the docs for the area you touch:

@@ -2,8 +2,6 @@
 
 ## Layout
 
-The planned layout, filled in as the M1 and M2 tasks land.
-
 - `programs/<name>/`: one ZGAL program each (`<name>.zgal` with a `main`, plus its own `.cpp` and
   `.ts` files, `assets/` and optional `test.sh` / `test-web.sh`). The Makefile finds them; adding
   one needs no Makefile change ([building-and-testing.md](building-and-testing.md)).
@@ -41,8 +39,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
   programs' inputs, the synthetic scene generator (which also renders a scene's ground truth with
   splat_render), and `scene_args.py`, which prints splat_render's arguments for a scene and a
   camera, or splat_train's (`--train`) for a scene with images.
-- `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`), Python tests and test
-  data.
+- `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`). The Python tests are in
+  `tools/tests/`.
 - `colmap/`: the one real scene: `colmap_exports3`, a COLMAP text export (one SIMPLE_RADIAL
   camera, 46 images, sparse points; CRLF line endings), and its images, `cs5330_dense_resized`
   (748×748 JPEGs, named as in `images.txt`), committed directly (6.2 MB, no LFS).
@@ -50,10 +48,8 @@ The planned layout, filled in as the M1 and M2 tasks land.
 
 ## Pipeline
 
-The planned pipeline (M1 renders, M2 trains). Steps 1 to 5 are `lib/render_graph.zgal`
-([below](#render-graph)), and steps 6 to 9 are `lib/train_graph.zgal` ([below](#train-graph)),
-with step 9's math in `lib/splat_backward.zgal`.
-The rest of training is to come.
+Steps 1 to 5 are `lib/render_graph.zgal` ([below](#render-graph)), and steps 6 to 9 are
+`lib/train_graph.zgal` ([below](#train-graph)), with step 9's math in `lib/splat_backward.zgal`.
 
 Data is converted offline: the programs read std430 `buffer-file` data and a `manifest.json`, the
 same on native and the web, so no image or COLMAP parsing library is linked. The training images
@@ -74,7 +70,7 @@ Per frame, rendering follows the paper's tile-based rasterizer:
    batches, writing the colour, the final transmittance and the last contributor (kept for the
    backward pass), and an RGBA8 image.
 
-Training's backward pass so far:
+Training's backward pass:
 
 6. **Loss**: each pixel's loss against the camera's target image and its gradient with respect to
    the pixel's colour, summed.
