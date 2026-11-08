@@ -297,6 +297,42 @@ bounded by its stride before its end is computed, so with the stride caps no off
 a checked header overflows a uint, and the largest stream (131,981,072 B) fits one 128 MiB
 binding.
 
+### Decode
+
+Three kernels in `lib/splat_stream.zgal` decode a stream into the f32 `Splat` working buffer as its
+records arrive, each record once, so `projectSplat` reads what it always reads. The graph binds the
+stream as a buffer of its words (`uint`s) and gives PlanDecode `arrived`, the bytes in that buffer
+so far (a multiple of 4, at most the buffer's), and `capacity`, the working buffer's splats. All
+four of their buffers are `#:frames shared`, since the decode is incremental:
+
+- `splats`: the working buffer, at least `splatCount` elements, zeroed at creation, so a splat whose
+  SH record hasn't arrived evaluates as degree 0 and the SH above the stream's degree stay 0;
+- `header`: one `StreamHeader`, PlanDecode's copy of the stream's once `arrived` covers it (whether
+  or not it passes), which the decode kernels read and an app can read back (its camera);
+- `counts`: `uint`s, `decodeCountsSize` (7) at least, zeroed: the records decoded
+  (`decodeBaseDecoded`, `decodeShDecoded`: splats [0, n) have them), this frame's ranges
+  (from `decodeBaseFrom`, `decodeShFrom`), this frame's `arrived` (`decodeArrived`),
+  `decodeHeaderState` (0 until the header is in, then 1) and `decodeHeaderCode`;
+- `commands`: two `DispatchCommand`s (`(import indirect)`), DecodeBase's and DecodeSh's.
+
+Each frame:
+
+1. **PlanDecode** (one invocation) writes `arrived` and zero-workgroup commands. Once `arrived` ≥ 432
+   it reads the header from the stream's words, copies it to `header` (the first time), and writes
+   `checkStreamHeader`'s code, or `streamOverCapacity` (11) for a header that passes with
+   `splatCount` above `capacity`. Only a code of 0 decodes: the records now complete are
+   `completeRecords(arrived, offset, stride, splatCount)` for the base and the SH records (whole
+   records only; all of them for the SH's stride 0 at degree 0, which hold nothing), never fewer
+   than before, and the commands cover the new ones, 64 a workgroup (`decodeGroups`; at most 8,739).
+2. **DecodeBase**, dispatched indirectly over the new base records, decodes each component with
+   `decodeComponent` from the stream's word holding it, the descriptors from `header` (so a precision
+   change needs no rebuild), writing position, logScale, rotation, opacity and `sh[0..2]` field by
+   field, leaving `sh[3..]`.
+3. **DecodeSh** likewise writes the new SH records' `sh[3..]` (none at degree 0).
+
+The kernels take the stream's size on trust: whatever supplies `arrived` (an app, or the
+streaming buffer later) keeps it within the buffer.
+
 ### Encoder
 
 `encodeStream(splats, config, out, report)` takes an `EncodeConfig`: `shDegree` and, per group,

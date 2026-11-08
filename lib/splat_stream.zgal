@@ -4,8 +4,10 @@
 ;; opacity, DC, SH) has its own encoding, given in the header, so changing the precision needs no
 ;; rebuild. The encoder is C++ (lib/native/stream_encoder.h); the decode and the header check are
 ;; here, so the shaders, the C++ encoder's error report and the TypeScript (web) openers all run the
-;; same code. Every function here is pure, so ZGAL compiles it to GLSL, C++ and TypeScript.
+;; same code. Every function here is pure, so ZGAL compiles it to GLSL, C++ and TypeScript; the
+;; decode kernels (PlanDecode, DecodeBase, DecodeSh, at the end) run them on the GPU.
 (import "splat_math.zgal")
+(import indirect)  ; DispatchCommand: the decode kernels' indirect dispatches
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Structs
@@ -211,3 +213,171 @@
 (define (decodeComponent [f : StreamField] [c : uint] [word : uint] [byteOffset : uint]) : float
   (let* ([r (if (= f.sharedRange (uint 1)) (uint 0) c)])
     (decodeBits (componentBits word byteOffset f.encoding) f.encoding (at f.low r) (at f.stepSize r))))
+
+;; ---------------------------------------------------------------------------------------------
+;; Decoding on the GPU
+;; ---------------------------------------------------------------------------------------------
+;; Three kernels decode a stream (a buffer of its words, `stream`) into the f32 Splat working
+;; buffer as its records arrive, each record once: PlanDecode, one invocation, reads the header
+;; from the stream's words, checks it, and from `arrived` (the bytes in the buffer so far, a multiple
+;; of 4, at most the buffer's) works out which records are newly complete; DecodeBase and DecodeSh,
+;; dispatched indirectly with the workgroups PlanDecode wrote, decode them. The descriptors come
+;; from the header at run time, so a precision change needs no rebuild.
+;;
+;; The graph declares, all #:frames shared (decode is incremental, so they must outlive a frame):
+;;   - `splats`, the working buffer (Splat), at least splatCount elements, starting zeroed: a splat
+;;     whose SH hasn't arrived evaluates as degree 0, and the SH above the stream's degree stay 0;
+;;   - `header`, one StreamHeader: PlanDecode's copy of the stream's, once arrived covers it
+;;     (whether or not it passes the check), for the decode kernels and the app (its camera);
+;;   - `counts`, uints, decodeCountsSize at least (a graph may keep its own after them), starting
+;;     zeroed: the decoded records and the header's state, element by element as below;
+;;   - `commands`, two DispatchCommands: DecodeBase's (decodeBaseCommand) and DecodeSh's.
+;; A header that fails checkStreamHeader, or whose splatCount is above `capacity` (the working
+;; buffer's elements), decodes nothing.
+
+;; `counts`, element by element
+(define decodeBaseDecoded (uint 0))  ; base records decoded: splats [0, this) have their base
+(define decodeShDecoded (uint 1))    ; SH records decoded: splats [0, this) have their SH
+(define decodeBaseFrom (uint 2))     ; this frame's base records: [decodeBaseFrom, decodeBaseDecoded)
+(define decodeShFrom (uint 3))       ; this frame's SH records: [decodeShFrom, decodeShDecoded)
+(define decodeArrived (uint 4))      ; this frame's `arrived`
+(define decodeHeaderState (uint 5))  ; 0 until arrived covers the header, then 1
+(define decodeHeaderCode (uint 6))   ; once it has: checkStreamHeader's code, or streamOverCapacity
+(define decodeCountsSize (uint 7))   ; the elements decoding uses (graphs say 7: they can't use this)
+
+;; `commands`, element by element
+(define decodeBaseCommand (uint 0))
+(define decodeShCommand (uint 1))
+
+;; PlanDecode's code for a header that passes checkStreamHeader but holds more splats than the
+;; working buffer (after checkStreamHeader's codes, which never return it)
+(define streamOverCapacity (uint 11))
+
+;; DecodeBase's and DecodeSh's workgroup size (their `workgroup` clauses say 64 too)
+(define decodeGroupSize (uint 64))
+
+;; The stream's header, by words: the camera's first word and the first field's, 12 words a field
+(define streamCameraWord (uint 8))
+(define streamFieldsWord (uint 36))
+(define streamFieldWords (uint 12))
+
+;; The records of `stride` bytes from byte `offset` that `arrived` bytes hold whole, at most count
+;; (all of them for stride 0: the SH records at degree 0, which hold nothing)
+(define (completeRecords [arrived : uint] [offset : uint] [stride : uint] [count : uint]) : uint
+  (cond [(< arrived offset) (uint 0)]
+        [(= stride (uint 0)) count]
+        [else (min count (/ (- arrived offset) stride))]))
+
+;; The workgroups of decodeGroupSize covering `records` (at most streamMaxSplats, 8739 workgroups,
+;; within every device's dispatch limit)
+(define (decodeGroups [records : uint]) : uint
+  (/ (+ records (- decodeGroupSize (uint 1))) decodeGroupSize))
+
+;; The header, its check, the newly complete records and the decode's dispatches: one invocation
+(compute-material PlanDecode
+  (workgroup 1)
+  (bindings
+   (stream (buffer-array uint read))
+   (header (buffer-array StreamHeader write))
+   (counts (buffer-array uint read-write))
+   (commands (buffer-array DispatchCommand write)))
+  (push (arrived uint) (capacity uint))
+  (define (wordAt [k : uint]) : uint (at stream k))
+  (define (floatAt [k : uint]) : float (uintBitsToFloat (at stream k)))
+  (define (vec4At [k : uint]) : vec4
+    (vec4 (floatAt k) (floatAt (+ k (uint 1))) (floatAt (+ k (uint 2))) (floatAt (+ k (uint 3)))))
+  (define (fieldAt [g : uint]) : StreamField
+    (let* ([k (+ streamFieldsWord (* streamFieldWords g))])
+      (StreamField (wordAt k) (wordAt (+ k (uint 1))) (wordAt (+ k (uint 2))) (wordAt (+ k (uint 3)))
+                   (vec4At (+ k (uint 4))) (vec4At (+ k (uint 8))))))
+  (define (cameraAt [k : uint]) : Camera
+    (Camera (mat4 (vec4At k) (vec4At (+ k (uint 4))) (vec4At (+ k (uint 8))) (vec4At (+ k (uint 12))))
+            (vec4At (+ k (uint 16)))
+            (vec3 (floatAt (+ k (uint 20))) (floatAt (+ k (uint 21))) (floatAt (+ k (uint 22))))
+            (wordAt (+ k (uint 23)))
+            (uvec2 (wordAt (+ k (uint 24))) (wordAt (+ k (uint 25))))
+            (wordAt (+ k (uint 26)))
+            (wordAt (+ k (uint 27)))))
+  (compute
+   (let* ([baseFrom (at counts decodeBaseDecoded)]
+          [shFrom (at counts decodeShDecoded)])
+     ;; Nothing to decode until the header is in, and past it unless it passes
+     (write! (at counts decodeArrived) arrived)
+     (write! (at counts decodeBaseFrom) baseFrom)
+     (write! (at counts decodeShFrom) shFrom)
+     (write! (at commands decodeBaseCommand) (DispatchCommand 0 1 1))
+     (write! (at commands decodeShCommand) (DispatchCommand 0 1 1))
+     (when (>= arrived streamHeaderSize)
+       (let* ([h (StreamHeader (wordAt 0) (wordAt 1) (wordAt 2) (wordAt 3) (wordAt 4) (wordAt 5)
+                               (wordAt 6) (wordAt 7) (cameraAt streamCameraWord)
+                               (array StreamField (fieldAt 0) (fieldAt 1) (fieldAt 2) (fieldAt 3)
+                                      (fieldAt 4) (fieldAt 5)))]
+              [checked (checkStreamHeader h)]
+              [code (if (and (= checked streamOk) (> h.splatCount capacity)) streamOverCapacity checked)])
+         ;; Copied out once: the same bytes every later frame
+         (when (= (at counts decodeHeaderState) (uint 0))
+           (write! (at header 0) h))
+         (write! (at counts decodeHeaderState) (uint 1))
+         (write! (at counts decodeHeaderCode) code)
+         (when (= code streamOk)
+           ;; Monotonic, so a record is decoded once even if `arrived` were to fall back
+           (let* ([baseTo (max baseFrom (completeRecords arrived h.baseOffset h.baseStride h.splatCount))]
+                  [shTo (max shFrom (completeRecords arrived h.shOffset h.shStride h.splatCount))])
+             (write! (at counts decodeBaseDecoded) baseTo)
+             (write! (at counts decodeShDecoded) shTo)
+             (write! (at commands decodeBaseCommand) (DispatchCommand (decodeGroups (- baseTo baseFrom)) 1 1))
+             ;; At degree 0 the SH records hold nothing: only the count moves
+             (when (> h.shDegree (uint 0))
+               (write! (at commands decodeShCommand)
+                       (DispatchCommand (decodeGroups (- shTo shFrom)) 1 1))))))))))
+
+;; The base records [decodeBaseFrom, decodeBaseDecoded): position, logScale, rotation, opacity and
+;; the DC terms (sh[0..2]), leaving the SH (sh[3..]) as they are
+(compute-material DecodeBase
+  (workgroup 64)
+  (bindings
+   (stream (buffer-array uint read))
+   (header (buffer-array StreamHeader read))
+   (counts (buffer-array uint read))
+   (splats (buffer-array Splat write)))
+  ;; Field f's component c of the record at byte `record`
+  (define (component [f : StreamField] [c : uint] [record : uint]) : float
+    (let* ([byteOffset (+ record (componentOffset f c))])
+      (decodeComponent f c (at stream (shr byteOffset (uint 2))) byteOffset)))
+  (define (vec3Of [f : StreamField] [record : uint]) : vec3
+    (vec3 (component f (uint 0) record) (component f (uint 1) record) (component f (uint 2) record)))
+  (compute
+   (let* ([h (at header 0)]
+          [rotation (at h.fields groupRotation)]
+          [dc (at h.fields groupDc)])
+     (for ([i (range (+ (at counts decodeBaseFrom) globalInvocationId.x) (at counts decodeBaseDecoded)
+                     (* decodeGroupSize workgroupCount.x))])
+       (let* ([r (+ h.baseOffset (* i h.baseStride))])
+         (write! (.position (at splats i)) (vec3Of (at h.fields groupPosition) r))
+         (write! (.logScale (at splats i)) (vec3Of (at h.fields groupScale) r))
+         (write! (.rotation (at splats i))
+                 (vec4 (component rotation (uint 0) r) (component rotation (uint 1) r)
+                       (component rotation (uint 2) r) (component rotation (uint 3) r)))
+         (write! (.opacity (at splats i)) (component (at h.fields groupOpacity) (uint 0) r))
+         (for ([c (range (uint 0) (uint 3))])
+           (write! (at (.sh (at splats i)) c) (component dc c r))))))))
+
+;; The SH records [decodeShFrom, decodeShDecoded): sh[3..] (bands 1 to shDegree; the rest stay 0)
+(compute-material DecodeSh
+  (workgroup 64)
+  (bindings
+   (stream (buffer-array uint read))
+   (header (buffer-array StreamHeader read))
+   (counts (buffer-array uint read))
+   (splats (buffer-array Splat write)))
+  (define (component [f : StreamField] [c : uint] [record : uint]) : float
+    (let* ([byteOffset (+ record (componentOffset f c))])
+      (decodeComponent f c (at stream (shr byteOffset (uint 2))) byteOffset)))
+  (compute
+   (let* ([h (at header 0)]
+          [f (at h.fields groupSh)])
+     (for ([i (range (+ (at counts decodeShFrom) globalInvocationId.x) (at counts decodeShDecoded)
+                     (* decodeGroupSize workgroupCount.x))])
+       (let* ([r (+ h.shOffset (* i h.shStride))])
+         (for ([k (range (uint 0) f.components)])
+           (write! (at (.sh (at splats i)) (+ k (uint 3))) (component f k r))))))))

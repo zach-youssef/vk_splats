@@ -399,6 +399,30 @@ TEST_CASE("componentBits takes a component from its word") {
     CHECK(ss::decodeComponent(f, 2, 0x00040000u, 2) == 33.0f);
 }
 
+TEST_CASE("completeRecords counts the whole records arrived, and decodeGroups covers them") {
+    // 432-byte header, then records of 36 bytes
+    CHECK(ss::completeRecords(0, 432, 36, 10) == 0);
+    CHECK(ss::completeRecords(431, 432, 36, 10) == 0);
+    CHECK(ss::completeRecords(432, 432, 36, 10) == 0);
+    CHECK(ss::completeRecords(432 + 35, 432, 36, 10) == 0);
+    CHECK(ss::completeRecords(432 + 36, 432, 36, 10) == 1);
+    CHECK(ss::completeRecords(432 + 36 * 7 + 20, 432, 36, 10) == 7);
+    CHECK(ss::completeRecords(432 + 36 * 10, 432, 36, 10) == 10);
+    CHECK(ss::completeRecords(1000000, 432, 36, 10) == 10);  // the SH records' bytes count for nothing
+    // Stride 0 (the SH records at degree 0): all of them once arrived reaches their offset
+    CHECK(ss::completeRecords(791, 792, 0, 10) == 0);
+    CHECK(ss::completeRecords(792, 792, 0, 10) == 10);
+    // The largest stream: no overflow
+    const uint32_t end = ss::streamHeaderSize + ss::streamMaxSplats * ss::maxBaseStride;
+    CHECK(ss::completeRecords(end, ss::streamHeaderSize, ss::maxBaseStride, ss::streamMaxSplats) == ss::streamMaxSplats);
+    CHECK(ss::decodeGroups(0) == 0);
+    CHECK(ss::decodeGroups(1) == 1);
+    CHECK(ss::decodeGroups(64) == 1);
+    CHECK(ss::decodeGroups(65) == 2);
+    CHECK(ss::decodeGroups(ss::streamMaxSplats) == 8739);
+    CHECK(ss::decodeGroupSize == 64);
+}
+
 TEST_CASE("every encoding round-trips at every SH degree") {
     const std::vector<ss::Splat> splats = randomSplats(1, 97);
     for (uint32_t d = 0; d <= 3; ++d) {
