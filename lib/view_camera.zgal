@@ -1,0 +1,108 @@
+;; The viewer's camera controls (docs/architecture.md, "View camera"): a pose relative to a start
+;; Camera (from a cameras file or the stream header's default), moved by keys, turned by mouse deltas,
+;; and fitted to the window's size. Every function is pure, so ZGAL compiles it to GLSL, C++ and
+;; TypeScript, and the native and web apps run the same code.
+;;
+;; Axes are COLMAP's (docs/architecture.md, "Conventions"): a camera looks down its +z with +y down
+;; in the image, so up is the start camera's -y. Yaw turns about that up, in world space, and pitch
+;; about the turned camera's x axis, so the camera never rolls: its x axis stays perpendicular to the
+;; start's up however it's turned.
+(import "splat_math.zgal")
+
+;; ---------------------------------------------------------------------------------------------
+;; Structs
+;; ---------------------------------------------------------------------------------------------
+;; Where the viewer is, relative to its start camera. The untouched pose (viewPose) is all zeros, and
+;; fitCamera gives the start camera exactly for it.
+(struct ViewPose
+  (offset vec3)            ; the camera centre minus the start's, in world space
+  (yaw float)              ; radians in about [-pi, pi] (wrapped in float), turning right (+x) about the start's up
+  (pitch float))           ; radians in [-viewPitchLimit, viewPitchLimit], looking up (-y)
+
+;; ---------------------------------------------------------------------------------------------
+;; Constants
+;; ---------------------------------------------------------------------------------------------
+;; Pitch stops short of straight up or down, where yaw and the view direction would degenerate
+(define viewPitchLimit (radians 89.0))
+(define viewPi 3.14159265358979323846)
+(define viewTwoPi 6.28318530717958647692)
+
+;; ---------------------------------------------------------------------------------------------
+;; Functions
+;; ---------------------------------------------------------------------------------------------
+;; The untouched pose: the start camera itself
+(define (viewPose) : ViewPose
+  (ViewPose (vec3 0.0) 0.0 0.0))
+
+;; The pose's turn in the start camera's frame (camera to start camera): the yaw about -y, then the
+;; pitch about x. Column-major, so each vec3 is a column. The identity for yaw = pitch = 0, exactly.
+(define (viewTurn [pose : ViewPose]) : mat3
+  (let* ([cy (cos pose.yaw)]
+         [sy (sin pose.yaw)]
+         [cp (cos pose.pitch)]
+         [sp (sin pose.pitch)]
+         ;; Turning right: +z goes to (sin yaw, 0, cos yaw)
+         [yawTurn (mat3 (vec3 cy 0.0 (- sy)) (vec3 0.0 1.0 0.0) (vec3 sy 0.0 cy))]
+         ;; Looking up: +z goes to (0, -sin pitch, cos pitch)
+         [pitchTurn (mat3 (vec3 1.0 0.0 0.0) (vec3 0.0 cp sp) (vec3 0.0 (- sp) cp))])
+    (* yawTurn pitchTurn)))
+
+;; The pose's rotation, world to camera: the start's, followed by the inverse turn
+(define (viewRotation [pose : ViewPose] [start : Camera]) : mat3
+  (* (transpose (viewTurn pose)) (mat3 start.worldToCamera)))
+
+;; Turns the pose by a mouse delta in pixels (x right, y down, as cursors report it): right turns
+;; right, down looks down. radiansPerPixel is the caller's sensitivity. The yaw wraps to [-pi, pi)
+;; (in float, possibly a few ulps outside it) and the pitch is clamped to the limit, so the pose stays
+;; upright.
+(define (viewLook [pose : ViewPose] [delta : vec2] [radiansPerPixel : float]) : ViewPose
+  (let* ([yaw (+ pose.yaw (* delta.x radiansPerPixel))]
+         [wrapped (- yaw (* viewTwoPi (floor (/ (+ yaw viewPi) viewTwoPi))))]
+         [pitch (clamp (- pose.pitch (* delta.y radiansPerPixel)) (- viewPitchLimit) viewPitchLimit)])
+    (with pose #:yaw wrapped #:pitch pitch)))
+
+;; Moves the pose `span` world units along `keys` (right, up, forward), e.g. (D - A, E - Q,
+;; W - S): right and forward are the camera's current x and z (forward follows the pitch), and up is
+;; the start's up, so Q and E rise and sink level whatever the view. The direction is normalized, so a
+;; diagonal is as fast as one key; keys that cancel (or none) don't move.
+(define (viewMove [pose : ViewPose] [start : Camera] [keys : vec3] [span : float]) : ViewPose
+  (let* ([toWorld (transpose (viewRotation pose start))]
+         [startToWorld (transpose (mat3 start.worldToCamera))]
+         [direction (+ (* keys.x (at toWorld 0))
+                       (* keys.y (- (at startToWorld 1)))
+                       (* keys.z (at toWorld 2)))]
+         [len (length direction)])
+    (if (> len 1e-6)
+        (with pose #:offset (+ pose.offset (* (/ span len) direction)))
+        pose)))
+
+;; The movement speed after `steps` scroll steps (fractional steps from a trackpad are fine), each
+;; scaling baseSpeed by stepFactor. Computed from the step count, not by multiplying the last speed,
+;; so scrolling back to the same count gives the same speed exactly. The caller picks baseSpeed (in
+;; world units per second, e.g. from the scene's size) and stepFactor (above 1).
+(define (viewSpeed [baseSpeed : float] [steps : float] [stepFactor : float]) : float
+  (* baseSpeed (pow stepFactor steps)))
+
+;; The camera to render: the pose applied to the start camera, at `size` pixels. One scale
+;; s = H'/H keeps the start's vertical field of view and square pixels (fx and fy scale alike); the
+;; principal point keeps its offset from the image centre, scaled: cx' = W'/2 + s (cx - W/2), written
+;; as s cx + (W' - s W)/2 so that it's cx exactly when the size matches. With the untouched pose and
+;; the start's size this is the start camera exactly (its other fields are kept). Both sizes must have
+;; a non-zero height: size.y = 0 (a minimized window) gives zero focal lengths, and fitting from such a
+;; camera divides by zero, so skip rendering then.
+(define (fitCamera [pose : ViewPose] [start : Camera] [size : uvec2]) : Camera
+  (let* ([r (viewRotation pose start)]
+         [w0 (mat3 start.worldToCamera)]
+         ;; t = R (start centre + offset) negated, from the start's t: R_turn^T (t0 - R0 offset)
+         [t (* (transpose (viewTurn pose)) (- (.xyz (at start.worldToCamera 3)) (* w0 pose.offset)))]
+         [oldSize (vec2 start.size)]
+         [newSize (vec2 size)]
+         [s (/ newSize.y oldSize.y)]
+         [k start.intrinsics]
+         [cx (+ (* s k.z) (* 0.5 (- newSize.x (* s oldSize.x))))]
+         [cy (+ (* s k.w) (* 0.5 (- newSize.y (* s oldSize.y))))])
+    (with start
+          #:worldToCamera (mat4 (vec4 (at r 0) 0.0) (vec4 (at r 1) 0.0) (vec4 (at r 2) 0.0) (vec4 t 1.0))
+          #:intrinsics (vec4 (* s k.x) (* s k.y) cx cy)
+          #:center (+ start.center pose.offset)
+          #:size size)))

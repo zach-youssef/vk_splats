@@ -37,6 +37,9 @@
     ([below](#train-graph)).
   - `splat_stream.zgal`: the stream format's header, its check and its decode
     ([data-format.md](data-format.md#stream-files)); it imports `splat_math.zgal`.
+  - `view_camera.zgal`: the viewer's camera controls, a pose relative to a start camera turned
+    by mouse deltas, moved by keys and fitted to the window's size ([below](#view-camera)); it
+    imports `splat_math.zgal`.
   - `native/`: header-only C++ that the data tools share with the programs, on top of the C++ ZGAL
     generates for those modules: the stream encoder (`stream_encoder.h`), the default camera it
     writes into the header (`default_camera.h`, [data-format.md](data-format.md#stream-files)) and
@@ -509,6 +512,40 @@ are read too, and `history` and the trained splats when the app enables `readHis
   agree with GPU central differences, Richardson-extrapolated from h and 2h (32 probes, the
   corners first, then `pcgHash`-seeded pixels and channels, so every platform probes the same).
 
+## View camera
+
+`lib/view_camera.zgal` holds the viewer's camera controls as pure functions, so the native and
+web apps (C++ and TypeScript) and the shaders compute the same camera. The viewer's state is a
+`ViewPose` relative to a start `Camera` (from a cameras file, or the stream header's default
+camera): the offset of the camera centre from the start's (world space), a yaw and a pitch, all
+zero for the untouched pose (`viewPose`). Up is the start camera's −y (COLMAP: image y down).
+
+- `viewLook(pose, delta, radiansPerPixel)` turns by a cursor delta in pixels: +x turns right
+  (yaw, about the start's up, in world space), +y looks down (pitch, about the turned camera's
+  x axis). The yaw wraps to [−π, π) (to float rounding: a few ulps outside it can occur) and the pitch is clamped to ±`viewPitchLimit` (89°). Since
+  the view depends on (yaw, pitch) only, the camera never rolls: its x axis stays perpendicular
+  to the start's up after any looks.
+- `viewMove(pose, start, keys, span)` moves `span` world units along `keys` = (right, up,
+  forward), e.g. (D − A, E − Q, W − S): right and forward are the current camera's x and z
+  (forward follows the pitch), up is the start's, so Q and E stay level. The direction is
+  normalized; keys that cancel don't move.
+- `viewSpeed(baseSpeed, steps, stepFactor)` is baseSpeed · stepFactor^steps, computed from the
+  scroll step count, so scrolling back gives the same speed exactly. The caller picks
+  baseSpeed (world units per second) and stepFactor.
+- `fitCamera(pose, start, size)` is the camera to render at `size`: the start's rotation
+  followed by the pose's turn, centred at the start's centre plus the offset, and one scale
+  s = H′/H for the intrinsics: fx′ = s·fx, fy′ = s·fy, cx′ = W′/2 + s·(cx − W/2) and
+  cy′ = H′/2 + s·(cy − H/2) (computed as s·cx + (W′ − s·W)/2, exact for s = 1). That keeps the
+  vertical field of view and square pixels; a wider window sees more horizontally. The
+  translation is built from the start's, R_turnᵀ(t₀ − R₀·offset), not from the centre, so the
+  untouched pose at the start's size gives the start camera exactly (its other fields, such as
+  `imageBatch`, are kept). Both heights must be non-zero (skip rendering a minimized window).
+
+`tests/cpp/view_camera_test.cpp` checks that identity bit for bit (the default camera
+and random ones), the fit's scaling (square pixels, points at W′/2 + s·(u − W/2), the way back),
+the directions of looks and moves, their round trips, the yaw's wrap and the pitch's clamp, that
+the x axis stays level over thousands of random looks, and the speed's exact way back.
+
 ## splat_train
 
 `programs/splat_train` runs `TrainGraph` (with `train`) headless, one Adam iteration a frame, for
@@ -701,6 +738,11 @@ here with their offsets.
   (colour vec3)            ; 32: the SH colour for this camera's view direction
   (tileCount uint)         ; 44: (maxX − minX)(maxY − minY); 0 when culled
   (tiles uvec4))           ; 48: the tile rectangle (minX, minY, maxX, maxY), max exclusive
+
+(struct ViewPose           ; 32 bytes: the viewer's pose relative to its start camera
+  (offset vec3)            ; 0: the camera centre minus the start's, in world space
+  (yaw float)              ; 12: radians in about [−π, π], turning right about the start's up
+  (pitch float))           ; 16: radians, looking up, within ±89°; then 12 bytes of padding
 
 (struct DensifyStat        ; 8 bytes: a splat's densification statistics (train graph)
   (gradientNorm float)     ; 0: the sum of densifyNorm(dL/dmean) over the frames that saw it

@@ -1,0 +1,21 @@
+;; The view camera's functions (lib/view_camera.zgal) for view_camera_test.cpp, which includes the
+;; generated view_camera_test.zgal.h (namespace view_camera_test). The probe material fits a camera to
+;; a moved and turned pose and projects a point through it, so glslc compiles what the test uses.
+(import "../../lib/view_camera.zgal")
+
+(compute-material ViewCameraProbe
+  (workgroup 64)
+  (bindings
+   (cameras (buffer-array Camera))
+   (points (buffer-array vec4))
+   (pixels (buffer-array vec2)))
+  (push (count uint) (speedSteps float))
+  (compute
+   (let* ([i globalInvocationId.x])
+     (when (< i count)
+       (let* ([start (at cameras 0)]
+              [looked (viewLook (viewPose) (vec2 (float i) 1.0) 0.01)]
+              [moved (viewMove looked start (vec3 1.0 0.0 1.0) (viewSpeed 1.0 speedSteps 1.25))]
+              [cam (fitCamera moved start (uvec2 640 480))])
+         (write! (at pixels i)
+                 (projectMean (toCamera cam.worldToCamera (.xyz (at points i))) cam.intrinsics)))))))
