@@ -148,3 +148,20 @@ x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2 rot_0..3
 The reader accepts properties in any order and of any numeric type, SH of degree 0–2 (fewer
 `f_rest`, padded with zeros) and elements after the vertices. It ignores the normals. The writer
 writes degree 3, with zero normals.
+
+## Stream files
+
+A stream is one file of splats that a viewer can draw while it downloads; its header carries a
+default camera. `tests/cpp/default_camera_test.cpp` checks the camera.
+
+### Default camera
+
+`lib/native/default_camera.h` gives a default camera framing a scene, so a viewer opening a scene
+without cameras still sees it. Per axis, the order statistics at
+`floor(p (N − 1))` for p = 0.05 and 0.95 bound a box (robust to a few floaters), with centre c and
+radius r, half its diagonal (1 for a point; an empty scene has c = 0, r = 1). The camera is
+1280×720 with a 60° vertical field of view (fx = fy = 360√3, principal point at the centre),
+looks down world +z with the identity rotation from c − 2.2 r e_z: r / sin 30° puts the box's
+bounding sphere inside the vertical field of view, and the factor 1.1 adds a margin. Everything is
+float32 with literal constants, so the camera is the same on every platform and for any splat
+order.

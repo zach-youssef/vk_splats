@@ -82,7 +82,7 @@ DOCTEST_CFLAGS = -I$(ZGAL_ROOT)/third_party/doctest
 $(foreach t,$(CPP_TEST_ZGAL),$(eval $(call zgal-rule,tests/cpp/$(t).zgal,$(OUT)/tests/gen/$(t),$(OUT)/tests/gen/$(t)/spv)))
 $(foreach t,$(CPP_TEST_ZGAL),$(eval $(OUT)/tests/$(t): $(OUT)/tests/gen/$(t)/$(t).zgal.stamp))
 
-$(OUT)/tests/%: tests/cpp/%.cpp $(wildcard tests/cpp/*.h tests/oracle/*.h)
+$(OUT)/tests/%: tests/cpp/%.cpp $(wildcard tests/cpp/*.h tests/oracle/*.h lib/native/*.h)
 	@mkdir -p $(dir $@)
 	$(CXX) -o $@ $< $(CXXFLAGS) $(ZGAL_CFLAGS) $(DOCTEST_CFLAGS) -Itests \
 		$(if $(wildcard tests/cpp/$*.zgal),-I$(OUT)/tests/gen/$*)

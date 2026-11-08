@@ -35,6 +35,14 @@
   - `ssim.zgal`: the D-SSIM term's forward and backward kernels (a separable 11×11 Gaussian
     window), which add to the Loss kernel's per-pixel losses and gradients
     ([below](#train-graph)).
+  - `native/`: header-only C++ on top of the C++ ZGAL generates for those modules: the default
+    camera framing a scene (`default_camera.h`, [data-format.md](data-format.md#default-camera)).
+    ZGAL puts the generated code in the namespace of the importing `.zgal` file, so an includer
+    aliases it first: `#include "<x>.zgal.h"`, then `namespace splat_native { namespace gen = ::<x>; }`,
+    then the header. Entry points take plain structs and spans and return status codes (no
+    exceptions), so a C ABI can wrap them. Their functions are `inline` in `splat_native`, so a
+    linked binary must alias `gen` to one namespace in every translation unit (otherwise it's an
+    ODR violation).
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
   programs' inputs, the synthetic scene generator (which also renders a scene's ground truth with
   splat_render), and `scene_args.py`, which prints splat_render's arguments for a scene and a

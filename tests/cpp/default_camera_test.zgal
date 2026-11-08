@@ -1,0 +1,18 @@
+;; The splat math's structs and projection for default_camera_test.cpp, which includes the generated
+;; default_camera_test.zgal.h (namespace default_camera_test) and lib/native/default_camera.h on top
+;; of it. The probe material projects a point through a camera, so glslc compiles what the test uses.
+(import "../../lib/splat_math.zgal")
+
+(compute-material DefaultCameraProbe
+  (workgroup 64)
+  (bindings
+   (cameras (buffer-array Camera))
+   (points (buffer-array vec4))
+   (pixels (buffer-array vec2)))
+  (push (count uint))
+  (compute
+   (let* ([i globalInvocationId.x])
+     (when (< i count)
+       (let* ([cam (at cameras 0)])
+         (write! (at pixels i)
+                 (projectMean (toCamera cam.worldToCamera (.xyz (at points i))) cam.intrinsics)))))))
