@@ -96,8 +96,9 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   preset, both at 50 dB and a largest difference of 8/255; the header's camera; a wrong
   `--splat-count`) at the same bars; its checks are in the app, but for the closed-form oracle on
   S1's faint variants, which `build/web-check/view_oracle_check` runs on the `accum` the app writes
-  to `$SPLAT_VIEW_ACCUM` (natively too), so the web build's `saveAccum` needs Node's `fs`. Dawn on
-  Metal gave the same PSNRs as MoltenVK.
+  to `$SPLAT_VIEW_ACCUM` (natively too), so the web build's `saveAccum` needs Node's `fs`, and for
+  the sort's frame count (the native `--timings`; the web has none). Dawn on Metal gave the same
+  PSNRs as MoltenVK.
 
 ## Training on the web
 

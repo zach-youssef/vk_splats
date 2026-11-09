@@ -584,7 +584,8 @@ camera, [above](#view-camera)). For now it loads the stream whole through `buffe
    the key `bitnot(floatSortKey(depth))` (far first) or 0xFFFFFFFF when culled (a visible depth
    is above near > 0, so its key is below 2³¹), and the index. Invocation 0 writes the sort's
    count (`counts[viewProjected]`, 7) and the DrawCommand (6 vertices, an instance a decoded
-   splat), so the draw always covers what was sorted.
+   splat), so the draw always covers what was sorted, and counts the frames Project ran in
+   (`counts[viewProjections]`, 8), which tests compare with the frames the app enabled it in.
 3. The sort of the keys with the indices as values, `#:count (at counts 7)`: culled splats last.
 4. `drawSplats`: an instance a sorted splat (`SplatQuad`), two triangles, the square of its 3σ
    radius around its mean in pixels, collapsed to a point outside the view when culled (its key,
@@ -621,7 +622,7 @@ or `inspect`) and `readAccum` (`inspect`: rgba16f as two uints a pixel, r | g <<
 
 ## splat_view
 
-`programs/splat_view` runs `ViewGraph`: in a window by default (escape quits), or headless with
+`programs/splat_view` runs `ViewGraph`: in a window by default ([controls](#controls)), or headless with
 `--frames N` and `--capture FILE` (the last frame's `rendered`). ZGAL can't read a file's size or
 header, so `tools/scene_args.py --view <scene.stream>` prints the stream and its required
 `--splat-count` (the header's) and `--stream-bytes` (the file's size):
@@ -641,7 +642,49 @@ that the image is `encodeAccum` of `accum` within a unit with some pixel covered
 splat was drawn: the base and SH records decoded, the splats sorted and the DrawCommand's
 instances are all `--splat-count`, with 6 vertices (each readback handled at least
 framesInFlight + 3 frames after the camera arrived). The newest readbacks can be of different
-frames, so it holds for a still camera only.
+frames, so it holds for a still camera only. It also checks that `counts[viewProjections]` (the
+frames the GPU ran Project in) is the app's count, and prints that count; the readbacks must be
+framesInFlight + 3 frames after Project last ran, so the run must end still.
+
+### Controls
+
+W, A, S and D move forward, left, back and right, Q and E sink and rise (`viewMove`), dragging
+with the left button looks around (`viewLook`, at 1/fy radians a pixel of the fitted camera, so
+the scene follows the cursor near the centre), and scrolling changes the speed (`viewSpeed`: each
+step ×1.25, within ±20 steps; up is faster). Keys and drags do nothing until the app has its
+camera. A `Camera` carries no scene scale and the stream header no bounds (positions are f32), so
+the base speed, a quarter of a scene length per second, takes the length from the cameras:
+
+- With `--cameras`, the spread of their centres (the root mean square distance from their mean),
+  the scale the capture was walked at; the program prints it. A forward-facing capture's cameras
+  spread less than its scene, so it moves slowly there.
+- Without them, or when they don't spread (one camera, or coincident centres: a spread under a
+  thousandth of this fallback), the start camera's distance from the world origin (at least
+  0.04). That holds only for a scene around the origin seen from about its size away, as the
+  header's default camera sees one (the origin isn't the scene's middle in general: COLMAP's
+  normalisation centres the cameras, not the scene). For a scene far from the origin or a camera
+  near it, it's off by more than scrolling's ×86 either way may correct. A scene radius in the
+  stream header (the encoder computes one for the default camera) would fix it.
+
+A key press sets its bit in two masks, `held` and `tapped`, and its release clears it from `held`
+only; a frame moves with both, then clears `tapped` (once the app is ready). So a key pressed and
+released between two frames (Chromium's page tests send both at once, and quick taps do too)
+still moves for one frame: a latched press.
+
+Project and the sort run (`#:enabled`, the app's `project`) only in a frame whose camera differs
+from the one they last ran for: the app became ready, or the pose or the surface's size differs
+from the pose and size they last ran for (compared exactly, whatever changed them: a key, a drag
+or the script); the rest of the graph runs every frame, drawing the cached order. So a
+still camera costs the draw and Encode only. A `resize!` applies after the handlers but before the
+frame's camera is computed, so the frame calling it projects for the new size; a window resized
+by the user is seen by the frame handler a frame late, so that one frame draws the old projection
+at the new size.
+
+Test options: `--scripted-moves N` shrinks the surface to three quarters (`resize!`) the frame
+after the app is ready, then moves forward and looks (W and a drag, through the controls' code) in
+the next N frames, then stays still; it fails when the frames run out first. `--project-every-frame` runs Project and the
+sort in every frame (a fresh render of each frame's camera), and `--frames-in-flight N` sets the
+frames in flight from the first frame.
 
 Its `test.sh` encodes splat_render's committed S3 scene with the full and web presets and, for
 each, renders cameras 0 and 24 at their sizes with `--inspect`, held to 50 dB and a largest
@@ -652,7 +695,14 @@ which the largest difference catches (mutants: a DrawCommand one instance short 
 counts, Project skipping the last splat fails at 34-36/255). Each comparison prints its PSNR and
 largest difference. It renders the header's camera without
 `--cameras` and from a one-camera file of the header's bytes 32 to 144, which must capture the
-same PNG, and a wrong `--splat-count` must be refused.
+same PNG, and a wrong `--splat-count` must be refused. Every still run above must have run Project
+in one frame. Then, at 2 and 3 frames in flight, `--scripted-moves 6` must run Project in exactly
+8 frames (ready, the shrink and the 6 moves) and capture, still after the last move, the same PNG
+byte for byte as the same script with `--project-every-frame`: the cached projection is a fresh
+one. (Mutants: dropping the pose or the size from the change check fails the count and the
+comparison.) Natively, the same script with `--timings` must have run Project and the sort in the
+same 8 frames (the table's frame counts): sorting sorted keys changes no image or count, so only
+this catches a sort running every frame. The web has no `--timings`.
 
 Then the closed-form oracle (`tests/oracle/closed_form.h`), the viewer's S1 check: S1's `faint`
 (one anisotropic splat off the axis, three cameras rotated about z) and `faint-overlap` (three

@@ -29,10 +29,12 @@
 ;; ---------------------------------------------------------------------------------------------
 ;; Constants
 ;; ---------------------------------------------------------------------------------------------
-;; `counts`' element past the decode's (decodeCountsSize): the splats Project keyed, the sort's
-;; count and the draw's instances
+;; `counts`' elements past the decode's (decodeCountsSize): the splats Project keyed, the sort's
+;; count and the draw's instances; and how many times Project has run (an app disables it on a still
+;; camera, which tests check with this)
 (define viewProjected (uint 7))
-(define viewCountsSize (uint 8))  ; the elements (the graph says 8: it can't use this)
+(define viewProjections (uint 8))
+(define viewCountsSize (uint 9))  ; the elements (the graph says 9: it can't use this)
 
 ;; A culled splat's key: above every visible one's, so the sort puts it last
 (define culledKey (uint #xFFFFFFFF))
@@ -54,10 +56,10 @@
 ;; ---------------------------------------------------------------------------------------------
 ;; 1. Each decoded splat ([0, counts[decodeBaseDecoded])) as the camera sees it, its key and its
 ;; index; invocation 0 also writes the sorted count and the DrawCommand (6 vertices, an instance a
-;; splat), so the draw always covers what the sort sorted. Dispatched over the working buffer's
-;; capacity (at most streamMaxSplats: 8739 workgroups, within every device's limit); the invocations
-;; past the decoded splats do nothing. shDegree is the stream header's (the app gives it, which
-;; keeps the bindings at 7 of WebGPU's 8).
+;; splat), so the draw always covers what the sort sorted, and counts the run (viewProjections).
+;; Dispatched over the working buffer's capacity (at most streamMaxSplats: 8739 workgroups, within
+;; every device's limit); the invocations past the decoded splats do nothing. shDegree is the stream
+;; header's (the app gives it, which keeps the bindings at 7 of WebGPU's 8).
 (compute-material Project
   (workgroup 64)
   (bindings
@@ -74,6 +76,7 @@
           [i globalInvocationId.x])
      (when (= i (uint 0))
        (write! (at counts viewProjected) decoded)
+       (write! (at counts viewProjections) (+ (at counts viewProjections) (uint 1)))
        (write! (at draws 0) (DrawCommand 6 decoded 0 0)))
      (when (< i decoded)
        (let* ([p (projectSplat (at splats i) camera near shDegree)])
@@ -162,7 +165,8 @@
   ;; The decode's (lib/splat_stream.zgal), then Project's and the sort's
   (buffer splats Splat splatCount #:frames shared)
   (buffer header StreamHeader 1 #:frames shared)
-  (buffer counts uint 8 #:frames shared)  ; decodeCountsSize, then viewProjected: viewCountsSize
+  ;; decodeCountsSize, viewProjected and viewProjections: viewCountsSize
+  (buffer counts uint 9 #:frames shared)
   (buffer commands DispatchCommand 2 #:frames shared)  ; decodeBaseCommand, decodeShCommand
   (buffer projected Projected splatCount #:frames shared)
   (buffer keys uint splatCount #:frames shared)

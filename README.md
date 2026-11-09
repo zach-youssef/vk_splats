@@ -30,6 +30,19 @@ training options are in [docs/data-format.md](docs/data-format.md) and the
 from conversion through `tools/scene_args.py --train` to the evaluation, is in
 [docs/results.md](docs/results.md#reproducing).
 
+## Viewer controls
+
+`splat_view` shows a scene's stream in a window (its options are in the
+[splat_view section](docs/architecture.md#splat_view)):
+
+| Input | Does |
+| --- | --- |
+| W, A, S, D | move forward, left, back, right |
+| Q, E | sink, rise |
+| drag (left mouse button) | look around |
+| scroll | move faster (up) or slower (down) |
+| Escape | quit |
+
 ## Layout
 
 The fuller version is [docs/architecture.md](docs/architecture.md#layout).

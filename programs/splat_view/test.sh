@@ -194,4 +194,84 @@ for refused in "opaque:isn't below 0.35" "doubled:blends [0-9]* splats"; do
         fail "$log" "the $fixture fixture (not refused for its bound)"
     fi
 done
+# The base speed (docs/architecture.md, "Controls") comes from the cameras' spread, or from the
+# start camera's distance when they don't spread. S3's 25 cameras spread ~4 (speed ~1: a quarter),
+# and the moves runs below log it. A header-only run takes the header camera's distance, as
+# does a cameras file of just it; a file of one camera, and of coincident centres (camera 0 seven
+# times, whose float32 spread is a rounding residue, not 0), must take the same speed from the
+# fallback (about 1 here), not ~1e-8.
+speed_of() {  # speed_of <log>: the base speed it printed
+    sed -n 's/^splat_view: base speed \([^ ]*\) .*/\1/p' "$1"
+}
+head -c 112 "$golden/s3/cameras.bin" > "$out/one-camera.bin"
+: > "$out/coincident.bin"
+for _ in 1 2 3 4 5 6 7; do cat "$out/one-camera.bin" >> "$out/coincident.bin"; done
+view coincident "$out/full/scene.stream" --cameras "$out/coincident.bin" --size 128x128 ||
+    fail "$out/coincident.log" "the coincident cameras run"
+view one-camera "$out/full/scene.stream" --cameras "$out/one-camera.bin" --size 128x128 ||
+    fail "$out/one-camera.log" "the one camera run"
+header_speed=$(speed_of "$out/header.log")
+if [ -n "$header_speed" ] && grep -q "^splat_view: base speed .*(from the header's camera)" "$out/header.log" &&
+    [ "$(speed_of "$out/header-file.log")" = "$header_speed" ] &&
+    [ "$(speed_of "$out/coincident.log")" = "$(speed_of "$out/one-camera.log")" ] &&
+    awk -v s="$(speed_of "$out/coincident.log")" 'BEGIN { exit !(s > 0.1) }' &&
+    grep -q "^splat_view: base speed .*(from the start camera's distance: the 7 cameras" "$out/coincident.log" &&
+    grep -q "^splat_view: base speed 0\.9[0-9]* (the 25 cameras spread 3\.9" "$out/full-camera-0.log"; then
+    echo "splat_view: base speed: the fallback for no, one and coincident cameras, the spread for S3's"
+else
+    cat "$out/header.log" "$out/header-file.log" "$out/one-camera.log" "$out/coincident.log"
+    echo "splat_view: the base speed FAILED: its source or value"
+    status=1
+fi
+# The controls (docs/architecture.md, "splat_view"): Project and the sort run only when the camera
+# changes. The still runs above projected once (--inspect counts the GPU's runs and checks them
+# against the app's). --scripted-moves 6 shrinks the surface (resize!) the frame after the app is
+# ready, then moves (W and a drag, through the controls' code) for 6 frames, then is still: Project
+# must run in 2 + 6 frames (ready, the shrink and the moves), not after, and at 2 and 3 frames in
+# flight the last, still frame (after a move) must be the same image, byte for byte, as a run
+# projecting in every frame (a fresh render of the same pose and size).
+for name in full-camera-0 full-camera-24 web-camera-0 web-camera-24 header; do
+    grep -q '^splat_view: inspect: Project ran in 1 frames' "$out/$name.log" ||
+        fail "$out/$name.log" "$name: Project running on a still camera"
+done
+moves=6
+script() {  # script <log> [arguments]: the moves on the full preset's camera 0, 40 frames
+    log=$1
+    shift
+    # shellcheck disable=SC2046 # the arguments are words without spaces
+    program --validation --frames 40 $("$python" "$tools/scene_args.py" --view "$out/full/scene.stream") \
+        --cameras "$golden/s3/cameras.bin" --camera 0 --size 128x128 --scripted-moves $moves "$@" \
+        > "$log" 2>&1 || fail "$log" "$log's run"
+}
+for frames_in_flight in 2 3; do
+    name=moves-$frames_in_flight
+    script "$out/$name-moves.log" --frames-in-flight $frames_in_flight --capture "$out/$name-moves.png" --inspect
+    script "$out/$name-fresh.log" --frames-in-flight $frames_in_flight --capture "$out/$name-fresh.png" \
+        --project-every-frame
+    if ! grep -q "^splat_view: inspect: Project ran in $((moves + 2)) frames" "$out/$name-moves.log"; then
+        fail "$out/$name-moves.log" "$name: Project not running in exactly $((moves + 2)) frames"
+    elif ! cmp -s "$out/$name-moves.png" "$out/$name-fresh.png"; then
+        fail "$out/$name-moves.log" "$name: the still frame after moving against a fresh render"
+    else
+        grep '^splat_view: inspect' "$out/$name-moves.log"
+        echo "splat_view: $name: still after moving, the image is a fresh render's"
+    fi
+done
+# The sort must run in the frames Project does (the same #:enabled flag), not every frame: the
+# native --timings table counts the frames each node ran in (the web has no --timings). Sorting
+# sorted keys changes nothing, so no image or count above would catch an always-on sort.
+case $binary in
+    *.js) ;;
+    *)
+        log=$out/sort-frames.log
+        script "$log" --timings
+        project=$(awk '$1 == "project" { print $NF }' "$log")
+        sort=$(awk '$1 == "sortSplats" { print $NF }' "$log")
+        if [ "$project" = $((moves + 2)) ] && [ "$sort" = $((moves + 2)) ]; then
+            echo "splat_view: Project and the sort ran in $((moves + 2)) of 40 frames"
+        else
+            fail "$log" "Project in '$project' frames and the sort in '$sort', not $((moves + 2)):"
+        fi
+        ;;
+esac
 exit $status

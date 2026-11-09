@@ -12,10 +12,20 @@
 ;; --stream-bytes, and fails (exit 1) on a mismatch, a missing camera or when the frames run out
 ;; before it has a camera. --inspect also reads back accum, counts and the DrawCommand and checks,
 ;; on the last frame, that the image is Encode's of accum (encodeAccum), within a unit of rounding,
-;; and that every splat was decoded (base and SH), sorted and drawn: each count is --splat-count.
-;; The newest readbacks may be of different frames, so this holds for a still camera only. Once
-;; those pass, it writes accum's readback to the file $SPLAT_VIEW_ACCUM names, if set (an extern
-;; can't take a path option), for web-check/view_oracle_check's closed-form oracle (test.sh).
+;; and that every splat was decoded (base and SH), sorted and drawn: each count is --splat-count,
+;; and that Project ran as often as the app enabled it (the GPU's viewProjections). The newest
+;; readbacks may be of different frames, so this holds for a still camera only: the run must end
+;; still for framesInFlight + 3 frames. Once those pass, it writes accum's readback to the file
+;; $SPLAT_VIEW_ACCUM names, if set (an extern can't take a path option), for
+;; web-check/view_oracle_check's closed-form oracle (test.sh).
+;;
+;; Controls (docs/architecture.md, "splat_view"): W, A, S and D move forward, left, back and right,
+;; Q and E sink and rise, dragging with the left button looks around, and scrolling changes the
+;; speed. A key pressed and released between two frames still moves for one frame (a latched
+;; press). Project and the sort run only in a frame whose camera differs from the last projected
+;; one (the pose, the size, or the app becoming ready): their outputs are #:frames shared, so a
+;; still camera reuses them in every frame slot. --scripted-moves, --project-every-frame and
+;; --frames-in-flight are for tests.
 
 (import "../../lib/view_graph.zgal")
 (import "../../lib/view_camera.zgal")
@@ -23,6 +33,67 @@
 ;; The camera before the app has one (nothing is drawn with it: Project is off)
 (define (placeholderCamera) : Camera
   (Camera (mat4 1.0) (vec4 1.0 1.0 0.5 0.5) (vec3 0.0) (uint 0) (uvec2 1 1) (uint 0) (uint 0)))
+
+;; The movement keys, as bits of the app's held and tapped masks
+(define keyW (uint 1))
+(define keyA (uint 2))
+(define keyS (uint 4))
+(define keyD (uint 8))
+(define keyQ (uint 16))
+(define keyE (uint 32))
+
+;; Scrolling: each step scales the speed by viewStepFactor, within viewMaxSteps steps either way
+(define viewStepFactor 1.25)
+(define viewMaxSteps 20.0)
+
+;; 1 when a key's bit is in the mask, else 0
+(define (keyDown [keys : uint] [key : uint]) : float
+  (if (= (bitand keys key) (uint 0)) 0.0 1.0))
+
+;; viewMove's keys, (D - A, E - Q, W - S), from a mask
+(define (moveKeys [keys : uint]) : vec3
+  (vec3 (- (keyDown keys keyD) (keyDown keys keyA))
+        (- (keyDown keys keyE) (keyDown keys keyQ))
+        (- (keyDown keys keyW) (keyDown keys keyS))))
+
+;; The speed before any scrolling, in world units per second: a quarter of the scene's length a
+;; second. With --cameras the length is the spread of the capture's camera centres (readCameras'
+;; handler: their root mean square distance from their mean), the scale the capture walked. Without
+;; them, or when they don't spread (one camera, or coincident centres), the fallback is the start
+;; camera's distance from the world origin (at least 0.04). A Camera carries no scene scale and the stream header no bounds,
+;; so the fallback is a guess that holds only for a scene around the origin seen from a scene's
+;; length away (the header's default camera of such a scene). It's far off for an off-origin scene
+;; or a camera near the origin, where scrolling (x86 at most either way) may not correct it.
+;; The spread counts only above a thousandth of the fallback length. Coincident centres don't spread
+;; exactly 0 in float32: the rounding in the mean and the differences leaves about 1e-7 of the
+;; centres' size, which would freeze the viewer at a speed of ~1e-8. The fallback is at least the
+;; start camera's distance, a centre's size, so a thousandth of it is far above that residue and far
+;; below any real capture's baseline.
+(define (viewFallbackLength [start : Camera]) : float
+  (max (length start.center) 0.04))
+(define (viewSpreads [spread : float] [start : Camera]) : bool
+  (> spread (* 0.001 (viewFallbackLength start))))
+(define (viewBaseSpeed [spread : float] [start : Camera]) : float
+  (* 0.25 (if (viewSpreads spread start) spread (viewFallbackLength start))))
+
+;; Whether two poses are the same, exactly (so a pose that moved, however little, differs)
+(define (samePose [a : ViewPose] [b : ViewPose]) : bool
+  (and (= a.offset.x b.offset.x) (= a.offset.y b.offset.y) (= a.offset.z b.offset.z) (= a.yaw b.yaw)
+       (= a.pitch b.pitch)))
+
+;; A mouse delta in pixels from two cursors (in [-1, 1] across the surface, y down)
+(define (cursorPixels [from : vec2] [to : vec2] [size : vec2]) : vec2
+  (* (* (- to from) size) 0.5))
+
+;; The look sensitivity: a pixel of the fitted camera's image per radian at its centre (1 / fy),
+;; so a drag turns the scene under the cursor about as far as the cursor went
+(define (radiansPerPixel [start : Camera] [size : vec2]) : float
+  (/ (float start.size.y) (* start.intrinsics.y size.y)))
+
+;; A drag's look: the pose turned by the cursor's move from `from` to `to` on a surface of `size`
+;; pixels (the cursor-moved handler's, and --scripted-moves')
+(define (dragLook [pose : ViewPose] [start : Camera] [from : vec2] [to : vec2] [size : vec2]) : ViewPose
+  (viewLook pose (cursorPixels from to size) (radiansPerPixel start size)))
 
 ;; An rgba8 readback pixel's channel c (a uint, r in the low byte)
 (define (byteChannel [pixel : uint] [c : uint]) : uint
@@ -54,6 +125,14 @@
   (parameter near float)
   (parameter background float)
   (parameter inspect bool)
+  ;; Tests: the frame after the app becomes ready, the surface shrinking to three quarters
+  ;; (resize!), then scriptedMoves frames moving forward and looking (W and a drag, through the
+  ;; controls' code), then still; Project in every frame (a fresh render, to compare the cache
+  ;; with); and the frames in flight (from the first frame) when framesGiven
+  (parameter scriptedMoves uint)
+  (parameter projectEveryFrame bool)
+  (parameter framesInFlightOption uint)
+  (parameter framesGiven bool)
   ;; Exits the program with status 1
   (extern (fail) : void)
   ;; Writes accum's readback (rgba16f pixels as r | g << 16, b | a << 16, row by row) to the file
@@ -66,6 +145,23 @@
    (start Camera (placeholderCamera))
    (readyFrame uint 0)     ; the frame both became ready in
    (failed bool #f)
+   ;; The controls: where the viewer is, the movement keys held and those pressed since the last
+   ;; frame that moved (a latched press), the drag, and the scroll steps
+   (pose ViewPose (viewPose))
+   (held uint 0)
+   (tapped uint 0)
+   (dragging bool #f)
+   (cursor vec2 (vec2 0.0))
+   (steps float 0.0)
+   (baseSpeed float 0.0)   ; viewBaseSpeed's, once the start camera is known
+   ;; Whether the start camera changed since Project last ran (the app became ready), whether
+   ;; this frame runs it, the pose and size it last ran for, how often it has, and in which frame
+   (dirty bool #t)
+   (project bool #f)
+   (projectedPose ViewPose (viewPose))
+   (projectedSize vec2 (vec2 0.0))
+   (projections uint 0)
+   (lastProjectFrame uint 0)
    ;; --inspect: the newest readbacks and the frames they were handled in
    (accum (data uvec2) (empty-data uvec2))
    (accumFrame uint 0)
@@ -76,6 +172,30 @@
    (draws (data DrawCommand) (empty-data DrawCommand))
    (drawsFrame uint 0))
   (on (key-pressed escape) (quit!))
+  ;; A key's press sets its bit in both masks, and its release clears it from held only: the frame
+  ;; moves with either, so a press released before the frame still moves it
+  (on (key-pressed w) (with state #:held (bitor state.held keyW) #:tapped (bitor state.tapped keyW)))
+  (on (key-pressed a) (with state #:held (bitor state.held keyA) #:tapped (bitor state.tapped keyA)))
+  (on (key-pressed s) (with state #:held (bitor state.held keyS) #:tapped (bitor state.tapped keyS)))
+  (on (key-pressed d) (with state #:held (bitor state.held keyD) #:tapped (bitor state.tapped keyD)))
+  (on (key-pressed q) (with state #:held (bitor state.held keyQ) #:tapped (bitor state.tapped keyQ)))
+  (on (key-pressed e) (with state #:held (bitor state.held keyE) #:tapped (bitor state.tapped keyE)))
+  (on (key-released w) (with state #:held (bitand state.held (bitnot keyW))))
+  (on (key-released a) (with state #:held (bitand state.held (bitnot keyA))))
+  (on (key-released s) (with state #:held (bitand state.held (bitnot keyS))))
+  (on (key-released d) (with state #:held (bitand state.held (bitnot keyD))))
+  (on (key-released q) (with state #:held (bitand state.held (bitnot keyQ))))
+  (on (key-released e) (with state #:held (bitand state.held (bitnot keyE))))
+  ;; Dragging with the left button looks around (once the app has its camera)
+  (on (mouse-pressed left cursor) (with state #:dragging #t #:cursor cursor))
+  (on (mouse-released left cursor) (with state #:dragging #f))
+  (on (cursor-moved cursor)
+    (if (and state.dragging state.headerReady state.cameraReady (> surfaceSize.y 0.0))
+        (with state #:cursor cursor #:pose (dragLook state.pose state.start state.cursor cursor surfaceSize))
+        (with state #:cursor cursor)))
+  ;; Scrolling up is faster
+  (on (scrolled offset)
+    (with state #:steps (clamp (+ state.steps offset.y) (- viewMaxSteps) viewMaxSteps)))
   (on (read readHeader d)
     (let* ([h (at d 0)]
            [code (checkStreamHeader h)]
@@ -92,49 +212,107 @@
                         " bytes, not --stream-bytes' " streamBytes)
                 (fail) state)]
         [else
-         (let* ([cameraReady (or state.cameraReady (not hasCameras))])
+         (let* ([cameraReady (or state.cameraReady (not hasCameras))]
+                [speed (if hasCameras state.baseSpeed (viewBaseSpeed 0.0 h.camera))])
            (print! "splat_view: " splatCount " splats at SH degree " h.shDegree)
+           (unless hasCameras (print! "splat_view: base speed " speed " (from the header's camera)"))
            (with state #:headerReady #t #:shDegree h.shDegree #:cameraReady cameraReady
-                 #:start (if hasCameras state.start h.camera) #:readyFrame frameNumber))])))
+                 #:start (if hasCameras state.start h.camera) #:baseSpeed speed #:readyFrame frameNumber
+                 #:dirty #t))])))
   (on (read readCameras d)
     (if (< cameraIndex (count d))
-        (with state #:cameraReady #t #:start (at d cameraIndex) #:readyFrame frameNumber)
+        (let* ([n (count d)]
+               [mean (/ (fold ([acc (vec3 0.0)]) ([i (range (uint 0) n)]) (+ acc (.center (at d i))))
+                        (float n))]
+               [squares (fold ([acc 0.0]) ([i (range (uint 0) n)])
+                          (let* ([offset (- (.center (at d i)) mean)]) (+ acc (dot offset offset))))]
+               [spread (sqrt (/ squares (float n)))]
+               [speed (viewBaseSpeed spread (at d cameraIndex))])
+          (if (viewSpreads spread (at d cameraIndex))
+              (print! "splat_view: base speed " speed " (the " n " cameras spread " spread ")")
+              (print! "splat_view: base speed " speed " (from the start camera's distance: the " n
+                      " cameras spread " spread ")"))
+          (with state #:cameraReady #t #:start (at d cameraIndex) #:baseSpeed speed
+                #:readyFrame frameNumber #:dirty #t))
         (begin (print! "splat_view: FAILED, --camera " cameraIndex " but --cameras holds " (count d))
                (fail) state)))
   (on (read readAccum d) (with state #:accum d #:accumFrame frameNumber))
   (on (read readCounts d) (with state #:counts d #:countsFrame frameNumber))
   (on (read readDraws d) (with state #:draws d #:drawsFrame frameNumber))
   (on (read readRendered d) (if inspect (with state #:image d #:imageFrame frameNumber) state))
+  ;; Each frame: moves the pose by the keys (and the script), then decides whether Project and the
+  ;; sort run (state.project, their #:enabled): once ready, when the start camera, the pose or the
+  ;; surface's size differs from what they last ran for (whatever changed the pose: a key, a drag
+  ;; or the script). A resize! applies after the handlers but before
+  ;; the camera's computed, so a frame resizing projects for its new size; a window resized by the
+  ;; user is seen here a frame late, so that one frame draws the old projection at the new size.
+  ;; Then the checks, and on the last frame --inspect's.
   (on (frame dt)
     (let* ([ready (and state.headerReady state.cameraReady)]
-           [last (and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))])
+           [last (and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))]
+           ;; --scripted-moves: the surface shrinks to three quarters in frame readyFrame + 1, and
+           ;; frames readyFrame + 2 to scriptEnd move, so the last projection is a move's
+           [scripted (> scriptedMoves (uint 0))]
+           [shrinkFrame (+ state.readyFrame (uint 1))]
+           [scriptEnd (+ shrinkFrame scriptedMoves)]
+           [scriptMoving (and scripted ready (> frameNumber shrinkFrame) (<= frameNumber scriptEnd))]
+           [shrinking (and scripted ready (= frameNumber shrinkFrame))]
+           [size (uvec2 surfaceSize)]
+           [smaller (/ (* size (uint 3)) (uint 4))]
+           [newSize (if shrinking (vec2 smaller) surfaceSize)]
+           ;; The keys held or pressed since the last frame that moved; they move once ready
+           [keys (bitor (bitor state.held state.tapped) (if scriptMoving keyW (uint 0)))]
+           [direction (moveKeys keys)]
+           [moving (and ready (> (length direction) 0.0))]
+           [span (* (viewSpeed state.baseSpeed state.steps viewStepFactor) dt)]
+           [walked (if moving (viewMove state.pose state.start direction span) state.pose)]
+           ;; The script's drag: the cursor 4 and 2 pixels right and down of the centre
+           [pose (if scriptMoving
+                     (dragLook walked state.start (vec2 0.0) (/ (vec2 8.0 4.0) newSize) newSize)
+                     walked)]
+           [changed (or state.dirty (not (samePose pose state.projectedPose))
+                        (not= newSize.x state.projectedSize.x) (not= newSize.y state.projectedSize.y))]
+           [project (and ready (> newSize.y 0.0) (or projectEveryFrame changed))]
+           [next (with state #:pose pose #:tapped (if ready (uint 0) state.tapped)
+                       #:dirty (and state.dirty (not project)) #:project project
+                       #:projectedPose (if project pose state.projectedPose)
+                       #:projectedSize (if project newSize state.projectedSize)
+                       #:projections (if project (+ state.projections (uint 1)) state.projections)
+                       #:lastProjectFrame (if project frameNumber state.lastProjectFrame))])
+      (when (and framesGiven (= frameNumber (uint 0))) (set-frames-in-flight! framesInFlightOption))
+      (when shrinking (resize! smaller.x smaller.y))
       (cond
         [(not (and countGiven bytesGiven))
          (begin (print! "splat_view: FAILED, --splat-count and --stream-bytes are required "
                         "(tools/scene_args.py --view prints them)")
-                (fail) state)]
+                (fail) next)]
         [(< streamBytes streamHeaderSize)
          (begin (print! "splat_view: FAILED, --stream-bytes is below the header's " streamHeaderSize " bytes")
-                (fail) state)]
+                (fail) next)]
         [(and last (not ready))
          (begin (print! "splat_view: FAILED, " frameLimit " frames weren't enough to read the header back")
-                (fail) state)]
+                (fail) next)]
+        [(and last scripted (<= frameNumber scriptEnd))
+         (begin (print! "splat_view: FAILED, " frameLimit " frames weren't enough for --scripted-moves "
+                        scriptedMoves " (ready in frame " state.readyFrame ")")
+                (fail) next)]
         [(and last inspect)
-         ;; A readback handled in frame f is of a frame after f - framesInFlight - 2, so both must
-         ;; be of frames that drew with the camera (from readyFrame + 1)
-         (let* ([settled (+ state.readyFrame framesInFlight (uint 3))]
+         ;; A readback handled in frame f is of a frame after f - framesInFlight - 2, so each must
+         ;; be of a frame after Project last ran (with the camera this frame draws from)
+         (let* ([settled (+ next.lastProjectFrame framesInFlight (uint 3))]
                 [pixels (count state.image)])
            (cond
              [(or (< state.accumFrame settled) (< state.imageFrame settled) (< state.countsFrame settled)
                   (< state.drawsFrame settled))
-              (begin (print! "splat_view: FAILED, too few frames for --inspect's readbacks (accum handled in frame "
+              (begin (print! "splat_view: FAILED, too few still frames for --inspect's readbacks (accum handled in frame "
                              state.accumFrame ", the image in " state.imageFrame ", counts in " state.countsFrame
-                             ", the DrawCommand in " state.drawsFrame ", ready in " state.readyFrame ")")
-                     (fail) state)]
+                             ", the DrawCommand in " state.drawsFrame ", Project last ran in "
+                             next.lastProjectFrame ")")
+                     (fail) next)]
              [(or (< (count state.counts) viewCountsSize) (= (count state.draws) (uint 0)))
               (begin (print! "splat_view: FAILED, --inspect's readbacks hold " (count state.counts) " counts and "
                              (count state.draws) " DrawCommands")
-                     (fail) state)]
+                     (fail) next)]
              [(not (and (= (at state.counts decodeBaseDecoded) splatCount)
                         (= (at state.counts decodeShDecoded) splatCount)
                         (= (at state.counts viewProjected) splatCount)
@@ -145,31 +323,35 @@
                              (at state.counts viewProjected) " sorted, " (.instanceCount (at state.draws 0))
                              " instances of " (.vertexCount (at state.draws 0)) " vertices drawn, of "
                              splatCount " splats")
-                     (fail) state)]
+                     (fail) next)]
+             [(not= (at state.counts viewProjections) next.projections)
+              (begin (print! "splat_view: FAILED, Project ran in " (at state.counts viewProjections)
+                             " frames on the GPU, but the app enabled it in " next.projections)
+                     (fail) next)]
              [(or (= pixels (uint 0)) (not= (count state.accum) pixels))
               (begin (print! "splat_view: FAILED, --inspect's readbacks hold " (count state.accum) " and " pixels
                              " pixels")
-                     (fail) state)]
+                     (fail) next)]
              [else
               (let* ([worst (fold ([acc (uint 0)]) ([i (range (uint 0) pixels)])
                               (max acc (encodeError (at state.accum i) (at state.image i) (vec3 background))))]
                      [covered (fold ([acc (uint 0)]) ([i (range (uint 0) pixels)])
                                 (if (> (.w (halfPixel (at state.accum i))) 0.0) (+ acc (uint 1)) acc))])
-                (print! "splat_view: inspect: " covered " of " pixels " pixels covered, the image within "
+                (print! "splat_view: inspect: Project ran in " next.projections " frames (the last, frame "
+                        next.lastProjectFrame "); " covered " of " pixels " pixels covered, the image within "
                         worst " of Encode's")
                 (if (and (<= worst (uint 1)) (> covered (uint 0)))
-                    (begin (saveAccum state.accum) (print! "splat_view: passed") state)
-                    (begin (print! "splat_view: FAILED, the image isn't Encode's of accum") (fail) state)))]))]
-        [else state])))
+                    (begin (saveAccum state.accum) (print! "splat_view: passed") next)
+                    (begin (print! "splat_view: FAILED, the image isn't Encode's of accum") (fail) next)))]))]
+        [else next])))
   (run ViewGraph (streamFile streamFile) (splatCount splatCount) (streamBytes streamBytes)
        (hasCameras hasCameras) (cameraFile cameraFile)
        (cameraInput (if (and state.headerReady state.cameraReady (> surfaceSize.y 0.0))
-                        (fitCamera (viewPose) state.start (uvec2 surfaceSize))
+                        (fitCamera state.pose state.start (uvec2 surfaceSize))
                         state.start))
        (near near) (shDegree state.shDegree) (background (vec3 background))
        (window (not headless)) (capture capture) (inspect inspect)
-       #:enabled ((project (and state.headerReady state.cameraReady (> surfaceSize.y 0.0)))
-                  (sortSplats (and state.headerReady state.cameraReady (> surfaceSize.y 0.0))))))
+       #:enabled ((project state.project) (sortSplats state.project))))
 
 (main SplatView
   (about "Views a splat scene's stream, in a window or headless (--frames N, --capture FILE)")
@@ -188,4 +370,14 @@
   (option background "--background" "the background's grey level (0 black, 1 white)" #:default 0.0
           #:range (0.0 1.0))
   (flag inspect "--inspect" "also read back accum, the counts and the DrawCommand and check them and the image (tests)")
-  (controls "Controls:" "  escape  quit"))
+  (option scriptedMoves "--scripted-moves" "tests: once ready, shrink the surface, then move this many frames"
+          #:default 0 #:range (0 1000))
+  (flag projectEveryFrame "--project-every-frame" "tests: project and sort in every frame, the camera still or not")
+  (option framesInFlightOption "--frames-in-flight" "tests: the frames in flight" #:default 2 #:range (1 4)
+          #:given framesGiven)
+  (controls "Controls:"
+            "  W A S D  move forward, left, back, right"
+            "  Q E      sink, rise"
+            "  drag     look around (left mouse button)"
+            "  scroll   faster (up) or slower (down)"
+            "  escape   quit"))
