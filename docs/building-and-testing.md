@@ -72,6 +72,8 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   for the web (no native-only features such as `import-images`). Programs link only Vulkan; one
   that needs more, e.g. GLFW for a window, opts in with `programs/<name>/program.mk`:
   `LIBS_<name> = -lglfw`. Headless programs then build and run without GLFW.
+  A ZGAL program binary loads its shaders from `shaders/` beside itself, so a copy of one (e.g. a
+  mutant's binary kept beside the real build) needs that directory copied with it.
   A numeric option whose every value, 0 included, is a meaningful choice is made required with
   ZGAL's `#:given`: the option also sets a `bool` parameter when it's on the command line, and the
   program fails without it (splat_train's `--max-screen-size`, where 0 turns the prune off).

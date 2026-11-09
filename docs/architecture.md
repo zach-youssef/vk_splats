@@ -140,6 +140,10 @@ Training adds Adam, and densification and pruning on a fixed capacity, compacted
   or a GLSL built-in function (`step`, `sign`, `distance`; hence `StreamField`'s `stepSize`), and
   a function or struct named like a body form (`values`, `count`, `sum`). The lists are
   `external/vulkan_test/dsl/private/names.rkt`.
+- **Draws**: a graphics material culls back faces by default, so one drawing screen-space quads
+  whose winding isn't fixed (a splat's corners, either way round) needs `#:cull none`. Draw quads
+  as a triangle list (6 vertices), not a 4-vertex strip: MoltenVK can't turn primitive restart
+  off for a strip, and validation reports it.
 - **Capacity**: the splat count is bounded by a required `--max-splats`. ZGAL recreates a buffer,
   losing its contents, when its per-frame size changes, so only scratch buffers (tile entries)
   grow: the tile entries' capacity is a per-frame input the app grows after an overflow
@@ -587,8 +591,8 @@ camera, [above](#view-camera)). For now it loads the stream whole through `buffe
    flips y itself). Each fragment computes Rasterize's power and alpha at its pixel centre
    (`d = mean − fragCoord.xy`), discards power > 0 or alpha < `alphaMin`, and outputs
    (colour·α, α), blended premultiplied into `accum` (rgba16f, cleared to zero each frame): rgb
-   Σ c·α·T, alpha 1 − T. `#:cull none`, and a triangle list rather than a 4-vertex strip:
-   MoltenVK can't turn primitive restart off for a strip, and validation reports it.
+   Σ c·α·T, alpha 1 − T. `#:cull none`, and a triangle list rather than a 4-vertex strip
+   ([Conventions](#conventions), "Draws").
 5. `encode`: a triangle covering `rendered` (rgba8) whose fragments `fetch` their `accum` pixel
    and write `encodeAccum`: clamp(rgb + (1 − a)·background), opaque, as Rasterize writes its
    image. A pass of fragments needs no storage image (rgba16f storage isn't portable on the web).
