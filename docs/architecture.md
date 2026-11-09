@@ -28,10 +28,13 @@
   `(import "../../lib/<module>.zgal")`. A module's name is a C++ namespace (ZGAL compiles its
   functions to C++ too), so it uses underscores, not hyphens.
   - `splat_math.zgal`: the structs, the per-splat preprocess (covariance, EWA projection, conic,
-    radius, tile rectangle, SH colour) and the sort keys ([below](#splat-math)).
+    radius, tile rectangle, SH colour), the blend's alpha thresholds and the sort keys
+    ([below](#splat-math)).
   - `render_graph.zgal`: `SplatGraph`, the render graph's preprocess, tile entries, sort, tile
     ranges and rasterizer, and the window's present ([below](#render-graph)); it imports
-    `splat_math.zgal`.
+    `splat_math.zgal` and `present.zgal`.
+  - `present.zgal`: `Present`, which draws an RGBA8 image on the window's surface, letterboxed
+    (`letterbox`), for the render and viewer graphs.
   - `train_graph.zgal`: `TrainGraph`, the render graph's forward pass followed by the loss and the
     backward rasterize, giving each splat's gradients with respect to its projection
     ([below](#train-graph)); it imports `render_graph.zgal` and `ssim.zgal`.
@@ -209,7 +212,7 @@ with a window, draws the image on the surface.
      function is applied.
    Pixels past the image's edge (in edge tiles) only help load batches, and every pixel inside
    writes all three, so nothing reads an unwritten value.
-6. `present` (only with the `window` parameter): `Present` draws `rendered` on the surface as a
+6. `present` (only with the `window` parameter): `Present` (`lib/present.zgal`) draws `rendered` on the surface as a
    quad, with nearest sampling, letterboxed by `presentScale` (`letterbox`, from the surface's
    size, so the image keeps its aspect ratio). The fragment shader decodes the colours
    (`srgbDecode`) so that an sRGB surface's encode gives back the captured values. **Known

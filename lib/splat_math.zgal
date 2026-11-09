@@ -67,6 +67,13 @@
 ;; larger radius covers the same tiles
 (define radiusMax 1048576.0)
 
+;; The blend's thresholds (Appendix C, as the reference code applies them): a splat whose alpha at
+;; a pixel (its opacity times the Gaussian, at most alphaMax) is below alphaMin isn't blended there.
+;; The tile renderer's Rasterize (lib/render_graph.zgal), the training graph's backward pass and the
+;; viewer's draw (lib/view_graph.zgal) share them.
+(define alphaMin (/ 1.0 255.0))
+(define alphaMax 0.99)
+
 ;; The real spherical harmonics' constants for degrees 0-3 (reference code's SH_C0 ... SH_C3)
 (define SH_C0 0.28209479177387814)
 (define SH_C1 0.4886025119029199)

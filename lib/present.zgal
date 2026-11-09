@@ -1,0 +1,31 @@
+;; The image on a window: Present draws an RGBA8 image of sRGB-encoded colours (what a capture
+;; writes) on the surface, letterboxed. The render graph (lib/render_graph.zgal) and the viewer graph
+;; (lib/view_graph.zgal) import it, (import "present.zgal").
+(import color)
+
+;; The image on the surface, letterboxed (scale: the image's half extents in clip space, at most 1,
+;; so its aspect ratio is kept), as two triangles. The image holds the
+;; colours the capture writes, which are sRGB-encoded as the training images are. The colours are
+;; decoded first, assuming an sRGB surface whose hardware encode gives them back: the web draws
+;; through an sRGB view, and native Vulkan picks B8G8R8A8_SRGB when the surface offers it (MoltenVK
+;; does), but otherwise the first format, and on a UNORM one the window shows the image darker
+;; (docs/architecture.md, a known limitation; ZGAL doesn't tell a shader the surface's format).
+(graphics-material Present
+  (bindings
+   (picture texture)
+   (pictureSampler sampler))
+  (push (scale vec2))
+  (varyings (uv vec2))
+  (outputs (color vec4))
+  (vertex
+   (let* ([corner (at (array vec2 (vec2 0.0 0.0) (vec2 1.0 0.0) (vec2 0.0 1.0)
+                             (vec2 0.0 1.0) (vec2 1.0 0.0) (vec2 1.0 1.0))
+                      vertexIndex)])
+     (results #:position (vec4 (* (- (* corner 2.0) 1.0) scale) 0.0 1.0) #:uv corner)))
+  (fragment
+   (vec4 (srgbDecode (.rgb (sample picture pictureSampler uv))) 1.0)))
+
+;; The scale Present needs to letterbox a width x height image on a surface of surfaceSize
+(define (letterbox [surfaceSize : vec2] [width : uint] [height : uint]) : vec2
+  (let* ([ratio (/ (* (float width) surfaceSize.y) (* (float height) (max surfaceSize.x 1.0)))])
+    (if (> ratio 1.0) (vec2 1.0 (/ 1.0 ratio)) (vec2 ratio 1.0))))
