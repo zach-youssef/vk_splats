@@ -1,5 +1,5 @@
 #!/bin/sh
-# render_test with validation: test.sh <binary> <output dir> [<web-check dir>]. Every S1 variant
+# render_test with validation: test.sh <binary> <output dir> <web-check dir>. Every S1 variant
 # (the closed-form oracle, every camera of the rotated ones; off-centre is 48x32 with the principal
 # point off the centre), S2's cameras (cam_1 is 80x48: non-square) on a grey background, twice each
 # with the hashes compared (deterministic across runs, not only across frames), and S3's cameras 0
@@ -13,7 +13,7 @@
 set -eu
 binary=$1
 out=$2
-checks=${3:-}
+checks=$3
 python=${PYTHON:-python3}
 here=$(dirname "$0")
 
@@ -26,7 +26,6 @@ mkdir -p "$out"
 web=
 case $binary in *.js)
     web=1
-    [ -n "$checks" ] || { echo "render_test: test.sh needs the web-check directory for a web build" >&2; exit 2; }
     ;;
 esac
 

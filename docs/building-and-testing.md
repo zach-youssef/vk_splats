@@ -78,7 +78,8 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   ZGAL's `#:given`: the option also sets a `bool` parameter when it's on the command line, and the
   program fails without it (splat_train's `--max-screen-size`, where 0 turns the prune off).
 - **A program test**: `programs/<name>/test.sh`, executable, run from the repository's root as
-  `test.sh <binary> <output dir>`. It runs the program headless with `--validation` (which fails
+  `test.sh <binary> <output dir> <web-check dir>`, after the program's web-check tools (a test
+  that needs none ignores the third argument). It runs the program headless with `--validation` (which fails
   unless validation and synchronization validation are both available) and exits non-zero on any
   failure; a validation message is a failure.
   A training test ends several hundred iterations after its last densification or opacity reset
@@ -102,10 +103,11 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   runs it in Chromium, and checks what it shows (`--screenshot`, `--keys`), failing when the
   checker exits non-zero, 3 (no Chromium) included. SwiftShader is slow, so a page test uses a
   tiny scene: splat_render's renders S3 (2000 splats) at 128x128 ([web.md](web.md#tests)).
-- **A web-check tool**: `programs/<name>/web-check/<tool>.cpp`, a host program a web test runs on
-  what the web run wrote, for checks written in C++ (render_test's `render_test_check`). It's built
+- **A web-check tool**: `programs/<name>/web-check/<tool>.cpp`, a host program a test runs on
+  what a run wrote, for checks written in C++: a web run's (render_test's `render_test_check`), or
+  either backend's (splat_view's `view_oracle_check`). It's built
   like a C++ test (with `tests/` on the include path, and a `<tool>.zgal` beside it for a generated
-  header) into `build/web-check/<tool>` before the program's `test-web-<name>`, and rebuilt when
+  header) into `build/web-check/<tool>` before the program's `test-<name>` and `test-web-<name>`, and rebuilt when
   the program's or `tests/oracle/`'s headers change. Tool names must be unique across programs.
 - **A C++ test**: `tests/cpp/<name>.cpp`, a whole program (doctest with
   `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`, or its own `main`) with `tests/`, doctest and the wrapper's

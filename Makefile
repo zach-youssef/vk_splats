@@ -109,18 +109,9 @@ $(OUT)/tests/%: tests/cpp/%.cpp $(wildcard tests/cpp/*.h tests/oracle/*.h lib/na
 test-cpp: $(foreach t,$(CPP_TESTS),$(OUT)/tests/$(t))
 	@set -e; for t in $(CPP_TESTS); do echo "== $$t"; $(OUT)/tests/$$t; done
 
-# Program tests: programs/<name>/test.sh, run from the repository's root as
-# test.sh <binary> <output dir>, runs the program headless with --validation
-TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test.sh),$(p)))
-
-$(foreach p,$(TESTED_PROGRAMS),$(eval test-$(p): $(OUT)/$(p)/$(p) $(NATIVE_LIB) ; programs/$(p)/test.sh $(OUT)/$(p)/$(p) $(OUT)/test/$(p)))
-
-test-programs: $(foreach p,$(TESTED_PROGRAMS),test-$(p))
-
-test: test-tools test-cpp test-programs
-
-# Web-check tools: host programs a web test runs on what a web run wrote, where its checks are C++
-# (e.g. render_test's readbacks, checked by the native program's checks). Each
+# Web-check tools: host programs a test runs on what a run wrote, where its checks are C++: a web
+# run's (e.g. render_test's readbacks, checked by the native program's checks), or either
+# backend's (splat_view's accum, against the closed-form oracle). Each
 # programs/<name>/web-check/<tool>.cpp (tool names unique across programs) is built like a C++ test
 # into build/web-check/<tool>, including its generated <tool>.zgal.h when a <tool>.zgal is beside
 # it, and with the program's headers and tests/oracle's as prerequisites.
@@ -137,6 +128,17 @@ $(call WEB_CHECK_TOOL,$(1)): $(1) $(wildcard $(dir $(1))*.h $(dir $(1))../*.h te
 		$(if $(wildcard $(1:.cpp=.zgal)),-I$(OUT)/web-check/gen/$(basename $(notdir $(1))))
 endef
 $(foreach s,$(WEB_CHECK_SOURCES),$(eval $(call web-check-rule,$(s))))
+
+# Program tests: programs/<name>/test.sh, run from the repository's root as
+# test.sh <binary> <output dir> <web-check dir>, runs the program headless with --validation, after
+# its web-check tools (which some native tests run too)
+TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test.sh),$(p)))
+
+$(foreach p,$(TESTED_PROGRAMS),$(eval test-$(p): $(OUT)/$(p)/$(p) $(call web-check-tools,$(p)) $(NATIVE_LIB) ; programs/$(p)/test.sh $(OUT)/$(p)/$(p) $(OUT)/test/$(p) $(OUT)/web-check))
+
+test-programs: $(foreach p,$(TESTED_PROGRAMS),test-$(p))
+
+test: test-tools test-cpp test-programs
 
 # Web tests: programs/<name>/test-web.sh, run as test-web.sh <main.js> <output dir> <web-check
 # dir> under Node, after its program's web build and its web-check tools

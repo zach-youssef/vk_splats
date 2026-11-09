@@ -13,7 +13,9 @@
 ;; before it has a camera. --inspect also reads back accum, counts and the DrawCommand and checks,
 ;; on the last frame, that the image is Encode's of accum (encodeAccum), within a unit of rounding,
 ;; and that every splat was decoded (base and SH), sorted and drawn: each count is --splat-count.
-;; The newest readbacks may be of different frames, so this holds for a still camera only.
+;; The newest readbacks may be of different frames, so this holds for a still camera only. Once
+;; those pass, it writes accum's readback to the file $SPLAT_VIEW_ACCUM names, if set (an extern
+;; can't take a path option), for web-check/view_oracle_check's closed-form oracle (test.sh).
 
 (import "../../lib/view_graph.zgal")
 (import "../../lib/view_camera.zgal")
@@ -54,6 +56,9 @@
   (parameter inspect bool)
   ;; Exits the program with status 1
   (extern (fail) : void)
+  ;; Writes accum's readback (rgba16f pixels as r | g << 16, b | a << 16, row by row) to the file
+  ;; $SPLAT_VIEW_ACCUM names, if set
+  (extern (saveAccum [accum : (data uvec2)]) : void)
   (state
    (headerReady bool #f)   ; the header has been read back and passed the checks
    (shDegree uint 0)       ; the header's
@@ -153,7 +158,7 @@
                 (print! "splat_view: inspect: " covered " of " pixels " pixels covered, the image within "
                         worst " of Encode's")
                 (if (and (<= worst (uint 1)) (> covered (uint 0)))
-                    (begin (print! "splat_view: passed") state)
+                    (begin (saveAccum state.accum) (print! "splat_view: passed") state)
                     (begin (print! "splat_view: FAILED, the image isn't Encode's of accum") (fail) state)))]))]
         [else state])))
   (run ViewGraph (streamFile streamFile) (splatCount splatCount) (streamBytes streamBytes)

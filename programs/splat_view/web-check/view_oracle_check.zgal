@@ -1,0 +1,3 @@
+;; The scene's structs (Splat, Camera) for view_oracle_check.cpp (its generated
+;; view_oracle_check.zgal.h, namespace view_oracle_check).
+(import "../../../lib/splat_math.zgal")

@@ -1,5 +1,5 @@
 #!/bin/sh
-# grad_test with validation: test.sh <binary> <output dir> [<web-check dir>].
+# grad_test with validation: test.sh <binary> <output dir> <web-check dir>.
 #   - S1's gradient variant against the closed-form oracle, with the L2 loss and the L1;
 #   - by finite differences on the GPU (L2 against a smooth pattern; --samples fields of each kind
 #     on S3), where the oracle can't reach: S2's cameras (cam_1 80x48, at its targets' offset 4096);
@@ -30,7 +30,7 @@
 set -eu
 binary=$1
 out=$2
-checks=${3:-}
+checks=$3
 python=${PYTHON:-python3}
 here=$(dirname "$0")
 
@@ -43,7 +43,6 @@ mkdir -p "$out"
 web=
 case $binary in *.js)
     web=1
-    [ -n "$checks" ] || { echo "grad_test: test.sh needs the web-check directory for a web build" >&2; exit 2; }
     ;;
 esac
 

@@ -653,6 +653,25 @@ largest difference. It renders the header's camera without
 `--cameras` and from a one-camera file of the header's bytes 32 to 144, which must capture the
 same PNG, and a wrong `--splat-count` must be refused.
 
+Then the closed-form oracle (`tests/oracle/closed_form.h`), the viewer's S1 check: S1's `faint`
+(one anisotropic splat off the axis, three cameras rotated about z) and `faint-overlap` (three
+overlapping splats stored out of depth order, on the non-square off-centre camera) as full-preset
+(f32) streams, every camera at its size with `--inspect`. Once the inspect checks pass, the app
+writes the `accum` readback to the file `$SPLAT_VIEW_ACCUM` names (the `saveAccum` extern: an
+extern can't take a path option), and the host tool `build/web-check/view_oracle_check`
+(`programs/splat_view/web-check/`, also run by the native test) compares every pixel with the
+oracle over a black background (`accum` has none): rgb with Σ c·α·T and a with 1 − T, within
+2e-3. The fixtures keep the oracle exact for the viewer, which the tool checks: opacity below 0.35,
+so α at 3σ (o·e^−4.5) is below 1/255 and the 3σ quad leaves out nothing the oracle (which has no
+cutoff) blends; and at most 3 splats blended at a pixel, so T stays far above Rasterize's stop,
+which the viewer lacks. The tolerance is the halves' rounding, (2·blends + 1)·2⁻¹² (each blend
+rounds the fragment's output and the result), plus the GPU's exp; a pixel with an α within 1e-3
+(relative) of 1/255 is borderline, its tolerance widened by what the flip changes. Measured within
+4.5e-4 (colour) and 7.7e-4 (1 − T), MoltenVK. A copy of an `accum` with one pixel's red moved by
+4e-3 must fail the tool. Mutants of the viewer graph it catches: sorting front to back
+(`faint-overlap`), the pixel corner instead of its centre, the quad at half the 3σ radius, and
+the opacity scaled by 0.99.
+
 ## splat_train
 
 `programs/splat_train` runs `TrainGraph` (with `train`) headless, one Adam iteration a frame, for
