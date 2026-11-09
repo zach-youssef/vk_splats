@@ -203,6 +203,25 @@ S1_VARIANTS: Dict[str, S1Variant] = {
                         on_axis(4.5, 0.42, 0.5, 0.2, theta=2.0, opacity=4.2, dc=(0.5, 0.5, 1.0)),
                         on_axis(6.0, 0.6, 0.6, 0.2, opacity=1.0, dc=(0.5, 0.5, -0.5))],
                        background=(0.1, 0.2, 0.3), note="the stop at T < 1e-4 near the centre"),
+    # Not a C++ test's setup: faint splats (opacity below 0.35, so alpha at 3 sigma is below 1/255)
+    # for splat_view's oracle (programs/splat_view/test.sh), where the viewer's 3-sigma quad then
+    # drops nothing the oracle blends, and nothing reaches the 0.99 clamp or the 1e-4 stop. One
+    # anisotropic splat off the axis seen by rotated cameras (sigmoid(-0.7) = 0.332) ...
+    "faint": S1Variant(50.0, 33, 33,
+                       [OracleSplat(0.3, -0.2, 4.0, (0.3, 0.08, 0.15), theta=0.7, opacity_logit=-0.7,
+                                    dc=(1.0, 0.5, -0.5))],
+                       phis=(0.0, 0.4, -1.1), note="opacity 0.332: the 3-sigma quad drops nothing"),
+    # ... and three overlapping ones on the off-centre camera (non-square, principal point off the
+    # centre), stored middle, front, back, so the viewer's back-to-front sort must reorder them
+    "faint-overlap": S1Variant(50.0, 48, 32,
+                               [OracleSplat(0.1, 0.05, 5.0, (0.4, 0.25, 0.2), theta=0.5, opacity_logit=-0.8,
+                                            dc=(1.2, -0.4, 0.3)),
+                                OracleSplat(-0.2, 0.1, 3.0, (0.2, 0.15, 0.2), theta=-0.3, opacity_logit=-1.0,
+                                            dc=(-0.5, 1.0, 0.8)),
+                                OracleSplat(0.3, -0.1, 7.0, (0.6, 0.4, 0.3), theta=1.2, opacity_logit=-0.7,
+                                            dc=(0.6, 0.6, -1.0))],
+                               background=(0.1, 0.2, 0.3), principal_offset=(-3.0, -3.5),
+                               note="three faint splats overlapping, stored out of depth order"),
 }
 
 

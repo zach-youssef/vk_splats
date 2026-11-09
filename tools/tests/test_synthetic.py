@@ -85,7 +85,7 @@ def test_s1_writes_every_variant(s1):
 
 # The numbers of tests/cpp/closed_form_test.cpp's setups, written out again so a change on either
 # side shows: (f, width, height, splats as (x, y, z, scales, theta, opacity logit, dc), background,
-# target, camera rotations phi), and off-centre's and stack's, which no C++ test has
+# target, camera rotations phi), and off-centre's, stack's and the faint ones', which no C++ test has
 EXPECTED_S1 = {
     "isotropic": (50, 33, 33, [(0, 0, 4, (0.2, 0.2, 0.2), 0.3, 0, (1, 0, -1))], (0, 0, 0), None, [0]),
     "anisotropic": (50, 33, 33, [(0, 0, 4, (0.3, 0.1, 0.5), 0, 0, (1, 0, -1))], (0, 0, 0), None, [0]),
@@ -112,9 +112,15 @@ EXPECTED_S1 = {
                            (0, 0, 4, (0.45, 0.38, 0.2), 1.0, 4.2, (0, -1, 1)),
                            (0, 0, 4.5, (0.42, 0.5, 0.2), 2.0, 4.2, (0.5, 0.5, 1)),
                            (0, 0, 6, (0.6, 0.6, 0.2), 0, 1, (0.5, 0.5, -0.5))], (0.1, 0.2, 0.3), None, [0]),
+    "faint": (50, 33, 33, [(0.3, -0.2, 4, (0.3, 0.08, 0.15), 0.7, -0.7, (1, 0.5, -0.5))], (0, 0, 0), None,
+              [0, 0.4, -1.1]),
+    "faint-overlap": (50, 48, 32, [(0.1, 0.05, 5, (0.4, 0.25, 0.2), 0.5, -0.8, (1.2, -0.4, 0.3)),
+                                   (-0.2, 0.1, 3, (0.2, 0.15, 0.2), -0.3, -1.0, (-0.5, 1, 0.8)),
+                                   (0.3, -0.1, 7, (0.6, 0.4, 0.3), 1.2, -0.7, (0.6, 0.6, -1))], (0.1, 0.2, 0.3),
+                      None, [0]),
 }
 # The principal point's offset from the image centre (dcx, dcy); (0, 0) for the others
-PRINCIPAL_OFFSETS = {"off-centre": (-3.0, -3.5)}
+PRINCIPAL_OFFSETS = {"off-centre": (-3.0, -3.5), "faint-overlap": (-3.0, -3.5)}
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED_S1))
@@ -152,6 +158,17 @@ def test_s1_variant_matches_the_oracle_test_setup(s1, name):
         c, s = math.cos(phi), math.sin(phi)
         np.testing.assert_allclose(m[:3, :3], [[c, -s, 0], [s, c, 0], [0, 0, 1]], atol=1e-7)
         np.testing.assert_array_equal(m[:3, 3], 0)
+
+
+@pytest.mark.parametrize("name", ["faint", "faint-overlap"])
+def test_s1_faint_variants_stay_in_the_view_oracles_bounds(name):
+    # splat_view's oracle (view_oracle_check.cpp): opacity below 0.35, so alpha at 3 sigma
+    # (o e^-4.5) is below 1/255, and at most 3 splats
+    v = ms.S1_VARIANTS[name]
+    assert 1 <= len(v.splats) <= 3
+    for s in v.splats:
+        o = 1.0 / (1.0 + math.exp(-s.opacity_logit))
+        assert o < 0.35 and o * math.exp(-4.5) < 1.0 / 255.0
 
 
 def test_s1_rotated_camera_sees_world_to_camera_about_z(s1):
