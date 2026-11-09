@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""psnr.py <capture.png> <golden.png> <minimum dB>: prints the PSNR of a capture's RGB against a
-golden's (8-bit, peak 255) and exits 1 when they differ in size or the PSNR is below the minimum.
-Identical images print inf. Needs numpy and Pillow (tools/requirements.txt)."""
+"""psnr.py <capture.png> <golden.png> <minimum dB> [<largest difference>]: prints the PSNR of a
+capture's RGB against a golden's (8-bit, peak 255) and its largest difference in any channel, and
+exits 1 when they differ in size, the PSNR is below the minimum or, when given, the largest
+difference (in 1/255 units) is above that. The PSNR alone misses a single wrong splat; the largest
+difference catches it. Identical images print inf. Needs numpy and Pillow (tools/requirements.txt)."""
 
 import math
 import sys
@@ -16,9 +18,10 @@ def rgb(path):
 
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         sys.exit(__doc__)
     capture, golden, minimum = rgb(sys.argv[1]), rgb(sys.argv[2]), float(sys.argv[3])
+    largest = int(sys.argv[4]) if len(sys.argv) == 5 else None
     if capture.shape != golden.shape:
         print(f"psnr: {sys.argv[1]} is {capture.shape[1]}x{capture.shape[0]}, the golden "
               f"{golden.shape[1]}x{golden.shape[0]}")
@@ -29,6 +32,9 @@ def main():
     print(f"psnr: {sys.argv[1]}: {psnr:.2f} dB against {sys.argv[2]} (largest difference {worst}/255)")
     if psnr < minimum:
         print(f"psnr: FAILED, below {minimum} dB")
+        sys.exit(1)
+    if largest is not None and worst > largest:
+        print(f"psnr: FAILED, a difference above {largest}/255")
         sys.exit(1)
 
 

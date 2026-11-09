@@ -1,0 +1,209 @@
+;; The viewer graph (docs/architecture.md, "View graph"): a scene.stream decoded on the GPU
+;; (lib/splat_stream.zgal's PlanDecode, DecodeBase and DecodeSh), then per frame, for the app's
+;; camera (a uniform: lib/view_camera.zgal's fitCamera of a start camera):
+;;   1. Project: projectSplat (lib/splat_math.zgal) per decoded splat, a back-to-front sort key and
+;;      the splat's index, and the splat draw's DrawCommand;
+;;   2. a sort of the keys, moving the indices with them: far splats first, culled ones last;
+;;   3. a draw of a quad per sorted splat (its 3-sigma square; a culled splat's collapsed to a
+;;      point), each fragment blending Rasterize's Gaussian (Eq. 3's alpha, with alphaMin and
+;;      alphaMax) back to front, premultiplied, into `accum` (rgba16f): sum c alpha T and 1 - T;
+;;   4. Encode: accum over the background, clamped, into `rendered` (rgba8), which the capture
+;;      reads and, with a window, Present (lib/present.zgal) draws on the surface.
+;; Unlike the tile renderer (lib/render_graph.zgal) it has no tiles, entries or capacity. Back to
+;; front it can't stop at Rasterize's transmittanceMin, so it blends every splat whose alpha passes,
+;; and it blends a splat only inside its 3-sigma square, where Rasterize blends the whole of the
+;; tiles the square meets: docs/paper-conformance.md's departures 18 and 19, each at most about
+;; 3/255 at a pixel per unit of colour difference. Programs import it, (import "../../lib/view_graph.zgal").
+;;
+;; The decode's buffers, Project's outputs, the sort's and the DrawCommand are #:frames shared: the
+;; decode is incremental (each record decoded once), and the rest is a cache that outlives the frame
+;; computing it, so an app may disable Project and the sort (a still camera, or before it has a
+;; camera) and every frame slot draws the same order. Only the images are per frame.
+
+(import indirect)
+(import sorting)
+(import "splat_math.zgal")
+(import "splat_stream.zgal")
+(import "present.zgal")  ; Present: the image on a window
+
+;; ---------------------------------------------------------------------------------------------
+;; Constants
+;; ---------------------------------------------------------------------------------------------
+;; `counts`' element past the decode's (decodeCountsSize): the splats Project keyed, the sort's
+;; count and the draw's instances
+(define viewProjected (uint 7))
+(define viewCountsSize (uint 8))  ; the elements (the graph says 8: it can't use this)
+
+;; A culled splat's key: above every visible one's, so the sort puts it last
+(define culledKey (uint #xFFFFFFFF))
+
+;; The key of a splat at a depth: descending depth, so the sort's ascending order is back to front.
+;; A visible splat's depth is above near > 0, so its floatSortKey is at least 2^31 and its key below
+;; 2^31: never culledKey. Equal keys draw in index order, the lower index behind (Rasterize puts it
+;; in front): exact float ties are negligible.
+(define (backToFrontKey [depth : float]) : uint
+  (bitnot (floatSortKey depth)))
+
+;; Encode's result: accum (premultiplied, alpha = 1 - T) over the background, clamped, opaque.
+;; The app's --inspect check computes it too.
+(define (encodeAccum [accum : vec4] [background : vec3]) : vec4
+  (vec4 (clamp (+ accum.rgb (* (- 1.0 accum.a) background)) (vec3 0.0) (vec3 1.0)) 1.0))
+
+;; ---------------------------------------------------------------------------------------------
+;; Kernels and materials
+;; ---------------------------------------------------------------------------------------------
+;; 1. Each decoded splat ([0, counts[decodeBaseDecoded])) as the camera sees it, its key and its
+;; index; invocation 0 also writes the sorted count and the DrawCommand (6 vertices, an instance a
+;; splat), so the draw always covers what the sort sorted. Dispatched over the working buffer's
+;; capacity (at most streamMaxSplats: 8739 workgroups, within every device's limit); the invocations
+;; past the decoded splats do nothing. shDegree is the stream header's (the app gives it, which
+;; keeps the bindings at 7 of WebGPU's 8).
+(compute-material Project
+  (workgroup 64)
+  (bindings
+   (splats (buffer-array Splat read))
+   (camera (buffer Camera))
+   (counts (buffer-array uint read-write))
+   (projected (buffer-array Projected write))
+   (keys (buffer-array uint write))
+   (indices (buffer-array uint write))
+   (draws (buffer-array DrawCommand write)))
+  (push (near float) (shDegree uint))
+  (compute
+   (let* ([decoded (at counts decodeBaseDecoded)]
+          [i globalInvocationId.x])
+     (when (= i (uint 0))
+       (write! (at counts viewProjected) decoded)
+       (write! (at draws 0) (DrawCommand 6 decoded 0 0)))
+     (when (< i decoded)
+       (let* ([p (projectSplat (at splats i) camera near shDegree)])
+         (write! (at projected i) p)
+         (write! (at keys i) (if (= p.tileCount (uint 0)) culledKey (backToFrontKey p.depth)))
+         (write! (at indices i) i))))))
+
+;; 3. The sorted splat instanceIndex as a quad (two triangles: a strip would need primitive restart
+;; off, which MoltenVK can't do and validation reports; drawn with #:cull none, as either winding
+;; is a splat): the square of its 3-sigma radius
+;; around its mean, in pixels, collapsed to a point outside the view when it's culled (its key,
+;; or a zero radius), so it draws nothing. Pixels are COLMAP's (y down), as is Vulkan's clip space
+;; (the WGSL flips y itself). Each fragment blends the splat as Rasterize does at its pixel centre:
+;; the same power and alpha, skipped when power > 0 or alpha < alphaMin, premultiplied.
+(graphics-material SplatQuad
+  (bindings
+   (projected (buffer-array Projected read))
+   (keys (buffer-array uint read))
+   (indices (buffer-array uint read))
+   (camera (buffer Camera)))
+  (varyings (mean vec2 flat) (conic vec3 flat) (opacity float flat) (colour vec3 flat))
+  (outputs (color vec4))
+  (vertex
+   (let* ([i (uint instanceIndex)]
+          [p (at projected (at indices i))]
+          [corner (at (array vec2 (vec2 -1.0 -1.0) (vec2 1.0 -1.0) (vec2 -1.0 1.0)
+                             (vec2 -1.0 1.0) (vec2 1.0 -1.0) (vec2 1.0 1.0))
+                      vertexIndex)]
+          [pixel (+ p.mean (* corner (float p.radius)))]
+          [clip (- (* (/ pixel (vec2 camera.size)) 2.0) 1.0)]
+          [hidden (or (= (at keys i) culledKey) (= p.radius (uint 0)))])
+     (results #:position (if hidden (vec4 2.0 2.0 0.0 1.0) (vec4 clip 0.0 1.0))
+              #:mean p.mean #:conic p.conic #:opacity p.opacity #:colour p.colour)))
+  (fragment
+   (let* ([d (- mean (.xy fragCoord))]
+          [power (- (* -0.5 (+ (* conic.x d.x d.x) (* conic.z d.y d.y))) (* conic.y d.x d.y))]
+          [alpha (min alphaMax (* opacity (exp power)))])
+     (when (or (> power 0.0) (< alpha alphaMin))
+       (discard!))
+     (vec4 (* colour alpha) alpha))))
+
+;; 4. accum over the background (encodeAccum), a fragment a pixel: a triangle covering the target
+(graphics-material Encode
+  (bindings
+   (accum texture)
+   (accumSampler sampler))
+  (push (background vec3))
+  (outputs (color vec4))
+  (vertex
+   (let* ([corner (vec2 (bitand vertexIndex 2) (bitand (shl vertexIndex 1) 2))])
+     (results #:position (vec4 (- (* corner 2.0) 1.0) 0.0 1.0))))
+  (fragment
+   (encodeAccum (fetch accum accumSampler (ivec2 (.xy fragCoord)) 0) background)))
+
+;; ---------------------------------------------------------------------------------------------
+;; The graph
+;; ---------------------------------------------------------------------------------------------
+(graph ViewGraph
+  ;; The stream: streamFile, of streamBytes bytes (a multiple of 4: the stream format's), holding
+  ;; splatCount splats (the working buffer's capacity, at most streamMaxSplats). The decode trusts
+  ;; streamBytes to be at most the file's size.
+  (parameter splatCount uint)
+  (parameter streamBytes uint)
+  (input streamFile path)
+  ;; The start cameras: cameraFile when hasCameras (otherwise the stream header's camera)
+  (parameter hasCameras bool)
+  (input cameraFile path)
+  ;; The camera to draw from, each frame (fitCamera), its size the surface's
+  (input cameraInput (per-frame Camera))
+  ;; Splats at most `near` from the camera are culled; shDegree is the header's (the app's, once
+  ;; it has read the header back)
+  (parameter near float)
+  (input shDegree (per-frame uint))
+  ;; The colour behind the splats (per frame: a graph parameter can't be a vec3)
+  (input background (per-frame vec3))
+  ;; Whether the graph draws the image on the surface (a program with a window), whether it reads
+  ;; the image back (a capture), and whether it also reads back accum, counts and the DrawCommand
+  ;; (for tests)
+  (parameter window bool)
+  (parameter capture bool)
+  (parameter inspect bool)
+
+  (buffer-file stream uint streamFile)
+  (buffer-file cameras Camera cameraFile #:when hasCameras)
+  (uniform camera Camera cameraInput)
+  ;; The decode's (lib/splat_stream.zgal), then Project's and the sort's
+  (buffer splats Splat splatCount #:frames shared)
+  (buffer header StreamHeader 1 #:frames shared)
+  (buffer counts uint 8 #:frames shared)  ; decodeCountsSize, then viewProjected: viewCountsSize
+  (buffer commands DispatchCommand 2 #:frames shared)  ; decodeBaseCommand, decodeShCommand
+  (buffer projected Projected splatCount #:frames shared)
+  (buffer keys uint splatCount #:frames shared)
+  (buffer indices uint splatCount #:frames shared)
+  (buffer draws DrawCommand 1 #:frames shared)
+  (image accum rgba16f (surface 1.0) #:frames per-frame)
+  (image rendered rgba8 (surface 1.0) #:frames per-frame)
+  (sampler nearest #:filter nearest #:address clamp-to-edge)
+  ;; Each frame clears accum: images aren't zeroed, and before Project first runs the
+  ;; DrawCommand is still zero (nothing is drawn)
+  (target accumTarget (color accum #:clear (0.0 0.0 0.0 0.0)))
+  (target renderedTarget (color rendered))
+  (target screen (surface #:clear (0.0 0.0 0.0 1.0) #:depth none) #:when window)
+
+  (material planning PlanDecode stream header counts commands
+            #:push ((arrived streamBytes) (capacity splatCount)) #:invocations (1))
+  (material decodingBase DecodeBase stream header counts splats)
+  (material decodingSh DecodeSh stream header counts splats)
+  (material projecting Project splats camera counts projected keys indices draws
+            #:push ((near near) (shDegree shDegree)) #:invocations (splatCount))
+  (material quads SplatQuad projected keys indices camera
+            #:blend premultiplied-alpha #:topology triangle-list #:cull none)
+  (material encoding Encode (accum accum) (accumSampler nearest) #:push ((background background)))
+  (material presenting Present (picture rendered) (pictureSampler nearest)
+            #:push ((scale (vec2 1.0 1.0))) #:when window)
+
+  (dispatch plan planning)
+  (dispatch decodeBase decodingBase #:indirect (at commands 0))
+  (dispatch decodeSh decodingSh #:indirect (at commands 1))
+  (dispatch project projecting)
+  (sort sortSplats keys #:values indices #:count (at counts 7))  ; viewProjected
+  (draw drawSplats accumTarget quads #:indirect (at draws 0))
+  (draw encode renderedTarget encoding 3)
+  (draw present screen presenting 6 #:when window)
+
+  ;; The header PlanDecode copied out (in the first frame: the whole stream is there), for the
+  ;; app's checks, its camera and its SH degree, and the start cameras
+  (readback readHeader header #:once #t)
+  (readback readCameras cameras #:once #t #:when hasCameras)
+  ;; The image, for a capture, and what tests check: accum, and the splats decoded, sorted and drawn
+  (readback readRendered rendered #:when (or capture inspect))
+  (readback readAccum accum #:when inspect)
+  (readback readCounts counts #:when inspect)
+  (readback readDraws draws #:when inspect))

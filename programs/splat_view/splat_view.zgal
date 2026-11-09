@@ -1,0 +1,186 @@
+;; splat_view: the viewer (lib/view_graph.zgal's ViewGraph) on a scene.stream (docs/data-format.md,
+;; "Stream"), in a window or headless (--frames N), writing the last frame to a PNG (--capture FILE).
+;; It loads the stream whole and decodes it on the GPU; ZGAL can't read a file's header or size, so
+;; tools/scene_args.py --view prints the arguments for a stream:
+;;
+;;     build/splat_view/splat_view $(tools/scene_args.py --view <scene.stream>) [more arguments]
+;;
+;; The camera starts as the stream header's, or --camera k of --cameras FILE (a cameras.bin), fitted
+;; to the window or --size (lib/view_camera.zgal's fitCamera: with the start camera's size it's the
+;; start camera exactly). Until the header has been read back (a few frames) nothing is drawn.
+;; The app checks the header as the decode does (checkStreamHeader) and against --splat-count and
+;; --stream-bytes, and fails (exit 1) on a mismatch, a missing camera or when the frames run out
+;; before it has a camera. --inspect also reads back accum, counts and the DrawCommand and checks,
+;; on the last frame, that the image is Encode's of accum (encodeAccum), within a unit of rounding,
+;; and that every splat was decoded (base and SH), sorted and drawn: each count is --splat-count.
+;; The newest readbacks may be of different frames, so this holds for a still camera only.
+
+(import "../../lib/view_graph.zgal")
+(import "../../lib/view_camera.zgal")
+
+;; The camera before the app has one (nothing is drawn with it: Project is off)
+(define (placeholderCamera) : Camera
+  (Camera (mat4 1.0) (vec4 1.0 1.0 0.5 0.5) (vec3 0.0) (uint 0) (uvec2 1 1) (uint 0) (uint 0)))
+
+;; An rgba8 readback pixel's channel c (a uint, r in the low byte)
+(define (byteChannel [pixel : uint] [c : uint]) : uint
+  (bitand (shr pixel (* c (uint 8))) (uint 255)))
+
+;; An rgba16f readback pixel (r | g << 16, b | a << 16) as a vec4
+(define (halfPixel [pixel : uvec2]) : vec4
+  (vec4 (decodeHalf (bitand pixel.x (uint 65535))) (decodeHalf (shr pixel.x (uint 16)))
+        (decodeHalf (bitand pixel.y (uint 65535))) (decodeHalf (shr pixel.y (uint 16)))))
+
+;; The largest difference, over a pixel's colour channels, between the image's bytes and Encode's
+;; result for the accum pixel (rounded to bytes)
+(define (encodeError [accum : uvec2] [image : uint] [background : vec3]) : uint
+  (let* ([expected (encodeAccum (halfPixel accum) background)])
+    (fold ([worst (uint 0)]) ([c (range (uint 0) (uint 3))])
+      (let* ([want (uint (+ (* (at expected c) 255.0) 0.5))]
+             [got (byteChannel image c)])
+        (max worst (if (> want got) (- want got) (- got want)))))))
+
+(app SplatView
+  (parameter streamFile path)
+  (parameter splatCount uint)
+  (parameter countGiven bool)
+  (parameter streamBytes uint)
+  (parameter bytesGiven bool)
+  (parameter cameraFile path)
+  (parameter hasCameras bool)
+  (parameter cameraIndex uint)
+  (parameter near float)
+  (parameter background float)
+  (parameter inspect bool)
+  ;; Exits the program with status 1
+  (extern (fail) : void)
+  (state
+   (headerReady bool #f)   ; the header has been read back and passed the checks
+   (shDegree uint 0)       ; the header's
+   (cameraReady bool #f)   ; the start camera is known
+   (start Camera (placeholderCamera))
+   (readyFrame uint 0)     ; the frame both became ready in
+   (failed bool #f)
+   ;; --inspect: the newest readbacks and the frames they were handled in
+   (accum (data uvec2) (empty-data uvec2))
+   (accumFrame uint 0)
+   (image (data uint) (empty-data uint))
+   (imageFrame uint 0)
+   (counts (data uint) (empty-data uint))
+   (countsFrame uint 0)
+   (draws (data DrawCommand) (empty-data DrawCommand))
+   (drawsFrame uint 0))
+  (on (key-pressed escape) (quit!))
+  (on (read readHeader d)
+    (let* ([h (at d 0)]
+           [code (checkStreamHeader h)]
+           [expectedBytes (+ h.shOffset (* splatCount h.shStride))])
+      (cond
+        [(not= code streamOk)
+         (begin (print! "splat_view: FAILED, the stream's header is refused, code " code) (fail) state)]
+        [(not= h.splatCount splatCount)
+         (begin (print! "splat_view: FAILED, the stream holds " h.splatCount " splats, not --splat-count's "
+                        splatCount)
+                (fail) state)]
+        [(not= expectedBytes streamBytes)
+         (begin (print! "splat_view: FAILED, the stream's records end at " expectedBytes
+                        " bytes, not --stream-bytes' " streamBytes)
+                (fail) state)]
+        [else
+         (let* ([cameraReady (or state.cameraReady (not hasCameras))])
+           (print! "splat_view: " splatCount " splats at SH degree " h.shDegree)
+           (with state #:headerReady #t #:shDegree h.shDegree #:cameraReady cameraReady
+                 #:start (if hasCameras state.start h.camera) #:readyFrame frameNumber))])))
+  (on (read readCameras d)
+    (if (< cameraIndex (count d))
+        (with state #:cameraReady #t #:start (at d cameraIndex) #:readyFrame frameNumber)
+        (begin (print! "splat_view: FAILED, --camera " cameraIndex " but --cameras holds " (count d))
+               (fail) state)))
+  (on (read readAccum d) (with state #:accum d #:accumFrame frameNumber))
+  (on (read readCounts d) (with state #:counts d #:countsFrame frameNumber))
+  (on (read readDraws d) (with state #:draws d #:drawsFrame frameNumber))
+  (on (read readRendered d) (if inspect (with state #:image d #:imageFrame frameNumber) state))
+  (on (frame dt)
+    (let* ([ready (and state.headerReady state.cameraReady)]
+           [last (and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))])
+      (cond
+        [(not (and countGiven bytesGiven))
+         (begin (print! "splat_view: FAILED, --splat-count and --stream-bytes are required "
+                        "(tools/scene_args.py --view prints them)")
+                (fail) state)]
+        [(< streamBytes streamHeaderSize)
+         (begin (print! "splat_view: FAILED, --stream-bytes is below the header's " streamHeaderSize " bytes")
+                (fail) state)]
+        [(and last (not ready))
+         (begin (print! "splat_view: FAILED, " frameLimit " frames weren't enough to read the header back")
+                (fail) state)]
+        [(and last inspect)
+         ;; A readback handled in frame f is of a frame after f - framesInFlight - 2, so both must
+         ;; be of frames that drew with the camera (from readyFrame + 1)
+         (let* ([settled (+ state.readyFrame framesInFlight (uint 3))]
+                [pixels (count state.image)])
+           (cond
+             [(or (< state.accumFrame settled) (< state.imageFrame settled) (< state.countsFrame settled)
+                  (< state.drawsFrame settled))
+              (begin (print! "splat_view: FAILED, too few frames for --inspect's readbacks (accum handled in frame "
+                             state.accumFrame ", the image in " state.imageFrame ", counts in " state.countsFrame
+                             ", the DrawCommand in " state.drawsFrame ", ready in " state.readyFrame ")")
+                     (fail) state)]
+             [(or (< (count state.counts) viewCountsSize) (= (count state.draws) (uint 0)))
+              (begin (print! "splat_view: FAILED, --inspect's readbacks hold " (count state.counts) " counts and "
+                             (count state.draws) " DrawCommands")
+                     (fail) state)]
+             [(not (and (= (at state.counts decodeBaseDecoded) splatCount)
+                        (= (at state.counts decodeShDecoded) splatCount)
+                        (= (at state.counts viewProjected) splatCount)
+                        (= (.instanceCount (at state.draws 0)) splatCount)
+                        (= (.vertexCount (at state.draws 0)) (uint 6))))
+              (begin (print! "splat_view: FAILED, not every splat drawn: " (at state.counts decodeBaseDecoded)
+                             " base and " (at state.counts decodeShDecoded) " SH records decoded, "
+                             (at state.counts viewProjected) " sorted, " (.instanceCount (at state.draws 0))
+                             " instances of " (.vertexCount (at state.draws 0)) " vertices drawn, of "
+                             splatCount " splats")
+                     (fail) state)]
+             [(or (= pixels (uint 0)) (not= (count state.accum) pixels))
+              (begin (print! "splat_view: FAILED, --inspect's readbacks hold " (count state.accum) " and " pixels
+                             " pixels")
+                     (fail) state)]
+             [else
+              (let* ([worst (fold ([acc (uint 0)]) ([i (range (uint 0) pixels)])
+                              (max acc (encodeError (at state.accum i) (at state.image i) (vec3 background))))]
+                     [covered (fold ([acc (uint 0)]) ([i (range (uint 0) pixels)])
+                                (if (> (.w (halfPixel (at state.accum i))) 0.0) (+ acc (uint 1)) acc))])
+                (print! "splat_view: inspect: " covered " of " pixels " pixels covered, the image within "
+                        worst " of Encode's")
+                (if (and (<= worst (uint 1)) (> covered (uint 0)))
+                    (begin (print! "splat_view: passed") state)
+                    (begin (print! "splat_view: FAILED, the image isn't Encode's of accum") (fail) state)))]))]
+        [else state])))
+  (run ViewGraph (streamFile streamFile) (splatCount splatCount) (streamBytes streamBytes)
+       (hasCameras hasCameras) (cameraFile cameraFile)
+       (cameraInput (if (and state.headerReady state.cameraReady (> surfaceSize.y 0.0))
+                        (fitCamera (viewPose) state.start (uvec2 surfaceSize))
+                        state.start))
+       (near near) (shDegree state.shDegree) (background (vec3 background))
+       (window (not headless)) (capture capture) (inspect inspect)
+       #:enabled ((project (and state.headerReady state.cameraReady (> surfaceSize.y 0.0)))
+                  (sortSplats (and state.headerReady state.cameraReady (> surfaceSize.y 0.0))))))
+
+(main SplatView
+  (about "Views a splat scene's stream, in a window or headless (--frames N, --capture FILE)")
+  (window "splat_view" 800 800)
+  (timestep #:max 0.1 #:fixed 0.016)
+  (capture readRendered)
+  (positional streamFile "the scene's stream (scene.stream)")
+  (option splatCount "--splat-count" "the splats in it (its header's; required)" #:default 1
+          #:range (1 559240) #:given countGiven)
+  (option streamBytes "--stream-bytes" "its size in bytes (required; at most the file's)" #:default 0
+          #:given bytesGiven)
+  (option cameraFile "--cameras" "a cameras.bin to start from (otherwise the stream header's camera)"
+          #:default "" #:given hasCameras)
+  (option cameraIndex "--camera" "the camera of --cameras to start from" #:default 0)
+  (option near "--near" "the near plane" #:default 0.2)
+  (option background "--background" "the background's grey level (0 black, 1 white)" #:default 0.0
+          #:range (0.0 1.0))
+  (flag inspect "--inspect" "also read back accum, the counts and the DrawCommand and check them and the image (tests)")
+  (controls "Controls:" "  escape  quit"))

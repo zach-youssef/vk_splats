@@ -44,6 +44,9 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | ZgalSortScatter | 6 | 1 | 0 | 8320 B with subgroups (2048 subgroup counts), 1152 B without (256 digits, 16 next, 16 bins) | 256 |
 | ZgalScan* / ZgalReduce* | at most 4 (3, and the count's buffer with a GPU `#:count`) | 1 | 0 | at most 260 B with subgroups; without, 1024 B (256 lanes), 1028 B for ZgalScanApply | 256 |
 | Present (vertex, fragment) | 0 | 1 | 0 (one sampled texture) | | |
+| Project | 7 (the camera `uniform` is a storage buffer on the web) | 1 | 0 | 0 | 64 |
+| SplatQuad (vertex, fragment) | 4 (vertex stage), 0 | 0 | 0 | | |
+| Encode (vertex, fragment) | 0 | 1 | 0 (one sampled `rgba16f` texture) | | |
 
 The largest buffers stay within `maxStorageBufferBindingSize` (128 MiB) and so within
 `maxBufferSize` (256 MiB): the rasterizer's `colours` at the programs' largest image, 2896² ×
@@ -89,6 +92,10 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 - **ssim_test**: every run of the native test; its checks are in the app.
 - **stream_test**: every run of the native test; its checks, `checkStreamHeader` among them, are
   in the app, so the web runs the TypeScript export.
+- **splat_view**: the native test (S3 against splat_render's goldens and full against web
+  preset, both at 50 dB and a largest difference of 8/255; the header's camera; a wrong
+  `--splat-count`) at the same bars; its checks are in the app. Dawn on Metal gave the same PSNRs
+  as MoltenVK.
 
 ## Training on the web
 

@@ -3,13 +3,16 @@
 
     build/splat_render/splat_render $(tools/scene_args.py <scene dir> <camera>) [more arguments]
     build/splat_train/splat_train $(tools/scene_args.py --train <scene dir>) [more arguments]
+    build/splat_view/splat_view $(tools/scene_args.py --view <scene.stream>) [more arguments]
 
 ZGAL programs can't read the manifest or join paths, so this does. For splat_render: the splat
 and camera files, the splat count, the SH degree and the camera's index and size; the camera is
 an index or a name from the manifest's cameras. For splat_train (--train): the splat, camera and
 image files, the splat and camera counts, the SH degree, the largest camera size among those with
 an image, the pixels the images hold (the file's size / 4) and the extent; the scene must have
-images, in one batch (images_0.bin), as splat_train reads one. Paths are printed as given
+images, in one batch (images_0.bin), as splat_train reads one. For splat_view (--view): the stream
+file, its splat count (the header's) and its size in bytes, which splat_view needs before it reads
+the stream (they size its buffers); splat_view checks the header itself. Paths are printed as given
 (relative to the current directory when the scene's is); a path with whitespace can't go through
 $(...) unquoted, so it is refused.
 
@@ -106,10 +109,25 @@ def train_args(scene: str) -> List[str]:
             "--target-pixels", str(pixels), "--extent", repr(float(manifest["extent"]))]
 
 
+# The stream header's splatCount: its third uint (lib/splat_stream.zgal's StreamHeader)
+STREAM_SPLAT_COUNT_OFFSET = 8
+
+
+def view_args(stream: str) -> List[str]:
+    with open(checked_path(stream), "rb") as f:
+        head = f.read(STREAM_SPLAT_COUNT_OFFSET + 4)
+    if len(head) < STREAM_SPLAT_COUNT_OFFSET + 4:
+        raise SystemExit(f"scene_args: {stream} is too short for a stream header")
+    count = struct.unpack_from("<I", head, STREAM_SPLAT_COUNT_OFFSET)[0]
+    return [stream, "--splat-count", str(count), "--stream-bytes", str(os.path.getsize(stream))]
+
+
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) == 2 and argv[0] == "--train":
         print(" ".join(train_args(argv[1])))
+    elif len(argv) == 2 and argv[0] == "--view":
+        print(" ".join(view_args(argv[1])))
     elif len(argv) == 2:
         print(" ".join(scene_args(argv[0], argv[1])))
     else:

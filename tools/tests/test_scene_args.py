@@ -1,4 +1,5 @@
-"""scene_args.py: splat_render's arguments from a scene's manifest."""
+"""scene_args.py: splat_render's and splat_train's arguments from a scene's manifest, splat_view's
+from a stream."""
 
 import json
 import os
@@ -6,9 +7,11 @@ import sys
 
 import pytest
 
+import convert
 import make_synthetic as ms
 import scene_args
 from conftest import REPO
+from stream_fixture import write_fixture
 
 
 @pytest.fixture(scope="module")
@@ -92,3 +95,20 @@ def test_train_args_checks_the_split(tmp_path):
     path.write_text(json.dumps(manifest))
     with pytest.raises(SystemExit, match="0 image batches"):  # past the split check
         scene_args.train_args(str(out))
+
+
+def test_view_args(tmp_path):
+    """--view: the stream, the header's splat count and the file's size; a short file is refused."""
+    write_fixture(str(tmp_path / "fixture"), 40, 7)
+    convert.main(["stream", str(tmp_path / "fixture" / "splats.bin"), str(tmp_path / "out"), "--config",
+                  os.path.join(REPO, "tools", "stream-configs", "web.json")])
+    path = str(tmp_path / "out" / "scene.stream")
+    args = scene_args.view_args(path)
+    assert args[0] == path
+    assert as_dict(args[1:]) == {"--splat-count": "40", "--stream-bytes": str(os.path.getsize(path))}
+    short = tmp_path / "short.stream"
+    short.write_bytes(b"SPLS\0\0\0\0")
+    with pytest.raises(SystemExit, match="too short"):
+        scene_args.view_args(str(short))
+    with pytest.raises(SystemExit, match="whitespace"):
+        scene_args.view_args(str(tmp_path / "a b.stream"))

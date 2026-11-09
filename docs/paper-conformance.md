@@ -186,6 +186,29 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     saves iteration t before its densification and reset, so what those do on the last iteration
     is never scored or written), but it steps Adam, which the reference's last iteration doesn't
     (`if iteration < opt.iterations`): the scored splats have had one more step, one of N.
+18. **The viewer has no early stop** (`lib/view_graph.zgal`): it blends back to front, so it can't
+    know where a pixel's front-to-back transmittance falls below `transmittanceMin` (1e-4), and it
+    blends every splat whose alpha passes. Rasterize, as the reference, leaves out the splat that
+    would take T below it and every splat after. It adds no visible artifact. The splats behind
+    that one are seen through T < 1e-4 together: under 0.03/255. The one larger term is the
+    crossing splat itself, which Rasterize leaves out (the background shows through its T) and
+    the viewer blends. T before it is below `transmittanceMin`/(1 − α) ≤ 0.01 (α ≤ `alphaMax`),
+    so the pixel changes by at most T·|colour − background|: up to 2.6/255 per unit of colour
+    difference in a channel (2.6/255 for colours in [0, 1]; `shColour` has no upper clamp, so a
+    brighter splat scales it, about 5/255 at colour 2), and over 1/255 only where the crossing
+    splat is almost opaque (α > 0.975). That is a single-pixel difference of a few levels at most,
+    not an edge or a band. On S3, Rasterize without the stop changes 9 of 16384
+    pixels (camera 0) and 13 of 15360 (camera 24), each by 1/255.
+19. **The viewer blends a splat only inside its 3σ square**: SplatQuad's quad is the square of the
+    splat's radius around its mean, the radius being 3σ along the larger axis, rounded up to
+    pixels. Rasterize evaluates every pixel of the tiles that square meets (departure 7), so it
+    also blends beyond the square wherever α passes `alphaMin`. It adds no visible artifact.
+    Beyond the square α ≤ opacity·e^−4.5 ≈ 0.011·opacity, so the viewer leaves out at most
+    0.011·T·|colour − behind| ≤ 2.8/255 a splat per unit of colour difference (it scales with a
+    colour above 1, as in departure 18), and nothing at an opacity below 0.353 (e^4.5/255; α under
+    `alphaMin`: why the viewer's closed-form fixtures keep o < 0.35). The reference's own
+    footprint is cut at its tile rectangle, a step of the same size at tile edges. On S3 (opacity
+    0.3-0.95), clipping Rasterize to the square changes no pixel.
 
 ## How correctness is checked
 

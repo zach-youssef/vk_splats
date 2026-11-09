@@ -7,6 +7,8 @@
   one needs no Makefile change ([building-and-testing.md](building-and-testing.md)).
   - `splat_render`: renders a camera of a scene in a window, or headless with a PNG capture
     ([below](#splat_render)).
+  - `splat_view`: the viewer, on a `scene.stream` decoded on the GPU, headless for now
+    ([below](#splat_view)).
   - `splat_train`: trains a scene's splats against its images, headless, scores the held-out
     views and writes an INRIA PLY ([below](#splat_train)).
   - `tile_test` and `render_test`: the render graph's GPU tests against the CPU and the
@@ -46,6 +48,10 @@
   - `view_camera.zgal`: the viewer's camera controls, a pose relative to a start camera turned
     by mouse deltas, moved by keys and fitted to the window's size ([below](#view-camera)); it
     imports `splat_math.zgal`.
+  - `view_graph.zgal`: `ViewGraph`, the viewer's graph: the stream decode, a per-splat
+    projection and back-to-front sort, a quad a splat blended into an rgba16f image, and its
+    encode and present ([below](#view-graph)); it imports `splat_math.zgal`,
+    `splat_stream.zgal` and `present.zgal`.
   - `native/`: header-only C++ that the data tools share with the programs, on top of the C++ ZGAL
     generates for those modules: the stream encoder (`stream_encoder.h`), the default camera it
     writes into the header (`default_camera.h`, [data-format.md](data-format.md#stream-files)) and
@@ -62,7 +68,8 @@
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
   programs' inputs, the synthetic scene generator (which also renders a scene's ground truth with
   splat_render), and `scene_args.py`, which prints splat_render's arguments for a scene and a
-  camera, or splat_train's (`--train`) for a scene with images.
+  camera, splat_train's (`--train`) for a scene with images, or splat_view's (`--view`) for a
+  `scene.stream`.
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`). The Python tests are in
   `tools/tests/`.
 - `colmap/`: the one real scene: `colmap_exports3`, a COLMAP text export (one SIMPLE_RADIAL
@@ -555,6 +562,92 @@ zero for the untouched pose (`viewPose`). Up is the start camera's −y (COLMAP:
 and random ones), the fit's scaling (square pixels, points at W′/2 + s·(u − W/2), the way back),
 the directions of looks and moves, their round trips, the yaw's wrap and the pitch's clamp, that
 the x axis stays level over thousands of random looks, and the speed's exact way back.
+
+## View graph
+
+`lib/view_graph.zgal`'s `ViewGraph` draws a `scene.stream` ([data-format.md](data-format.md#stream-files))
+from a camera the app gives each frame, as a `uniform` (`cameraInput`: `fitCamera` of a start
+camera, [above](#view-camera)). For now it loads the stream whole through `buffer-file`
+(`--stream-bytes` of it: the decode trusts that size). Each frame:
+
+1. The decode ([data-format.md](data-format.md#decode)): PlanDecode with `arrived` the whole
+   stream, then DecodeBase and DecodeSh, indirectly. With the stream all there, frame 0 decodes
+   every record and later frames none.
+2. `Project` over the working buffer's capacity (`splatCount`, at most 8,739 workgroups of 64),
+   doing work for i < `counts[decodeBaseDecoded]`: `projectSplat` with the header's SH degree (a
+   push constant the app reads back, which keeps Project at 7 storage buffers of the web's 8),
+   the key `bitnot(floatSortKey(depth))` (far first) or 0xFFFFFFFF when culled (a visible depth
+   is above near > 0, so its key is below 2³¹), and the index. Invocation 0 writes the sort's
+   count (`counts[viewProjected]`, 7) and the DrawCommand (6 vertices, an instance a decoded
+   splat), so the draw always covers what was sorted.
+3. The sort of the keys with the indices as values, `#:count (at counts 7)`: culled splats last.
+4. `drawSplats`: an instance a sorted splat (`SplatQuad`), two triangles, the square of its 3σ
+   radius around its mean in pixels, collapsed to a point outside the view when culled (its key,
+   or a zero radius). No y flip: COLMAP's pixels are y down, as ZGAL's clip space is (the WGSL
+   flips y itself). Each fragment computes Rasterize's power and alpha at its pixel centre
+   (`d = mean − fragCoord.xy`), discards power > 0 or alpha < `alphaMin`, and outputs
+   (colour·α, α), blended premultiplied into `accum` (rgba16f, cleared to zero each frame): rgb
+   Σ c·α·T, alpha 1 − T. `#:cull none`, and a triangle list rather than a 4-vertex strip:
+   MoltenVK can't turn primitive restart off for a strip, and validation reports it.
+5. `encode`: a triangle covering `rendered` (rgba8) whose fragments `fetch` their `accum` pixel
+   and write `encodeAccum`: clamp(rgb + (1 − a)·background), opaque, as Rasterize writes its
+   image. A pass of fragments needs no storage image (rgba16f storage isn't portable on the web).
+6. `present` (with `window`): `Present` draws `rendered` on the surface, unscaled (the images are
+   the surface's size).
+
+The decode's buffers, `projected`, the keys and indices, the DrawCommand and `counts` are
+`#:frames shared`: the decode decodes each record once, and the rest is a cache that outlives the
+frame computing it, so the app can disable Project and the sort (before it has a camera, and
+later on a still camera) while every frame slot draws the same order. `accum` and `rendered` are
+per frame. Until the app has its camera, Project is off and the DrawCommand still zero, so frames
+are the background.
+
+It isn't the tile renderer bit for bit: blending back to front, it can't stop where Rasterize
+stops (T < `transmittanceMin`, front to back) so it blends every splat whose alpha passes; it
+blends a splat only inside its 3σ square, where Rasterize blends every pixel of the tiles the
+square meets; and `accum` rounds to f16 at each blend. The first two are departures 18 and 19 in
+[paper-conformance.md](paper-conformance.md#departures), each at most about 3/255 at a pixel per unit of colour difference. On S3
+it's within 2/255 of splat_render's goldens (59-60 dB), almost all of it f16: Rasterize with both
+departures applied is within 1/255 of the viewer, and either departure alone changes Rasterize's S3
+images by at most 1/255. Equal keys draw in splat-index order, the lower index behind, where
+Rasterize puts it in front; exact float ties are negligible.
+Readbacks: `readHeader` (once), `readCameras` (once, with `hasCameras`), `readRendered` (a capture
+or `inspect`) and `readAccum` (`inspect`: rgba16f as two uints a pixel, r | g << 16 and b | a << 16).
+
+## splat_view
+
+`programs/splat_view` runs `ViewGraph`: in a window by default (escape quits), or headless with
+`--frames N` and `--capture FILE` (the last frame's `rendered`). ZGAL can't read a file's size or
+header, so `tools/scene_args.py --view <scene.stream>` prints the stream and its required
+`--splat-count` (the header's) and `--stream-bytes` (the file's size):
+
+```
+build/splat_view/splat_view $(tools/scene_args.py --view <scene.stream>) [--cameras cameras.bin --camera k] [--size WxH]
+```
+
+The start camera is the stream header's, or `--camera k` of `--cameras FILE`, fitted to the window
+(or `--size`) by `fitCamera` with the untouched pose, so at the camera's own size it is that
+camera exactly. The app reads the header back once and checks it as PlanDecode does
+(`checkStreamHeader`) and against the arguments (its splat count, and its SH records ending at
+`--stream-bytes`), failing (exit 1) on a mismatch, a `--camera` past the file, or frames running
+out before it has its camera. `--near` (0.2) and `--background` (a grey level) are splat_render's.
+`--inspect` also reads back `accum`, `counts` and the DrawCommand, and on the last frame checks
+that the image is `encodeAccum` of `accum` within a unit with some pixel covered, and that every
+splat was drawn: the base and SH records decoded, the splats sorted and the DrawCommand's
+instances are all `--splat-count`, with 6 vertices (each readback handled at least
+framesInFlight + 3 frames after the camera arrived). The newest readbacks can be of different
+frames, so it holds for a still camera only.
+
+Its `test.sh` encodes splat_render's committed S3 scene with the full and web presets and, for
+each, renders cameras 0 and 24 at their sizes with `--inspect`, held to 50 dB and a largest
+difference of 8/255 against splat_render's goldens (measured 59.0 to 59.9 dB and 2/255, MoltenVK
+and Dawn on Metal); the web preset's captures to the same against the full preset's (61.9 dB,
+1/255). The PSNR alone misses a lost splat: one costs 51-75 dB but 15/255 or more on these cameras (the larger of the two cameras' differences; one camera alone can be 6/255, which is why both stay in the test),
+which the largest difference catches (mutants: a DrawCommand one instance short fails `--inspect`'s
+counts, Project skipping the last splat fails at 34-36/255). Each comparison prints its PSNR and
+largest difference. It renders the header's camera without
+`--cameras` and from a one-camera file of the header's bytes 32 to 144, which must capture the
+same PNG, and a wrong `--splat-count` must be refused.
 
 ## splat_train
 

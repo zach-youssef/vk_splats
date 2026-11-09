@@ -177,7 +177,8 @@ changing the precision needs no rebuild. The format, `checkStreamHeader` and the
 `lib/splat_stream.zgal` (so the shaders, the C++ and the TypeScript run the same code); the
 encoder is `lib/native/stream_encoder.h`. `tests/cpp/splat_stream_test.cpp` checks them,
 `tests/cpp/default_camera_test.cpp` the default camera, `tools/tests/test_stream.py` the
-converter, and `programs/stream_test` the [decode](#decode) on the GPU.
+converter, and `programs/stream_test` the [decode](#decode) on the GPU. `programs/splat_view`
+draws a stream ([architecture.md](architecture.md#splat_view)).
 
 ### Converter
 

@@ -34,8 +34,8 @@ from conversion through `tools/scene_args.py --train` to the evaluation, is in
 
 The fuller version is [docs/architecture.md](docs/architecture.md#layout).
 
-- `programs/`: one directory per program (`splat_render`, `splat_train`) and per GPU test.
-- `lib/`: the ZGAL modules the programs share (the render and train graphs, the splat math, SSIM).
+- `programs/`: one directory per program (`splat_render`, `splat_view`, `splat_train`) and per GPU test.
+- `lib/`: the ZGAL modules the programs share (the render, view and train graphs, the splat math, SSIM, the stream format).
 - `tools/`: the offline Python converter, evaluator and synthetic scene generator, with tests.
 - `tests/`: C++ tests and closed-form oracles.
 - `colmap/`: the committed COLMAP scene and its images.
