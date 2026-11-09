@@ -151,9 +151,10 @@ test-web: $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
 # Page tests: programs/<name>/test-page.sh, run as test-page.sh <web build dir> <output dir>
 # <chromium.ts> after its program's web build: its page (<name>.zgal.html) in headless Chromium on
 # SwiftShader, through the wrapper's checker. A missing Chromium fails them (CHROMIUM names one).
+# They may encode their scene first (tools/convert.py), so they depend on the native library too.
 PAGE_TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test-page.sh),$(p)))
 
-$(foreach p,$(PAGE_TESTED_PROGRAMS),$(eval test-pages-$(p): $(OUT)/web/$(p) ; programs/$(p)/test-page.sh $(OUT)/web/$(p) $(OUT)/test-pages/$(p) $(ZGAL_ROOT)/web/tools/chromium.ts))
+$(foreach p,$(PAGE_TESTED_PROGRAMS),$(eval test-pages-$(p): $(OUT)/web/$(p) $(NATIVE_LIB) ; programs/$(p)/test-page.sh $(OUT)/web/$(p) $(OUT)/test-pages/$(p) $(ZGAL_ROOT)/web/tools/chromium.ts))
 
 test-pages: $(foreach p,$(PAGE_TESTED_PROGRAMS),test-pages-$(p))
 

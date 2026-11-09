@@ -28,8 +28,8 @@ Racket (for its ZGAL-generated header).
   after building its web-check tools and the native library; it needs Python as `make test` does
   (`PYTHON=...`).
 - `make test-pages`: each program's `test-page.sh` (`make test-pages-<name>` runs one), after its
-  web build: its page in headless Chromium on SwiftShader, through the wrapper's
-  `web/tools/chromium.ts`. It needs Python as `make test` does, and Chromium's headless shell:
+  web build and the native library (a page test may encode its scene): its page in headless
+  Chromium on SwiftShader, through the wrapper's `web/tools/chromium.ts`. It needs Python as `make test` does, and Chromium's headless shell:
   `CHROMIUM=<path>`, else the newest one Playwright installed
   (`npx playwright install chromium-headless-shell`). A missing Chromium fails it, unlike the
   wrapper's `make test-pages`, which skips one it doesn't find.
@@ -103,7 +103,8 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   `tools/scene_args.py --query <url dir> ...` prints a scene's arguments as that query string),
   runs it in Chromium, and checks what it shows (`--screenshot`, `--keys`), failing when the
   checker exits non-zero, 3 (no Chromium) included. SwiftShader is slow, so a page test uses a
-  tiny scene: splat_render's renders S3 (2000 splats) at 128x128 ([web.md](web.md#tests)).
+  tiny scene: splat_render's and splat_view's render S3 (2000 splats) at 128x128
+  ([web.md](web.md#tests)).
 - **A web-check tool**: `programs/<name>/web-check/<tool>.cpp`, a host program a test runs on
   what a run wrote, for checks written in C++: a web run's (render_test's `render_test_check`), or
   either backend's (splat_view's `view_oracle_check`). It's built
@@ -156,12 +157,14 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
     them (`cpu-tests`); every other shard would repeat them.
   - `web`: `make web`, then `test-web` (Node with Dawn on lavapipe), which builds the native
     library first (splat_train's check reads PLYs through it).
-  - `pages`: `make web`, then `test-pages` (headless Chromium on SwiftShader). Only this shard
+  - `pages`: `make web`, then `test-pages` (headless Chromium on SwiftShader), which builds the
+    native library first (splat_view's page test encodes its stream). Only this shard
     (`chromium`) installs Chromium's headless shell, with the steps of vulkan_test's `web.yml`:
     Playwright's (`PLAYWRIGHT_VERSION`, cached), after lifting Ubuntu 24.04's AppArmor ban on the
     unprivileged user namespaces its sandbox needs, and checked to be exactly one shell, which
-    `CHROMIUM` then names. Its page tests take well under a minute (splat_render's page: about
-    9 s on an M4), so the job is mostly setup, the web build and the install.
+    `CHROMIUM` then names. Its page tests take well under a minute (on an M4, splat_render's
+    page about 9 s, splat_view's two about 14 s with the encoding), so the job is mostly setup,
+    the web build and the install.
   Each test step runs even if an earlier one failed, and the program tests with `make -k`, so one
   failing program doesn't stop the others. On failure or cancellation a job uploads `build/test`,
   `build/test-web` and `build/test-pages` (each program's logs, as `test-outputs-<sha>-<suite>`);

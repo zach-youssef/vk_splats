@@ -139,6 +139,12 @@ SwiftShader, which the Node tests don't reach:
   128x128 canvas (`--size 128x128`, so the canvas is the image's size), the canvas screenshotted
   and compared with the native golden at 45 dB. SwiftShader matches it bit for bit (inf dB) on an
   M4; a page rendering camera 1 instead scores 20.8 dB and fails.
+- **splat_view**: S3 encoded as a stream (the full preset), camera 0 for 48 frames at a 128x128
+  canvas, twice. Untouched, the canvas must match splat_render's golden at 45 dB (68.1 dB on an
+  M4). With W pressed once (`--keys w`: a keyDown and keyUp together, once the page runs),
+  it must differ from the untouched canvas by at least 8/255 at some pixel (measured 17/255): the
+  latched press moved the camera. A mutant moving with the held keys only (no latch) draws the
+  untouched image (inf dB) and fails.
 
 ## Not supported on the web
 

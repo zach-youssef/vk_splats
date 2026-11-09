@@ -723,6 +723,9 @@ rounds the fragment's output and the result), plus the GPU's exp; a pixel with a
 (`faint-overlap`), the pixel corner instead of its centre, the quad at half the 3σ radius, and
 the opacity scaled by 0.99.
 
+Its `test-page.sh` runs the page in Chromium ([web.md](web.md#tests)): untouched, it must match
+splat_render's golden; with W pressed once, the camera must move.
+
 ## splat_train
 
 `programs/splat_train` runs `TrainGraph` (with `train`) headless, one Adam iteration a frame, for
