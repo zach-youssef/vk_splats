@@ -23,15 +23,7 @@ ln -s "$(cd "$web" && pwd)" "$out/site/page"
 ln -s "$(cd "$here/golden/s3" && pwd)" "$out/site/scene"
 
 # The page's options from the query string, as test.sh's from scene_args.py (paths made /scene/...)
-query=$("$python" tools/scene_args.py "$here/golden/s3" 0 | "$python" -c '
-import sys
-words = sys.stdin.read().split()
-pairs = []
-for option, value in zip(words[::2], words[1::2]):
-    if value.endswith(".bin"):
-        value = "/scene/" + value.rsplit("/", 1)[1]
-    pairs.append(option[2:] + "=" + value)
-print("&".join(pairs))')
+query=$("$python" tools/scene_args.py --query /scene "$here/golden/s3" 0)
 
 log="$out/s3-camera-0.log"
 status=0

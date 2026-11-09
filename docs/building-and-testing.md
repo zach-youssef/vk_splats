@@ -99,7 +99,8 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
 - **A page test**: `programs/<name>/test-page.sh`, run from the repository's root as
   `test-page.sh <web build dir> <output dir> <chromium.ts>`. It serves the program's page
   (`<name>.zgal.html`, its options and positional arguments in the query string) and its inputs
-  from one directory under its output directory (`chromium.ts --serve`, which follows symlinks),
+  from one directory under its output directory (`chromium.ts --serve`, which follows symlinks;
+  `tools/scene_args.py --query <url dir> ...` prints a scene's arguments as that query string),
   runs it in Chromium, and checks what it shows (`--screenshot`, `--keys`), failing when the
   checker exits non-zero, 3 (no Chromium) included. SwiftShader is slow, so a page test uses a
   tiny scene: splat_render's renders S3 (2000 splats) at 128x128 ([web.md](web.md#tests)).

@@ -112,3 +112,29 @@ def test_view_args(tmp_path):
         scene_args.view_args(str(short))
     with pytest.raises(SystemExit, match="whitespace"):
         scene_args.view_args(str(tmp_path / "a b.stream"))
+
+
+def test_query(tmp_path):
+    """--query: options as name=value, positionals as arg=value, paths as <url dir>/<file name>."""
+    golden = os.path.join(REPO, "programs", "splat_render", "golden", "s3")
+    assert scene_args.query("/scene", scene_args.scene_args(golden, "0")) == (
+        "splats=/scene/splats.bin&cameras=/scene/cameras.bin&splat-count=2000&sh-degree=3&camera=0"
+        "&width=128&height=128")
+    write_fixture(str(tmp_path / "fixture"), 40, 7)
+    convert.main(["stream", str(tmp_path / "fixture" / "splats.bin"), str(tmp_path / "out"), "--config",
+                  os.path.join(REPO, "tools", "stream-configs", "web.json")])
+    path = str(tmp_path / "out" / "scene.stream")
+    assert scene_args.query("/data/", scene_args.view_args(path)) == (
+        f"arg=/data/scene.stream&splat-count=40&stream-bytes={os.path.getsize(path)}")
+    # A value that isn't a path is quoted, not mapped
+    assert scene_args.query("/d", ["--name", "a&b"]) == "name=a%26b"
+
+
+def test_query_main(capsys):
+    golden = os.path.join(REPO, "programs", "splat_render", "golden", "s3")
+    scene_args.main(["--query", "/scene", golden, "cam_24_wide"])
+    out = capsys.readouterr().out.strip()
+    assert out == scene_args.query("/scene", scene_args.scene_args(golden, "24"))
+    assert "camera=24&width=160&height=96" in out
+    with pytest.raises(SystemExit):
+        scene_args.main(["--query", "/scene"])

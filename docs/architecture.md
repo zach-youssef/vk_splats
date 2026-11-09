@@ -69,7 +69,8 @@
   programs' inputs, the synthetic scene generator (which also renders a scene's ground truth with
   splat_render), and `scene_args.py`, which prints splat_render's arguments for a scene and a
   camera, splat_train's (`--train`) for a scene with images, or splat_view's (`--view`) for a
-  `scene.stream`.
+  `scene.stream`; `--query <url dir>` before any of these prints them as a page's query string,
+  with the paths made `<url dir>/<file name>` (for page tests).
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`). The Python tests are in
   `tools/tests/`.
 - `colmap/`: the one real scene: `colmap_exports3`, a COLMAP text export (one SIMPLE_RADIAL
