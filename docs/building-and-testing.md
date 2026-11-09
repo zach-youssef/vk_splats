@@ -201,6 +201,10 @@ tests it on its own. When using it:
   chains the L2's to the splat's parameters. A symmetric matrix's `b` gradient is for the shared off-diagonal value (both entries).
   Against the reference: its conic gradient's off-diagonal is half of `conic.b`, its Σ′ gradient
   equals `cov.b`, and its `dL_dmean2D` is per NDC unit (0.5·W, or 0.5·H for y, times `mean`).
+- A program's check reads its scene through `tests/oracle/zgal_scene.h`: the oracle's camera and
+  splats from `lib/splat_math.zgal`'s `Camera` and `Splat` (`sceneCamera()`, `sceneSplat()`, which
+  refuse anything but S1's setup), the borderline rule for a pixel whose alpha or T sits within
+  rounding of its threshold (`Borderline`, `borderline()`) and the hash the checks print.
 
 ## Gradient checks
 

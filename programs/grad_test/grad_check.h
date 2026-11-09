@@ -25,7 +25,7 @@
 // lib/train_graph.zgal): namespace render_types = grad_test;
 #pragma once
 
-#include "../../tests/oracle/closed_form.h"
+#include "../../tests/oracle/zgal_scene.h"
 
 #include <algorithm>
 #include <array>
@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -53,28 +54,11 @@ constexpr int kShown = 8;  // mismatches printed before the rest are only counte
     std::exit(1);
 }
 
-// The oracle's splat for an S1 splat seen by a camera rotated by phi about z (as render_check.h's)
+// The oracle's splat for an S1 splat seen by a camera rotated by phi about z
 inline oracle::Splat oracleSplat(const Splat& s, double phi) {
-    if (s.rotation.y != 0.0f || s.rotation.z != 0.0f) usage("--oracle needs splats rotated about z only (S1)");
-    oracle::Splat w{};
-    w.x = s.position.x;
-    w.y = s.position.y;
-    w.z = s.position.z;
-    w.log_scale = {s.logScale.x, s.logScale.y, s.logScale.z};
-    // (w, x, y, z) in (.x, .y, .z, .w): quat_about_z(theta) = (cos(theta/2), 0, 0, sin(theta/2))
-    w.theta = 2.0 * std::atan2(double(s.rotation.w), double(s.rotation.x));
-    w.opacity_logit = s.opacity;
-    w.dc = {s.sh[0], s.sh[1], s.sh[2]};
-    return oracle::world_to_camera_about_z(w, phi);
-}
-
-inline uint64_t fnv1a(uint64_t h, const void* bytes, size_t size) {
-    const auto* p = static_cast<const unsigned char*>(bytes);
-    for (size_t i = 0; i < size; ++i) {
-        h ^= p[i];
-        h *= 0x100000001b3ull;
-    }
-    return h;
+    const std::optional<oracle::Splat> o = oracle::sceneSplat(s, phi);
+    if (!o) usage("--oracle needs splats rotated about z only (S1)");
+    return *o;
 }
 
 // The quantized value a target channel has in the RGBA8 targets file (test.sh writes round(255 t))
@@ -130,22 +114,22 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
         ++failures;
     };
 
-    uint64_t hash = 0xcbf29ce484222325ull;
+    uint64_t hash = oracle::kFnvBasis;
     for (uint32_t i = 0; i < gradients.size(); ++i) {
         const ProjectedGradient& g = gradients[i];
         const std::array<float, 9> values = {g.mean.x,  g.mean.y,   g.conic.x,  g.conic.y, g.conic.z,
                                              g.opacity, g.colour.x, g.colour.y, g.colour.z};
         for (float v : values)
             if (!std::isfinite(v)) fail("splat " + std::to_string(i) + "'s gradients aren't finite");
-        hash = fnv1a(hash, values.data(), sizeof values);
+        hash = oracle::fnv1a(hash, values.data(), sizeof values);
         const std::array<float, 59> parameters = parameterValues(parameterGradients[i]);
         for (float v : parameters)
             if (!std::isfinite(v)) fail("splat " + std::to_string(i) + "'s parameter gradients aren't finite");
-        hash = fnv1a(hash, parameters.data(), sizeof parameters);
+        hash = oracle::fnv1a(hash, parameters.data(), sizeof parameters);
     }
     const float loss = losses[0];
     if (!std::isfinite(loss)) fail("the loss isn't finite");
-    hash = fnv1a(hash, &loss, sizeof loss);
+    hash = oracle::fnv1a(hash, &loss, sizeof loss);
     char hashText[17];
     std::snprintf(hashText, sizeof hashText, "%016llx", static_cast<unsigned long long>(hash));
     std::cout << "grad_test: camera " << cameraIndex << ": " << splats.size() << " splats, " << (l1 ? "L1 (+ D-SSIM under --dssim)" : "L2")
@@ -212,14 +196,10 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
     if (useOracle) {
         if (splats.size() != 1) usage("--oracle needs one splat (S1's gradient variant)");
         const Camera& cam = cameras[cameraIndex];
-        const glm::mat4& m = cam.worldToCamera;
-        if (cam.intrinsics.x != cam.intrinsics.y || m[3] != glm::vec4(0.0f, 0.0f, 0.0f, 1.0f) || m[2][2] != 1.0f) {
-            usage("--oracle needs a camera at the origin rotated about z with fx = fy (S1)");
-        }
-        const double phi = std::atan2(double(m[0][1]), double(m[0][0]));
-        const uint32_t width = cam.size.x, height = cam.size.y;
-        const oracle::Camera ocam{cam.intrinsics.x, int(width), int(height), cam.intrinsics.z - 0.5 * width,
-                                  cam.intrinsics.w - 0.5 * height};
+        const std::optional<oracle::SceneCamera> scene = oracle::sceneCamera(cam);
+        if (!scene) usage("--oracle needs a camera at the origin rotated about z with fx = fy (S1)");
+        const double phi = scene->phi;
+        const oracle::Camera& ocam = scene->camera;
         const oracle::Splat view = oracleSplat(splats[0], phi);
         const oracle::Rgb t{quantized(target.x), quantized(target.y), quantized(target.z)};
         const oracle::Rgb bg{background.x, background.y, background.z};

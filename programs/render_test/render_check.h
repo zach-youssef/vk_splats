@@ -22,7 +22,7 @@
 // that imports lib/render_graph.zgal): namespace render_types = render_test;
 #pragma once
 
-#include "../../tests/oracle/closed_form.h"
+#include "../../tests/oracle/zgal_scene.h"
 
 #include <algorithm>
 #include <cmath>
@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -66,31 +67,8 @@ inline std::string pixelName(uint32_t x, uint32_t y) {
     return "pixel (" + std::to_string(x) + ", " + std::to_string(y) + ")";
 }
 
-inline bool near(double value, double bound, double margin) {
-    return std::abs(value - bound) <= margin * bound;
-}
-
-// A threshold decision within rounding of its bound, which the GPU may take the other way.
-// Flipping one changes T by at most `flip` and the colour by at most 2 flip M, M the largest
-// colour channel among the pixel's splats and the background: for alpha (or the exponent's sign),
-// flip = alpha T, the splat's own term plus the (1 - alpha) scaling of everything after it; for
-// the transmittance stop, flip = T, since everything after it (at most T M) and the background's
-// T bg change.
-struct Borderline {
-    bool any = false;
-    double flip = 0.0;  // the sum over the pixel's borderline decisions
-    double maxColour = 0.0;
-
-    void add(double f) {
-        any = true;
-        flip += f;
-    }
-    void see(const oracle::Rgb& c) {
-        for (double v : c) maxColour = std::max(maxColour, v);
-    }
-    double colourTolerance(double base) const { return base + 2.0 * flip * maxColour; }
-    double tTolerance(double base) const { return base + flip; }
-};
+using oracle::Borderline;
+using oracle::near;
 
 struct Blend {
     oracle::Rgb colour{0.0, 0.0, 0.0};  // C + T bg
@@ -137,26 +115,9 @@ inline Blend cpuBlend(const zgal::Data<Projected>& projected, const zgal::Data<u
 
 // The oracle's splat for an S1 splat seen by a camera rotated by phi about z
 inline oracle::Splat oracleSplat(const Splat& s, double phi) {
-    if (s.rotation.y != 0.0f || s.rotation.z != 0.0f) usage("--oracle needs splats rotated about z only (S1)");
-    oracle::Splat w{};
-    w.x = s.position.x;
-    w.y = s.position.y;
-    w.z = s.position.z;
-    w.log_scale = {s.logScale.x, s.logScale.y, s.logScale.z};
-    // (w, x, y, z) in (.x, .y, .z, .w): quat_about_z(theta) = (cos(theta/2), 0, 0, sin(theta/2))
-    w.theta = 2.0 * std::atan2(double(s.rotation.w), double(s.rotation.x));
-    w.opacity_logit = s.opacity;
-    w.dc = {s.sh[0], s.sh[1], s.sh[2]};
-    return oracle::world_to_camera_about_z(w, phi);
-}
-
-inline uint64_t fnv1a(uint64_t h, const void* bytes, size_t size) {
-    const auto* p = static_cast<const unsigned char*>(bytes);
-    for (size_t i = 0; i < size; ++i) {
-        h ^= p[i];
-        h *= 0x100000001b3ull;
-    }
-    return h;
+    const std::optional<oracle::Splat> o = oracle::sceneSplat(s, phi);
+    if (!o) usage("--oracle needs splats rotated about z only (S1)");
+    return *o;
 }
 
 inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cameras, const zgal::Data<uint32_t>& counts,
@@ -256,8 +217,8 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
             }
         }
     }
-    uint64_t hash = fnv1a(0xcbf29ce484222325ull, colours.elements().data(), colours.size() * sizeof(glm::vec4));
-    hash = fnv1a(hash, lastEntries.elements().data(), lastEntries.size() * sizeof(uint32_t));
+    uint64_t hash = oracle::fnv1a(oracle::kFnvBasis, colours.elements().data(), colours.size() * sizeof(glm::vec4));
+    hash = oracle::fnv1a(hash, lastEntries.elements().data(), lastEntries.size() * sizeof(uint32_t));
     char hashText[17];
     std::snprintf(hashText, sizeof hashText, "%016llx", static_cast<unsigned long long>(hash));
     std::cout << "render_test: camera " << cameraIndex << " (" << width << "x" << height << "): " << splats.size()
@@ -267,15 +228,10 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
               << " borderline pixels, within what a flip changes)" << std::endl;
 
     if (useOracle) {
-        const glm::mat4& m = cam.worldToCamera;
-        if (cam.intrinsics.x != cam.intrinsics.y || m[3] != glm::vec4(0.0f, 0.0f, 0.0f, 1.0f) || m[2][2] != 1.0f) {
-            usage("--oracle needs a camera at the origin rotated about z with fx = fy (S1)");
-        }
-        const double phi = std::atan2(double(m[0][1]), double(m[0][0]));
-        // The principal point as the camera has it, so an off-centre one (S1's off-centre) is the
-        // oracle's too
-        const oracle::Camera ocam{cam.intrinsics.x, int(width), int(height), cam.intrinsics.z - 0.5 * width,
-                                  cam.intrinsics.w - 0.5 * height};
+        const std::optional<oracle::SceneCamera> scene = oracle::sceneCamera(cam);
+        if (!scene) usage("--oracle needs a camera at the origin rotated about z with fx = fy (S1)");
+        const double phi = scene->phi;
+        const oracle::Camera& ocam = scene->camera;
         std::vector<oracle::Splat> os;
         std::vector<glm::uvec4> rects;
         for (uint32_t i = 0; i < splats.size(); ++i) {
@@ -303,26 +259,7 @@ inline bool check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cam
                     if (tx < r.x || tx >= r.z || ty < r.y || ty >= r.w) continue;
                     fragments.push_back({os[i].z, oracle::raw_alpha(ocam, os[i], p), oracle::colour(os[i])});
                 }
-                // Borderline: an alpha or a running T within rounding of its threshold (the
-                // oracle's Gaussian has no exponent test)
-                Borderline border;
-                border.see(bg);
-                {
-                    std::vector<oracle::Fragment> sorted = fragments;
-                    std::stable_sort(sorted.begin(), sorted.end(),
-                                     [](const oracle::Fragment& l, const oracle::Fragment& r) { return l.depth < r.depth; });
-                    double t = 1.0;
-                    for (const oracle::Fragment& fr : sorted) {
-                        border.see(fr.colour);
-                        const double alpha = std::min(fr.alpha, oracle::kAlphaMax);
-                        if (near(alpha, oracle::kAlphaMin, kOracleMargin)) border.add(alpha * t);
-                        if (alpha < oracle::kAlphaMin) continue;
-                        const double next = t * (1.0 - alpha);
-                        if (near(next, oracle::kTransmittanceMin, kOracleMargin)) border.add(t);
-                        if (next < oracle::kTransmittanceMin) break;
-                        t = next;
-                    }
-                }
+                const Borderline border = oracle::borderline(fragments, bg, kOracleMargin);
                 const oracle::PixelValue want = oracle::composite(fragments, bg);
                 const glm::vec4 gpu = colours[y * width + x];
                 double error = 0.0;
