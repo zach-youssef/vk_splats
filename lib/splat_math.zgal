@@ -12,6 +12,8 @@
 ;; (graphdeco-inria/gaussian-splatting's diff-gaussian-rasterization, forward.cu): they're marked
 ;; "(reference code)", and docs/paper-conformance.md lists them.
 
+(import sorting)  ; floatSortKey, for the depth sort's key
+
 ;; ---------------------------------------------------------------------------------------------
 ;; Structs
 ;; ---------------------------------------------------------------------------------------------
@@ -291,46 +293,14 @@
   (projectSplatPerturbed s cam near shDegree (uint 48) 0.0))
 
 ;; ---------------------------------------------------------------------------------------------
-;; Sort keys (D5a: one 32-bit key, tile then depth quantized by its float bits)
+;; Sort keys: the splats by depth, then their tile entries by tile
 ;; ---------------------------------------------------------------------------------------------
-;; The bits a tile index needs for tileCount tiles: ceil(log2(tileCount)), at least 1 and at most
-;; 31, so the depth keeps at least one bit (748x748 has 47x47 = 2209 tiles: 12 bits, leaving 20)
-(define (tileBitsFor [tileCount : uint]) : uint
-  (while ([bits (uint 1)])
-    (and (< bits (uint 31)) (< (shl (uint 1) bits) tileCount))
-    (+ bits (uint 1))))
-
-;; The depth's bits in a key: 32 - tileBitsFor(tileCount)
-(define (depthBitsFor [tileCount : uint]) : uint
-  (- (uint 32) (tileBitsFor tileCount)))
-
-;; depthKey's shift: the least that fits far's bits above near's in depthBits. It depends on the
-;; frame's constants only, so kernels keying many entries compute it once (depthKeyShifted).
-(define (depthShift [depthBits : uint] [near : float] [far : float]) : uint
-  (let* ([maxQ (shr (bitnot (uint 0)) (- (uint 32) depthBits))]
-         [span (- (floatBitsToUint far) (floatBitsToUint near))])
-    (while ([s (uint 0)]) (> (shr span s) maxQ) (+ s (uint 1)))))
-
-;; depthKey (below) with its shift given: depthShift(depthBits, near, far)
-(define (depthKeyShifted [tile : uint] [depth : float] [depthBits : uint] [near : float] [far : float]
-                         [shift : uint]) : uint
-  (let* ([maxQ (shr (bitnot (uint 0)) (- (uint 32) depthBits))]
-         [q (shr (- (floatBitsToUint (clamp depth near far)) (floatBitsToUint near)) shift)])
-    (bitor (shl tile depthBits) (min q maxQ))))
-
-;; The key of a splat's entry in a tile: the tile in the high bits, then the depth in the low
-;; depthBits (1-31), so sorting the keys groups entries by tile and orders each tile's front to
-;; back. The depth, clamped to [near, far], is quantized by its float bits: a positive float's
-;; bits grow with its value, 2^23 steps per octave (exponent + mantissa is log2 to within 0.09),
-;; so the bits above near's, shifted right until far's fit in depthBits (depthShift), are close to
-;; log spaced, and exact on every device: integer operations only (a GPU's log can differ from
-;; C++'s by an ulp, moving a key by a step; docs/architecture.md). Depths beyond far share the
-;; largest value; equal keys' order is the sort's to choose. The quantized depth is clamped to
-;; depthBits too, so even a NaN depth (projectSplat culls those) can't change the tile.
-;; Requires 0 < near < far and tile < 2^(32 - depthBits); neither is checked.
-(define (depthKey [tile : uint] [depth : float] [depthBits : uint] [near : float] [far : float]) : uint
-  (depthKeyShifted tile depth depthBits near far (depthShift depthBits near far)))
-
-;; The tile of a key from depthKey
-(define (keyTile [key : uint] [depthBits : uint]) : uint
-  (shr key depthBits))
+;; A splat's key in the depth sort: its depth's floatSortKey ((import sorting): a uint that sorts
+;; as the float does), so the sort orders the splats front to back by their full float depths,
+;; exactly and the same on every device (integer comparisons only). A kept splat's depth is above
+;; near > 0 and not NaN (projectSplat), so its key is at most infinity's, 0xFF800000; a culled
+;; splat (tileCount 0) gets 0xFFFFFFFF, after every kept one. Equal depths keep the splats' index
+;; order (the sort is stable). The render graph then sorts the tile entries, emitted in this
+;; order, by tile only.
+(define (depthSortKey [p : Projected]) : uint
+  (if (= p.tileCount (uint 0)) (bitnot (uint 0)) (floatSortKey p.depth)))

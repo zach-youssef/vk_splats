@@ -85,7 +85,8 @@ def test_s1_writes_every_variant(s1):
 
 # The numbers of tests/cpp/closed_form_test.cpp's setups, written out again so a change on either
 # side shows: (f, width, height, splats as (x, y, z, scales, theta, opacity logit, dc), background,
-# target, camera rotations phi), and off-centre's, stack's and the faint ones', which no C++ test has
+# target, camera rotations phi), and off-centre's, stack's, the faint ones' and near-tie's, which no C++
+# test has
 EXPECTED_S1 = {
     "isotropic": (50, 33, 33, [(0, 0, 4, (0.2, 0.2, 0.2), 0.3, 0, (1, 0, -1))], (0, 0, 0), None, [0]),
     "anisotropic": (50, 33, 33, [(0, 0, 4, (0.3, 0.1, 0.5), 0, 0, (1, 0, -1))], (0, 0, 0), None, [0]),
@@ -118,9 +119,23 @@ EXPECTED_S1 = {
                                    (-0.2, 0.1, 3, (0.2, 0.15, 0.2), -0.3, -1.0, (-0.5, 1, 0.8)),
                                    (0.3, -0.1, 7, (0.6, 0.4, 0.3), 1.2, -0.7, (0.6, 0.6, -1))], (0.1, 0.2, 0.3),
                       None, [0]),
+    "near-tie": (50, 160, 96, [(0, 0, 3.999988079071045, (0.7, 0.7, 0.2), 0, 4, (1.7, -1.7, -1.7)),
+                               (0, 0, 3.999987840652466, (0.6, 0.6, 0.2), 0, 4, (-1.7, 1.7, -1.7))],
+                 (0.1, 0.2, 0.3), None, [0]),
 }
 # The principal point's offset from the image centre (dcx, dcy); (0, 0) for the others
 PRINCIPAL_OFFSETS = {"off-centre": (-3.0, -3.5), "faint-overlap": (-3.0, -3.5)}
+
+
+def test_near_tie_depths_are_one_float_apart_on_a_quantization_step(s1):
+    # The splats' float32 depths, as the kernels read them: one float apart, the front one's bits
+    # a multiple of 128 past bits(0.2) (near), so the quantized key departure 1 replaced tied them
+    # for every shift from 1 to 7
+    _, got, _ = read_scene(os.path.join(s1, "near-tie"))
+    bits = got.position[:, 2].astype(np.float32).view(np.uint32).astype(np.int64)
+    near = int(np.float32(0.2).view(np.uint32))
+    assert bits[0] == bits[1] + 1
+    assert (bits[1] - near) % 128 == 0
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED_S1))

@@ -417,7 +417,7 @@ tools/make_synthetic.py render-gt <scene dir> <renderer> [--background <g>] [--f
 ```
 
 - **S1** (`<out dir>/<variant>/`, no seed): the closed-form oracles' setups, with
-  `tests/cpp/closed_form_test.cpp`'s numbers (and `off-centre`, `stack`, `faint` and `faint-overlap`, which no C++ test has). Cameras
+  `tests/cpp/closed_form_test.cpp`'s numbers (and `off-centre`, `stack`, `faint`, `faint-overlap` and `near-tie`, which no C++ test has). Cameras
   sit at the origin, rotated only about z, with fx = fy = f and the principal point at the image
   centre (offset by (`dcx`, `dcy`) for `off-centre` and `faint-overlap`); the splats have DC colour only and
   rotation `quat_about_z(theta)`. `source.oracle` holds what a kernel test needs to build the
@@ -439,6 +439,7 @@ tools/make_synthetic.py render-gt <scene dir> <renderer> [--background <g>] [--f
   | `stack` | 50, 33² | five splats on the axis, the front four near-opaque: within about 2 px of the centre the stop at T < 1e-4 leaves the third (centre) or fourth and every later splat unblended |
   | `faint` | 50, 33², 3 cameras (phi 0, 0.4, −1.1) | one anisotropic splat off the axis at opacity 0.332 (below 0.35, so α at 3σ is below 1/255): splat_view's oracle, where the 3σ quad must drop nothing |
   | `faint-overlap` | 50, 48×32, `off-centre`'s camera | three faint splats (opacity 0.27 to 0.33) overlapping, stored middle, front, back: splat_view's back-to-front sort and blend |
+  | `near-tie` | 50, 160×96 (60 tiles) | two nearly opaque splats one float apart in depth, the farther (red) stored first: render_test's oracle needs the nearer (green) in front, which the quantized depth key of [paper-conformance.md](paper-conformance.md) departure 1 tied and drew in index order |
 
   The 33-pixel images put a pixel centre on the principal point. The cameras all sit at the
   origin, so the converter's extent (from camera centres) would be 0; S1 records instead 1.1 times

@@ -20,7 +20,6 @@
   (parameter height uint)
   (parameter shDegree uint)
   (parameter near float)
-  (parameter far float)
   (parameter initialEntries uint)
   (parameter background float)
   (state
@@ -34,7 +33,7 @@
       (with state #:capacity grown)))
   (run SplatGraph (splatFile splatFile) (cameraFile cameraFile) (splatCount splatCount)
        (cameraIndex cameraIndex) (width width) (height height) (shDegree shDegree) (near near)
-       (far far) (maxGroups groupLimit) (inspect #f) (capacity state.capacity)
+       (maxGroups groupLimit) (inspect #f) (capacity state.capacity)
        (background (vec3 background)) (window (not headless)) (capture capture)
        (presentScale (letterbox surfaceSize width height))))
 
@@ -55,7 +54,6 @@
           #:range (1 2896))
   (option shDegree "--sh-degree" "the SH bands to evaluate" #:default 3 #:range (0 3))
   (option near "--near" "the near plane" #:default 0.2)
-  (option far "--far" "the depth keys' far depth" #:default 1000.0)
   (option initialEntries "--initial-entries" "the tile entries' first capacity" #:default 1048576
           #:range (1 33554432))
   (option background "--background" "the background's grey level (0 black, 1 white)" #:default 0.0

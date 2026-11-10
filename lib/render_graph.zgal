@@ -1,10 +1,13 @@
 ;; The render graph: per frame, every splat projected for one camera, then each tile's splats front
-;; to back (Kerbl et al. 2023, Sec. 6), in four stages:
-;;   1. preprocess: projectSplat (lib/splat_math.zgal) per splat, and its tile count;
-;;   2. an exclusive scan of the tile counts (each splat's first entry) and their total;
-;;   3. tile entries, as many as the GPU's total says (an indirect dispatch the plan kernel sizes):
-;;      a sort key (tile, then depth) and the splat's index per tile a splat touches;
-;;   4. a sort of the keys, moving the splat indices with them, then each tile's range of entries.
+;; to back (Kerbl et al. 2023, Sec. 6), in five stages:
+;;   1. preprocess: projectSplat (lib/splat_math.zgal) per splat, and its depth's sort key;
+;;   2. a sort of the splats by depth (front to back, full float depths), then each splat's tile
+;;      count in that order, an exclusive scan of them (each splat's first entry) and their total;
+;;   3. tile entries, as many as the GPU's total says (an indirect dispatch the plan kernel sizes),
+;;      the splats' in depth order: the tile as the key and the splat's index, per tile a splat
+;;      touches;
+;;   4. a stable sort of the entries by tile, moving the splat indices with them, so each tile's
+;;      entries keep the depth order, then each tile's range of entries;
 ;;   5. rasterize: one 16x16 workgroup per tile blends the tile's entries front to back (Eq. 3) over
 ;;      a background, in batches loaded into shared memory, into each pixel's colour, final
 ;;      transmittance and last contributor, and an RGBA8 image;
@@ -12,14 +15,14 @@
 ;; import it, (import "../../lib/render_graph.zgal"), which imports the splat math and Present too.
 ;;
 ;; The entries' capacity is the app's, a per-frame input: when a frame has more entries than it
-;; holds, the frame keeps the first `capacity` (whole splats in index order, then part of one) and
+;; holds, the frame keeps the first `capacity` (whole splats front to back, then part of one) and
 ;; is incomplete, and `counts` (read back each frame) tells the app, which grows the capacity
 ;; (grownCapacity) for the frames after. The tile counts' total must stay below 2^32 (it's a
 ;; uint): past that the entries are wrong, but every kernel still stays in its buffers' bounds.
 ;; The splat count lives on the GPU (`splatCounts`, written once by InitSplatCounts, and by the
 ;; training graph's densification), so the per-splat kernels read it there and are dispatched
 ;; indirectly (`splatCommands`): a count that changes on the GPU needs no CPU round trip.
-;; Every 1D kernel (preprocess, plan, entries, ranges) loops over its elements by grid stride, so
+;; Every 1D kernel (preprocess, ranks, plan, entries, ranges) loops over its elements by grid stride, so
 ;; its dispatches stay within maxGroups workgroups (a graph parameter: groupLimit, or less to test
 ;; the loops). Rasterize is the exception: a 2D dispatch of the tile grid, which maxGroups doesn't
 ;; cap; the programs' image sides are at most 2896 (the colours' 128 MiB budget), so it's at most
@@ -73,9 +76,7 @@
 (define countEntries (uint 0))    ; the entries this frame holds: min(total, capacity), the sort's count
 (define countTotal (uint 1))      ; the entries the splats need: the tile counts' sum
 (define countCapacity (uint 2))   ; the capacity this frame had
-(define countDepthBits (uint 3))  ; depthBitsFor(the tile count): the keys' depth bits
-(define countDepthShift (uint 4)) ; depthShift(depth bits, near, far): the keys' depth shift
-(define countSize (uint 5))      ; the elements (SplatGraph says 5: it can't use this)
+(define countSize (uint 3))      ; the elements (SplatGraph says 3: it can't use this)
 
 ;; `splatCounts`, the splats' GPU-side count (shared between frames), element by element. The
 ;; render graph uses splatActive only; the training graph's densification the rest.
@@ -103,81 +104,97 @@
      (write! (at splatCounts k) (if (= k splatActive) splatCount (uint 0))))
    (write! (at splatCommands 0) (DispatchCommand (groupsFor splatCount splatGroupSize maxGroups) 1 1))))
 
-;; 1. Each splat as the camera sees it, and how many tiles it touches (0 when culled)
+;; 1. Each splat as the camera sees it (a tile count of 0 when culled), its depth's sort key
+;; (depthSortKey) and its index, for the depth sort
 (compute-material Preprocess
   (workgroup 64)
   (bindings
    (splats (buffer-array Splat read))
    (cameras (buffer-array Camera read))
    (projected (buffer-array Projected write))
-   (tileCounts (buffer-array uint write))
+   (depthKeys (buffer-array uint write))
+   (depthOrder (buffer-array uint write))
    (splatCounts (buffer-array uint read)))
   (push (cameraIndex uint) (near float) (shDegree uint))
   (compute
    (for ([i (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
      (let* ([p (projectSplat (at splats i) (at cameras cameraIndex) near shDegree)])
        (write! (at projected i) p)
-       (write! (at tileCounts i) p.tileCount)))))
+       (write! (at depthKeys i) (depthSortKey p))
+       (write! (at depthOrder i) i)))))
 
-;; 3a. From the total (reduced into counts), how many entries this frame holds, the keys' depth
-;; bits and shift, and the entry kernels' indirect dispatch (at most maxGroups): one invocation
+;; 2. After the depth sort (depthOrder: the splats front to back), each splat's tile count at its
+;; rank r in that order (tileCounts, for the scan: offsets[r] is its first entry), and its rank
+;; (splatRanks, the inverse permutation: the training graph's gather finds a splat's entries by it)
+(compute-material RankSplats
+  (workgroup 64)
+  (bindings
+   (projected (buffer-array Projected read))
+   (depthOrder (buffer-array uint read))
+   (tileCounts (buffer-array uint write))
+   (splatRanks (buffer-array uint write))
+   (splatCounts (buffer-array uint read)))
+  (compute
+   (for ([r (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
+     (let* ([s (at depthOrder r)])
+       (write! (at tileCounts r) (.tileCount (at projected s)))
+       (write! (at splatRanks s) r)))))
+
+;; 3a. From the total (reduced into counts), how many entries this frame holds, and the entry
+;; kernels' indirect dispatch (at most maxGroups): one invocation
 (compute-material PlanEntries
   (workgroup 1)
   (bindings
    (counts (buffer-array uint read-write))
    (commands (buffer-array DispatchCommand write)))
-  (push (capacity uint) (tileCount uint) (near float) (far float) (maxGroups uint))
+  (push (capacity uint) (maxGroups uint))
   (compute
-   (let* ([entries (min (at counts countTotal) capacity)]
-          [depthBits (depthBitsFor tileCount)])
+   (let* ([entries (min (at counts countTotal) capacity)])
      (write! (at counts countEntries) entries)
      (write! (at counts countCapacity) capacity)
-     (write! (at counts countDepthBits) depthBits)
-     (write! (at counts countDepthShift) (depthShift depthBits near far))
      (write! (at commands 0) (DispatchCommand (groupsFor entries entryGroupSize maxGroups) 1 1)))))
 
-;; 3b. Entry e: the splat whose run of entries holds it (the last whose offset is at most e; culled
-;; splats' runs are empty), the tile it is of that splat's rectangle (row by row), and its key.
-;; Entries sit at fixed positions (offset + index in the run), so they're the same every run.
-;; An entry outside its splat's run (only when the total wrapped past 2^32, so the offsets aren't
-;; ascending) gets key 0xFFFFFFFF: wrong, but within every buffer's bounds.
+;; 3b. Entry e: the rank whose run of entries holds it (the last whose offset is at most e; culled
+;; splats' runs are empty), its splat (depthOrder), the tile it is of that splat's rectangle (row by
+;; row), and the tile as its key. Entries sit at fixed positions (the rank's offset + the index in
+;; the run), so they come front to back, and are the same every run. An entry outside its splat's
+;; run (only when the total wrapped past 2^32, so the offsets aren't ascending) gets key
+;; 0xFFFFFFFF: wrong, but within every buffer's bounds.
 (compute-material EmitEntries
   (workgroup 256)
   (bindings
    (projected (buffer-array Projected read))
+   (depthOrder (buffer-array uint read))
    (offsets (buffer-array uint read))
    (counts (buffer-array uint read))
    (entryKeys (buffer-array uint write))
    (entrySplats (buffer-array uint write))
    (splatCounts (buffer-array uint read)))
-  (push (gridWidth uint) (near float) (far float))
+  (push (gridWidth uint))
   (compute
    (let* ([splatCount (at splatCounts splatActive)]
-          [entries (at counts countEntries)]
-          [depthBits (at counts countDepthBits)]
-          [shift (at counts countDepthShift)])
+          [entries (at counts countEntries)])
      (for ([e (range globalInvocationId.x entries (* entryGroupSize workgroupCount.x))])
        (let* ([(lo hi) (while ([lo (uint 0)] [hi splatCount])
                          (< lo hi)
                          (let* ([mid (/ (+ lo hi) (uint 2))])
                            (if (<= (at offsets mid) e) (values (+ mid (uint 1)) hi) (values lo mid))))]
-              [s (- (max lo (uint 1)) (uint 1))]
+              [r (- (max lo (uint 1)) (uint 1))]
+              [s (at depthOrder r)]
               [p (at projected s)]
-              [k (- e (at offsets s))])
+              [k (- e (at offsets r))])
          (write! (at entrySplats e) s)
          (if (< k p.tileCount)
-             (let* ([w (- p.tiles.z p.tiles.x)]
-                    [tile (+ (* (+ p.tiles.y (/ k w)) gridWidth) p.tiles.x (remainder k w))])
-               (write! (at entryKeys e) (depthKeyShifted tile p.depth depthBits near far shift)))
+             (let* ([w (- p.tiles.z p.tiles.x)])
+               (write! (at entryKeys e) (+ (* (+ p.tiles.y (/ k w)) gridWidth) p.tiles.x (remainder k w))))
              (write! (at entryKeys e) (bitnot (uint 0)))))))))
 
-;; 4. Each tile's entries, [start, end) in the sorted keys: an entry starts its tile's range when
-;; the entry before it is of another tile, and ends it when the one after it is. Tiles without
-;; entries keep the clear's (0, 0). `ranges` holds them as two uints a tile (start at 2t, end at
+;; 4. Each tile's entries, [start, end) in the sorted keys (tiles): an entry starts its tile's
+;; range when the entry before it is of another tile, and ends it when the one after it is. Tiles
+;; without entries keep the clear's (0, 0). `ranges` holds them as two uints a tile (start at 2t, end at
 ;; 2t + 1), not a uvec2: different invocations write a tile's start and end, and WGSL lets a store
 ;; to a vector's component rewrite the whole vector, so on the web the two writes raced (one lost).
-;; Keys of no tile (EmitEntries' 0xFFFFFFFF) only occur after a wrapped total; they read as the
-;; grid's last tile when the tile count is a power of two, which stays in bounds.
+;; Keys of no tile (EmitEntries' 0xFFFFFFFF, only after a wrapped total) are skipped.
 (compute-material TileRanges
   (workgroup 256)
   (bindings
@@ -186,14 +203,13 @@
    (ranges (buffer-array uint write)))
   (push (tileCount uint))
   (compute
-   (let* ([n (at counts countEntries)]
-          [bits (at counts countDepthBits)])
+   (let* ([n (at counts countEntries)])
      (for ([e (range globalInvocationId.x n (* entryGroupSize workgroupCount.x))])
-       (let* ([tile (keyTile (at entryKeys e) bits)])
+       (let* ([tile (at entryKeys e)])
          (when (< tile tileCount)
-           (when (if (= e (uint 0)) #t (not= tile (keyTile (at entryKeys (- e (uint 1))) bits)))
+           (when (if (= e (uint 0)) #t (not= tile (at entryKeys (- e (uint 1)))))
              (write! (at ranges (* tile (uint 2))) e))
-           (when (if (= (+ e (uint 1)) n) #t (not= tile (keyTile (at entryKeys (+ e (uint 1))) bits)))
+           (when (if (= (+ e (uint 1)) n) #t (not= tile (at entryKeys (+ e (uint 1)))))
              (write! (at ranges (+ (* tile (uint 2)) (uint 1))) (+ e (uint 1))))))))))
 
 ;; 5. Each tile's pixels, one invocation each in a 16x16 workgroup per tile (Sec. 6): the
@@ -284,10 +300,8 @@
   (parameter shDegree uint)
   (input splatFile path)
   (input cameraFile path)
-  ;; Depths: splats at most `near` from the camera are culled, and the keys quantize depth between
-  ;; near and far (0 < near < far; depthKey)
+  ;; Splats at most `near` (> 0) from the camera are culled
   (parameter near float)
-  (parameter far float)
   ;; The most workgroups a dispatch has: groupLimit, or less to test the grid-stride loops
   (parameter maxGroups uint)  ; at least 1 (groupsFor), as in the invocations below
   ;; Whether the graph also reads back its inputs and stages for tests (tile_test)
@@ -309,9 +323,14 @@
   (buffer-file splats Splat splatFile)
   (buffer-file cameras Camera cameraFile)
   (buffer projected Projected splatCount #:frames per-frame)
+  ;; The depth sort's keys and splat indices (front to back after it), and each splat's rank
+  (buffer depthKeys uint splatCount #:frames per-frame)
+  (buffer depthOrder uint splatCount #:frames per-frame)
+  (buffer splatRanks uint splatCount #:frames per-frame)
+  ;; By rank: each splat's tile count and first entry
   (buffer tileCounts uint splatCount #:frames per-frame)
   (buffer offsets uint splatCount #:frames per-frame)
-  (buffer counts uint 5 #:frames per-frame)  ; countSize
+  (buffer counts uint 3 #:frames per-frame)  ; countSize
   (buffer commands DispatchCommand 1 #:frames per-frame)
   (buffer splatCounts uint 6 #:frames shared)  ; splatCountsSize
   (buffer splatCommands DispatchCommand 1 #:frames shared)
@@ -328,14 +347,14 @@
 
   (material initializing InitSplatCounts splatCounts splatCommands
             #:push ((splatCount splatCount) (maxGroups maxGroups)) #:invocations (1))
-  (material preprocessing Preprocess splats cameras projected tileCounts splatCounts
+  (material preprocessing Preprocess splats cameras projected depthKeys depthOrder splatCounts
             #:push ((cameraIndex cameraIndex) (near near) (shDegree shDegree)))
+  (material ranking RankSplats projected depthOrder tileCounts splatRanks splatCounts)
   (material planning PlanEntries counts commands
-            #:push ((capacity capacity) (tileCount tileCount) (near near) (far far)
-                    (maxGroups maxGroups))
+            #:push ((capacity capacity) (maxGroups maxGroups))
             #:invocations (1))
-  (material emitting EmitEntries projected offsets counts entryKeys entrySplats splatCounts
-            #:push ((gridWidth gridWidth) (near near) (far far)))
+  (material emitting EmitEntries projected depthOrder offsets counts entryKeys entrySplats splatCounts
+            #:push ((gridWidth gridWidth)))
   (material ranging TileRanges entryKeys counts ranges #:push ((tileCount tileCount)))
   (material rasterizing Rasterize projected entrySplats ranges colours lastEntries rendered
             #:push ((width width) (height height) (background background))
@@ -345,6 +364,8 @@
 
   (dispatch initSplats initializing #:once #t)
   (dispatch preprocess preprocessing #:indirect (at splatCommands 0))
+  (sort sortSplats depthKeys #:values depthOrder #:count splatCount)
+  (dispatch rank ranking #:indirect (at splatCommands 0))
   (exclusive-scan scanTileCounts tileCounts offsets #:op add #:count splatCount)
   (reduce totalTileCounts tileCounts (at counts 1) #:op add #:count splatCount)
   (dispatch plan planning)

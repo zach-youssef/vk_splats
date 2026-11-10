@@ -753,95 +753,40 @@ TEST_CASE("tileRect holds exactly the tiles meeting [mean - r, mean + r), clampe
 // ---------------------------------------------------------------------------------------------
 // Sort keys
 // ---------------------------------------------------------------------------------------------
-TEST_CASE("tileBitsFor and depthBitsFor") {
-    const std::vector<std::pair<uint32_t, uint32_t>> expected = {
-        {0, 1}, {1, 1}, {2, 1}, {3, 2}, {4, 2}, {5, 3}, {2209, 12}, {4096, 12}, {4097, 13},
-        {1u << 20, 20}, {(1u << 20) + 1, 21}, {1u << 31, 31}, {0xFFFFFFFFu, 31}};
-    for (const auto& [count, bits] : expected) {
-        INFO("tileCount " << count);
-        CHECK(sm::tileBitsFor(count) == bits);
-        CHECK(sm::depthBitsFor(count) == 32 - bits);
-        if (count > 0 && count <= (1u << 31)) CHECK(uint64_t(count) <= (uint64_t(1) << bits));
-    }
-}
-
-// depthKey's quantization, independently: the depth's float bits above near's, shifted right by
-// the least shift that fits far's in depthBits
-static uint32_t floatBits(float f) {
+// The key's order, independently: a positive float's bits as an unsigned integer, with the sign
+// bit set (floatSortKey's mapping of positive floats)
+static uint32_t positiveFloatKey(float f) {
     uint32_t u;
     std::memcpy(&u, &f, sizeof(u));
-    return u;
+    return u | 0x80000000u;
 }
 
-static uint32_t referenceDepthQ(float depth, uint32_t bits, float near, float far) {
-    const uint64_t maxQ = (uint64_t(1) << bits) - 1;
-    const uint32_t span = floatBits(far) - floatBits(near);
-    uint32_t shift = 0;
-    while ((span >> shift) > maxQ) ++shift;
-    return (floatBits(std::clamp(depth, near, far)) - floatBits(near)) >> shift;
+static sm::Projected kept(float depth) {
+    sm::Projected p{};
+    p.depth = depth;
+    p.tileCount = 1;
+    return p;
 }
 
-TEST_CASE("depthKey: tile in the high bits, depth by its float bits below, monotonic and clamped") {
-    const float near = 0.2f, far = 100.0f;
-    for (uint32_t tileCount : {1u, 2209u, 1u << 20}) {
-        const uint32_t bits = sm::depthBitsFor(tileCount);
-        const uint32_t maxQ = bits == 32 ? 0xFFFFFFFFu : (1u << bits) - 1;
-        INFO("tileCount " << tileCount << ", depth bits " << bits);
-        for (uint32_t tile : {0u, tileCount / 2, tileCount - 1}) {
-            CHECK(sm::keyTile(sm::depthKey(tile, 1.0f, bits, near, far), bits) == tile);
-            // Clamped at both ends
-            CHECK((sm::depthKey(tile, near, bits, near, far) & maxQ) == 0);
-            CHECK((sm::depthKey(tile, 0.01f, bits, near, far) & maxQ) == 0);
-            CHECK((sm::depthKey(tile, far, bits, near, far) & maxQ) <= maxQ);
-            CHECK(sm::depthKey(tile, 1e6f, bits, near, far) == sm::depthKey(tile, far, bits, near, far));
-            // Close to log scale (float bits are log2 to within 0.09 of an octave, of the 9 here):
-            // far quantizes to the top half of the depth bits (or to the span of the bits, when
-            // they all fit), and the midpoint of the logs to about half of far's
-            const double top = sm::depthKey(tile, far, bits, near, far) & maxQ;
-            CHECK(top >= std::min(maxQ / 2.0, double(floatBits(far) - floatBits(near))));
-            const float mid = std::sqrt(near * far);
-            const double q = sm::depthKey(tile, mid, bits, near, far) & maxQ;
-            CHECK(std::abs(q / top - 0.5) <= 0.01);
-            // Front to back within a tile
-            uint32_t previous = 0;
-            for (int i = 0; i <= 200; ++i) {
-                const float depth = near * std::pow(far / near, i / 200.0f);
-                const uint32_t key = sm::depthKey(tile, depth, bits, near, far);
-                CHECK(sm::keyTile(key, bits) == tile);
-                CHECK((key & maxQ) == referenceDepthQ(depth, bits, near, far));
-                if (i > 0) CHECK(key >= previous);
-                previous = key;
-            }
-        }
-        // Tile-major: any depth in tile t sorts before any in tile t + 1
-        if (tileCount > 1)
-            CHECK(sm::depthKey(0, far, bits, near, far) < sm::depthKey(1, near, bits, near, far));
+TEST_CASE("depthSortKey: the full float depth, front to back, culled splats last") {
+    // Every float apart, near to past far: adjacent floats get adjacent keys, so no two depths tie
+    // (the quantized key this replaced tied depths 128 ulps apart at 1280x720)
+    for (float depth : {0.2f, 1.0f, 4.845015f, 1000.0f, 1e30f}) {
+        const float next = std::nextafter(depth, INFINITY);
+        CHECK(sm::depthSortKey(kept(depth)) == positiveFloatKey(depth));
+        CHECK(sm::depthSortKey(kept(next)) == sm::depthSortKey(kept(depth)) + 1);
     }
-    // 2209 tiles leave 20 bits: depths 0.1% apart get different keys
-    const uint32_t bits = sm::depthBitsFor(2209);
-    CHECK(bits == 20);
-    CHECK(sm::depthKey(7, 5.0f, bits, near, far) < sm::depthKey(7, 5.005f, bits, near, far));
-}
-
-TEST_CASE("depthShift and depthKeyShifted: depthKey with its shift computed once") {
-    for (auto [near, far] : {std::pair{0.2f, 100.0f}, {0.2f, 1000.0f}, {0.01f, 1e6f}, {1.0f, 1.0001f}}) {
-        for (uint32_t tileCount : {1u, 2209u, 1u << 20, 1u << 31}) {
-            const uint32_t bits = sm::depthBitsFor(tileCount);
-            const uint32_t shift = sm::depthShift(bits, near, far);
-            const uint64_t maxQ = (uint64_t(1) << bits) - 1;
-            const uint32_t span = floatBits(far) - floatBits(near);
-            INFO("near " << near << ", far " << far << ", depth bits " << bits << ", shift " << shift);
-            // The least shift that fits the span
-            CHECK((span >> shift) <= maxQ);
-            if (shift > 0) CHECK((span >> (shift - 1)) > maxQ);
-            for (float depth : {near * 0.5f, near, std::sqrt(near * far), far, far * 2.0f}) {
-                CHECK(sm::depthKeyShifted(3, depth, bits, near, far, shift) == sm::depthKey(3, depth, bits, near, far));
-            }
-            // A NaN depth (projectSplat culls it) can't reach the tile bits, whatever clamp gives
-            const uint32_t nanKey = sm::depthKey(1, std::nanf(""), bits, near, far);
-            CHECK(sm::keyTile(nanKey, bits) == 1);
-        }
+    // The pair that blended out of order on a trained scene (docs/paper-conformance.md, departure 1)
+    CHECK(sm::depthSortKey(kept(4.845015f)) < sm::depthSortKey(kept(4.845058f)));
+    // Monotonic over the depths' range
+    uint32_t previous = 0;
+    for (int i = 0; i <= 400; ++i) {
+        const uint32_t key = sm::depthSortKey(kept(0.2f * std::pow(1e4f, i / 400.0f)));
+        if (i > 0) CHECK(key > previous);
+        previous = key;
     }
-    // 0.2 to 1000 with 20 depth bits: a shift of 7, steps of 128 of 2^23 per octave (at most 2^-16)
-    CHECK(sm::depthShift(20, 0.2f, 1000.0f) == 7);
+    // A culled splat (tileCount 0) sorts after every kept one, even an infinitely far one
+    sm::Projected culled{};
+    CHECK(sm::depthSortKey(culled) == 0xFFFFFFFFu);
+    CHECK(sm::depthSortKey(kept(INFINITY)) < sm::depthSortKey(culled));
 }

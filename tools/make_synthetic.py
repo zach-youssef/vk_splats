@@ -222,6 +222,17 @@ S1_VARIANTS: Dict[str, S1Variant] = {
                                             dc=(0.6, 0.6, -1.0))],
                                background=(0.1, 0.2, 0.3), principal_offset=(-3.0, -3.5),
                                note="three faint splats overlapping, stored out of depth order"),
+    # Not a C++ test's setup: two nearly opaque splats (sigmoid(4) = 0.982, under the clamp, and
+    # T stays above 1e-4 behind both) one float apart in depth, the farther (red, a little wider)
+    # stored first. Exact depth sorting puts the green one in front. The front depth's float bits
+    # are bits(0.2) plus a multiple of 128, so the quantized key this replaced (bits(depth) -
+    # bits(near), shifted right by at least 1 with this image's 60 tiles) tied the two, and its
+    # index-order tie drew the red one in front (docs/paper-conformance.md, departure 1)
+    "near-tie": S1Variant(50.0, 160, 96,
+                          [on_axis(3.999988079071045, 0.7, 0.7, 0.2, opacity=4.0, dc=(1.7, -1.7, -1.7)),
+                           on_axis(3.999987840652466, 0.6, 0.6, 0.2, opacity=4.0, dc=(-1.7, 1.7, -1.7))],
+                          background=(0.1, 0.2, 0.3), note="one float apart in depth: the nearer "
+                                                          "(stored second, green) in front"),
 }
 
 

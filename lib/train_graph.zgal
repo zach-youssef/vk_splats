@@ -286,14 +286,15 @@
      ;; The fold's values are only its state
      (when (< t 0.0) (return!)))))
 
-;; 8a. Each sorted entry's position, at the entry's place before the sort (its splat's offset plus
-;; its index in the splat's tile rectangle, row by row: EmitEntries' order), from its tile. Places
-;; no entry maps to keep the clear's 0xFFFFFFFF (only after a wrapped total; GatherGradients
-;; skips them).
+;; 8a. Each sorted entry's position, at the entry's place before the sort (its splat's offset, at
+;; the splat's rank, plus its index in the splat's tile rectangle, row by row: EmitEntries' order),
+;; from its tile (its key). Places no entry maps to keep the clear's 0xFFFFFFFF (only after a
+;; wrapped total; GatherGradients skips them).
 (compute-material InvertEntries
   (workgroup 256)
   (bindings
    (projected (buffer-array Projected read))
+   (splatRanks (buffer-array uint read))
    (offsets (buffer-array uint read))
    (counts (buffer-array uint read))
    (entryKeys (buffer-array uint read))
@@ -301,25 +302,26 @@
    (entryPositions (buffer-array uint write)))
   (push (gridWidth uint))
   (compute
-   (let* ([entries (at counts countEntries)]
-          [bits (at counts countDepthBits)])
+   (let* ([entries (at counts countEntries)])
      (for ([e (range globalInvocationId.x entries (* entryGroupSize workgroupCount.x))])
-       (let* ([p (at projected (at entrySplats e))]
-              [tile (keyTile (at entryKeys e) bits)]
+       (let* ([s (at entrySplats e)]
+              [p (at projected s)]
+              [tile (at entryKeys e)]
               [tx (remainder tile gridWidth)]
               [ty (/ tile gridWidth)]
-              [place (+ (at offsets (at entrySplats e))
+              [place (+ (at offsets (at splatRanks s))
                         (* (- ty p.tiles.y) (- p.tiles.z p.tiles.x)) (- tx p.tiles.x))])
          (when (and (>= tx p.tiles.x) (< tx p.tiles.z) (>= ty p.tiles.y) (< ty p.tiles.w)
                     (< place entries))
            (write! (at entryPositions place) e)))))))
 
 ;; 8b. Each splat's gradients: its entries' (those the frame holds), summed in the order of its
-;; tiles, by one invocation, so the sum is the same every run. Culled splats' are 0.
+;; tiles, by one invocation (one a rank: the splat depthOrder gives, whose entries start at the
+;; rank's offset), so the sum is the same every run. Culled splats' are 0.
 ;; One dispatch is one chunk (BackwardRasterize's): it adds the splat's entries in [chunkFirst,
 ;; chunkFirst + chunkEntries) to the sum the earlier chunks left in splatGradients (the first chunk
-;; starts at 0). A splat's entries have the same depth and ascending tiles, so the sort puts them
-;; in the order of its tiles: the chunk's are a run of them, found by a binary search, and the
+;; starts at 0). A splat's entries are emitted together in ascending tiles, so the stable sort by
+;; tile keeps them in the order of its tiles: the chunk's are a run of them, found by a binary search, and the
 ;; chunks add the same entries in the same order as one pass, bit for bit. Places past the frame's
 ;; entries (a truncated frame's) map to none, after every entry; an entry outside the chunk (only
 ;; after a wrapped total) adds nothing.
@@ -327,6 +329,7 @@
   (workgroup 64)
   (bindings
    (projected (buffer-array Projected read))
+   (depthOrder (buffer-array uint read))
    (offsets (buffer-array uint read))
    (counts (buffer-array uint read))
    (entryPositions (buffer-array uint read))
@@ -338,8 +341,9 @@
    (let* ([entries (at counts countEntries)]
           [chunkEnd (+ chunkFirst chunkEntries)]
           [none (bitnot (uint 0))])
-     (for ([s (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
-       (let* ([first (at offsets s)]
+     (for ([r (range globalInvocationId.x (at splatCounts splatActive) (* splatGroupSize workgroupCount.x))])
+       (let* ([s (at depthOrder r)]
+              [first (at offsets r)]
               [tileCount (.tileCount (at projected s))]
               ;; The splat's first tile whose entry is in the chunk or after it
               [(low high)
@@ -900,7 +904,6 @@
   (input splatFile path)
   (input cameraFile path)
   (parameter near float)
-  (parameter far float)
   (parameter maxGroups uint)
   ;; Whether the graph also reads back the scene, the projections and the gradients, for tests
   (parameter inspect bool)
@@ -982,9 +985,12 @@
   (buffer-file cameras Camera cameraFile)
   (buffer-file targets uint targetFile)
   (buffer projected Projected maxSplats #:frames per-frame)
+  (buffer depthKeys uint maxSplats #:frames per-frame)
+  (buffer depthOrder uint maxSplats #:frames per-frame)
+  (buffer splatRanks uint maxSplats #:frames per-frame)
   (buffer tileCounts uint maxSplats #:frames per-frame)
   (buffer offsets uint maxSplats #:frames per-frame)
-  (buffer counts uint 5 #:frames per-frame)  ; countSize
+  (buffer counts uint 3 #:frames per-frame)  ; countSize
   (buffer commands DispatchCommand 1 #:frames per-frame)
   (buffer splatCounts uint 6 #:frames shared)  ; splatCountsSize
   (buffer splatCommands DispatchCommand 1 #:frames shared)
@@ -1037,8 +1043,9 @@
 
   (material initializing InitSplatCounts splatCounts splatCommands
             #:push ((splatCount splatCount) (maxGroups maxGroups)) #:invocations (1))
-  (material preprocessing Preprocess splats cameras projected tileCounts splatCounts
+  (material preprocessing Preprocess splats cameras projected depthKeys depthOrder splatCounts
             #:push ((cameraIndex cameraIndex) (near near) (shDegree shDegree)))
+  (material ranking RankSplats projected depthOrder tileCounts splatRanks splatCounts)
   (material perturbing Perturb splats cameras projected
             #:push ((splatCount splatCount) (splat perturbSplat) (field perturbField) (delta perturbDelta)
                     (cameraIndex cameraIndex) (near near) (shDegree shDegree))
@@ -1058,11 +1065,10 @@
             #:push ((capacity maxSplats) (maxGroups maxGroups)) #:invocations (1) #:when train)
   (material resetting ResetOpacity splats adamM adamV splatCounts #:when train)
   (material planning PlanEntries counts commands
-            #:push ((capacity (min capacity entryMost)) (tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16))) (near near) (far far)
-                    (maxGroups maxGroups))
+            #:push ((capacity (min capacity entryMost)) (maxGroups maxGroups))
             #:invocations (1))
-  (material emitting EmitEntries projected offsets counts entryKeys entrySplats splatCounts
-            #:push ((gridWidth (/ (+ width 15) 16)) (near near) (far far)))
+  (material emitting EmitEntries projected depthOrder offsets counts entryKeys entrySplats splatCounts
+            #:push ((gridWidth (/ (+ width 15) 16))))
   (material ranging TileRanges entryKeys counts ranges #:push ((tileCount (* (/ (+ width 15) 16) (/ (+ height 15) 16)))))
   (material rasterizing Rasterize projected entrySplats ranges colours lastEntries rendered
             #:push ((width width) (height height) (background background))
@@ -1107,9 +1113,9 @@
             entryGradients
             #:push ((width width) (height height) (background background) (chunkFirst 0)
                     (chunkEntries chunkSize)))
-  (material inverting InvertEntries projected offsets counts entryKeys entrySplats entryPositions
+  (material inverting InvertEntries projected splatRanks offsets counts entryKeys entrySplats entryPositions
             #:push ((gridWidth (/ (+ width 15) 16))))
-  (material gathering GatherGradients projected offsets counts entryPositions entryGradients
+  (material gathering GatherGradients projected depthOrder offsets counts entryPositions entryGradients
             splatGradients splatCounts
             #:push ((chunkFirst 0) (chunkEntries chunkSize)))
   (material backwardPreprocessing BackwardPreprocess splats cameras projected splatGradients
@@ -1129,6 +1135,8 @@
   ;; The forward pass: SplatGraph's, over the splats in use
   (dispatch preprocess preprocessing #:indirect (at splatCommands 0))
   (dispatch perturb perturbing #:when finiteDifferences)
+  (sort sortSplats depthKeys #:values depthOrder #:count (at splatCounts 0))  ; splatActive
+  (dispatch rank ranking #:indirect (at splatCommands 0))
   (exclusive-scan scanTileCounts tileCounts offsets #:op add #:count (at splatCounts 0))  ; splatActive
   (reduce totalTileCounts tileCounts (at counts 1) #:op add #:count (at splatCounts 0))
   (dispatch plan planning)

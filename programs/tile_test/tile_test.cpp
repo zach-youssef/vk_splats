@@ -1,20 +1,23 @@
 // tile_test's check: one frame's readbacks of the tile pipeline (lib/render_graph.zgal) against a
-// CPU loop over the splat math's generated C++ (tileRect, tileCountOf, depthKey, depthBitsFor).
+// CPU loop over the splat math's generated C++ (tileRect, tileCountOf, depthSortKey).
 //
 // The CPU recomputes the stages from the GPU's projections (each splat's mean, radius and depth),
 // so everything after the preprocess is compared exactly, with no tolerance:
 //   - each splat's tile rectangle and count: tileRect(mean, radius) (floor and ceil);
-//   - every entry's key: depthKey(tile, depth) (the depth quantization), and its splat;
-//   - the entries' order: by key, ties by splat index (the sort is stable and entries start in
-//     splat order: docs/architecture.md), so the keys and splats match position for position;
-//   - each tile's range [start, end): its entries, sorted by key, without duplicate splats.
+//   - the splats' depth order: by depthSortKey (the float depth), ties by splat index (a stable
+//     sort);
+//   - every entry's key (its tile) and splat, emitted in that order, then stably sorted by tile
+//     (docs/architecture.md), so the keys and splats match position for position: each tile's
+//     entries front to back by their full float depths;
+//   - each tile's range [start, end): its entries, of that tile, front to back, without duplicate
+//     splats.
 // The preprocess itself is compared with the CPU's projectSplat: whether each splat is culled
 // exactly, its mean, depth and radius to float precision (the GPU's exp, sqrt and division
 // needn't round as C++'s do). A degenerate splat (a zero quaternion, an overflowing scale; the
 // last --culled-tail splats) must be culled on both, and a kept one's radius below 2^31.
 //
 // A frame that overflowed its capacity is checked too: it must hold exactly the first `capacity`
-// entries of the CPU's list in splat order (whole splats, then part of one), sorted, with the
+// entries of the CPU's list in depth order (whole splats, then part of one), sorted, with the
 // ranges of those. check() says which kind of frame it checked, so the app can require both.
 #include "tile_test.zgal.h"
 
@@ -63,7 +66,7 @@ std::string str(glm::uvec4 v) {
 uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& cameras,
                const zgal::Data<uint32_t>& counts, const zgal::Data<Projected>& projected,
                const zgal::Data<uint32_t>& entryKeys, const zgal::Data<uint32_t>& entrySplats,
-               const zgal::Data<uint32_t>& ranges, uint32_t cameraIndex, uint32_t shDegree, float near, float far,
+               const zgal::Data<uint32_t>& ranges, uint32_t cameraIndex, uint32_t shDegree, float near,
                uint32_t culledTail) {
     if (counts.size() != countSize) return checkedNothing;
     const uint32_t entries = counts[countEntries];
@@ -98,24 +101,18 @@ uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& camera
                   << std::endl;
         std::exit(1);
     }
-    const uint32_t depthBits = depthBitsFor(tileCount);
-    if (counts[countDepthBits] != depthBits) fail("depth bits: GPU " + std::to_string(counts[countDepthBits]) +
-                                                  ", CPU " + std::to_string(depthBits));
-    const uint32_t shift = depthShift(depthBits, near, far);
-    if (counts[countDepthShift] != shift) fail("depth shift: GPU " + std::to_string(counts[countDepthShift]) +
-                                               ", CPU " + std::to_string(shift));
     // min(total, capacity): all of them, or as many as the capacity holds
     if (entries != std::min(total, capacity)) {
         fail("entries " + std::to_string(entries) + " of a total " + std::to_string(total) + " and a capacity " +
              std::to_string(capacity));
     }
 
-    // The preprocess against the CPU's, and each kept splat's entries from the GPU's projection
+    // The preprocess against the CPU's, and the kept splats, to sort by depth
     struct Entry {
         uint32_t key;
         uint32_t splat;
     };
-    std::vector<Entry> expected;
+    std::vector<Entry> order;
     uint32_t culled = 0;
     for (uint32_t i = 0; i < splats.size(); ++i) {
         const Projected& gpu = projected[i];
@@ -152,18 +149,24 @@ uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& camera
             fail(at + "tiles " + str(gpu.tiles) + " (" + std::to_string(gpu.tileCount) + "), CPU's tileRect " +
                  str(rect) + " (" + std::to_string(tileCountOf(rect)) + ")");
         }
+        order.push_back({depthSortKey(gpu), i});
+    }
+    // The splats front to back, equal depths in index order; then their entries in that order,
+    // each splat's tiles row by row (EmitEntries'), the tile as the key
+    std::stable_sort(order.begin(), order.end(), [](const Entry& a, const Entry& b) { return a.key < b.key; });
+    std::vector<Entry> expected;
+    for (const Entry& o : order) {
+        const glm::uvec4 rect = projected[o.splat].tiles;
         for (uint32_t y = rect.y; y < rect.w; ++y) {
-            for (uint32_t x = rect.x; x < rect.z; ++x) {
-                expected.push_back({depthKey(y * grid.x + x, gpu.depth, depthBits, near, far), i});
-            }
+            for (uint32_t x = rect.x; x < rect.z; ++x) expected.push_back({y * grid.x + x, o.splat});
         }
     }
     if (expected.size() != total) {
         fail("the GPU's total is " + std::to_string(total) + " entries, the CPU's " + std::to_string(expected.size()));
     }
-    // An overflowing frame holds the first `capacity` entries in splat order
+    // An overflowing frame holds the first `capacity` entries in depth order
     if (overflowed && expected.size() > capacity) expected.resize(capacity);
-    // Entries start in splat order, so a stable sort by key orders ties by splat index
+    // Entries start in depth order, so a stable sort by tile keeps each tile's front to back
     std::stable_sort(expected.begin(), expected.end(), [](const Entry& a, const Entry& b) { return a.key < b.key; });
 
     // The sorted entries, position for position
@@ -174,17 +177,16 @@ uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& camera
         const uint32_t splat = entrySplats[e];
         if (key != expected[e].key || splat != expected[e].splat) {
             ++keyMismatches;
-            fail("entry " + std::to_string(e) + ": GPU key " + std::to_string(key) + " (tile " +
-                 std::to_string(keyTile(key, depthBits)) + ") splat " + std::to_string(splat) + ", CPU key " +
-                 std::to_string(expected[e].key) + " (tile " + std::to_string(keyTile(expected[e].key, depthBits)) +
-                 ") splat " + std::to_string(expected[e].splat));
+            fail("entry " + std::to_string(e) + ": GPU tile " + std::to_string(key) + " splat " +
+                 std::to_string(splat) + ", CPU tile " + std::to_string(expected[e].key) + " splat " +
+                 std::to_string(expected[e].splat));
         }
     }
 
-    // Each tile's range: the CPU's count of entries, sorted by key, without a splat twice
+    // Each tile's range: the CPU's count of entries, front to back, without a splat twice
     std::vector<glm::uvec2> expectedRanges(tileCount, glm::uvec2(0u));
     for (uint32_t e = 0; e < expected.size(); ++e) {
-        const uint32_t tile = keyTile(expected[e].key, depthBits);
+        const uint32_t tile = expected[e].key;
         if (expectedRanges[tile] == glm::uvec2(0u)) expectedRanges[tile].x = e;
         expectedRanges[tile].y = e + 1;
     }
@@ -202,8 +204,10 @@ uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& camera
         largest = std::max(largest, r.y - r.x);
         std::set<uint32_t> seen;
         for (uint32_t e = r.x; e < r.y && e < entries; ++e) {
-            if (keyTile(entryKeys[e], depthBits) != t) fail("tile " + std::to_string(t) + "'s entry " + std::to_string(e) + " is of another tile");
-            if (e > r.x && entryKeys[e] < entryKeys[e - 1]) fail("tile " + std::to_string(t) + " isn't sorted at entry " + std::to_string(e));
+            if (entryKeys[e] != t) fail("tile " + std::to_string(t) + "'s entry " + std::to_string(e) + " is of another tile");
+            if (e > r.x && projected[entrySplats[e]].depth < projected[entrySplats[e - 1]].depth) {
+                fail("tile " + std::to_string(t) + " isn't front to back at entry " + std::to_string(e));
+            }
             if (!seen.insert(entrySplats[e]).second) {
                 fail("tile " + std::to_string(t) + " holds splat " + std::to_string(entrySplats[e]) + " twice");
             }
@@ -211,7 +215,7 @@ uint32_t check(const zgal::Data<Splat>& splats, const zgal::Data<Camera>& camera
     }
 
     std::cout << "tile_test: " << (overflowed ? "overflowing frame, " : "") << "camera " << cameraIndex << " (" << cam.size.x << "x" << cam.size.y << ", " << tileCount
-              << " tiles, " << depthBits << " depth bits): " << splats.size() << " splats, " << culled
+              << " tiles): " << splats.size() << " splats, " << culled
               << " culled, " << total << " entries in " << occupied << " tiles (at most " << largest
               << " in one), capacity " << capacity << ", " << entries << " held" << std::endl;
     if (fail.count > 0) {

@@ -25,7 +25,6 @@
   (parameter height uint)
   (parameter shDegree uint)
   (parameter near float)
-  (parameter far float)
   (parameter capacity uint)
   (parameter maxGroups uint)
   (parameter backgroundR float)
@@ -111,7 +110,7 @@
       [else state]))
   (run SplatGraph (splatFile splatFile) (cameraFile cameraFile) (splatCount splatCount)
        (cameraIndex cameraIndex) (width width) (height height) (shDegree shDegree) (near near)
-       (far far) (maxGroups maxGroups) (inspect #t) (capacity capacity)
+       (maxGroups maxGroups) (inspect #t) (capacity capacity)
        (background (vec3 backgroundR backgroundG backgroundB)) (window #f) (capture #f)
        (presentScale (vec2 1.0))))
 
@@ -131,7 +130,6 @@
           #:range (1 2896))
   (option shDegree "--sh-degree" "the SH bands to evaluate" #:default 3 #:range (0 3))
   (option near "--near" "the near plane" #:default 0.2)
-  (option far "--far" "the depth keys' far depth" #:default 1000.0)
   (option capacity "--capacity" "the tile entries' capacity (fixed; a frame needing more fails)"
           #:default 262144 #:range (1 33554432))
   (option maxGroups "--max-groups" "the most workgroups a dispatch has (groupLimit, 65535, or less to test the grid-stride loops)"

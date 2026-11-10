@@ -1,6 +1,6 @@
 ;; The tile pipeline's test (lib/render_graph.zgal): it runs the graph for one camera of a scene,
 ;; reads back every stage, and has C++ (tile_test.cpp, `check`) compare the tile entries and each
-;; tile's range exactly with a CPU loop over the splat math's C++ (tileRect, depthKey) on the GPU's
+;; tile's range exactly with a CPU loop over the splat math's C++ (tileRect, depthSortKey) on the GPU's
 ;; projections. The entries' capacity starts at --initial-entries, so a small one makes the first
 ;; frames overflow and the app grow it (grownCapacity). test.sh runs it on S2, S3 and degenerate
 ;; splats, some with a small --max-groups so the kernels' grid-stride loops run. It passes once a
@@ -24,7 +24,6 @@
   (parameter height uint)
   (parameter shDegree uint)
   (parameter near float)
-  (parameter far float)
   (parameter initialEntries uint)
   (parameter maxGroups uint)
   (parameter culledTail uint)
@@ -33,7 +32,7 @@
   (extern (check [splats : (data Splat)] [cameras : (data Camera)] [counts : (data uint)]
                  [projected : (data Projected)] [entryKeys : (data uint)] [entrySplats : (data uint)]
                  [ranges : (data uint)] [cameraIndex : uint] [shDegree : uint] [near : float]
-                 [far : float] [culledTail : uint]) : uint)
+                 [culledTail : uint]) : uint)
   ;; Exits the program with status 1
   (extern (fail) : void)
   (state
@@ -65,7 +64,7 @@
                        (> (count state.splats) 0) (> (count state.cameras) 0))]
            [result (if ready
                        (check state.splats state.cameras state.counts state.projected state.entryKeys
-                              state.entrySplats state.ranges cameraIndex shDegree near far culledTail)
+                              state.entrySplats state.ranges cameraIndex shDegree near culledTail)
                        checkedNothing)]
            [overflowChecked (or state.checkedOverflow (= result checkedOverflowing))]
            ;; A capacity below the total must have overflowed (checked) and grown
@@ -100,7 +99,7 @@
         [else (with state #:checkedOverflow overflowChecked)])))
   (run SplatGraph (splatFile splatFile) (cameraFile cameraFile) (splatCount splatCount)
        (cameraIndex cameraIndex) (width width) (height height) (shDegree shDegree) (near near)
-       (far far) (maxGroups maxGroups) (inspect #t) (capacity state.capacity)
+       (maxGroups maxGroups) (inspect #t) (capacity state.capacity)
        ;; The rasterizer's settings: tile_test doesn't check its output
        (background (vec3 0.0)) (window #f) (capture #f) (presentScale (vec2 1.0))))
 
@@ -120,7 +119,6 @@
           #:range (1 2896))
   (option shDegree "--sh-degree" "the SH bands to evaluate" #:default 3 #:range (0 3))
   (option near "--near" "the near plane" #:default 0.2)
-  (option far "--far" "the depth keys' far depth" #:default 1000.0)
   (option initialEntries "--initial-entries" "the entries' first capacity" #:default 16
           #:range (1 33554432))
   (option maxGroups "--max-groups" "the most workgroups a dispatch has (groupLimit, 65535, or less to test the grid-stride loops)"

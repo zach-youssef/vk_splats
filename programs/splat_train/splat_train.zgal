@@ -124,7 +124,6 @@
   (parameter targetPixels uint)
   (parameter shDegree uint)
   (parameter near float)
-  (parameter far float)
   (parameter initialEntries uint)
   (parameter maxEntries uint)
   (parameter chunkEntries uint)
@@ -331,7 +330,7 @@
        (targetOffset (if (= state.phase phaseLoading) (uint 0) (.pixelOffset (at state.cameras state.camera))))
        (targetPixels targetPixels)
        (shDegree (min shDegree (/ (if (= state.phase phaseTraining) state.iteration iterations) (max shInterval (uint 1)))))
-       (near near) (far far) (maxGroups groupLimit) (inspect #f) (finiteDifferences #f)
+       (near near) (maxGroups groupLimit) (inspect #f) (finiteDifferences #f)
        (maxEntries maxEntries) (chunkEntries chunkEntries)
        (capacity state.capacity) (background (vec3 background))
        (loss (if (= state.phase phaseTraining) lossL1 lossEval))
@@ -400,7 +399,6 @@
   (option targetPixels "--target-pixels" "the pixels the images hold (the file's size / 4)" #:default 0)
   (option shDegree "--sh-degree" "the SH degree training reaches" #:default 3 #:range (0 3))
   (option near "--near" "the near plane" #:default 0.2)
-  (option far "--far" "the depth keys' far depth" #:default 1000.0)
   (option initialEntries "--initial-entries" "the tile entries' first capacity (at most --max-entries)"
           #:default 1048576 #:range (1 33554432))
   ;; At most 2^25 (entryCapacityMax: the keys' 128 MiB binding); the capacity, and the memory the

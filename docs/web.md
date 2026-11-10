@@ -15,9 +15,10 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | Kernel | Storage buffers (max 8) | Uniforms (max 12) | Storage textures (max 4) | Workgroup memory (max 16384 B) | Invocations (max 256) |
 |---|---|---|---|---|---|
 | InitSplatCounts | 2 | 1 | 0 | 0 | 1 |
-| Preprocess | 5 | 1 | 0 | 0 | 64 |
+| Preprocess | 6 | 1 | 0 | 0 | 64 |
+| RankSplats | 5 | 0 | 0 | 0 | 64 |
 | PlanEntries | 2 | 1 | 0 | 0 | 1 |
-| EmitEntries | 6 | 1 | 0 | 0 | 256 |
+| EmitEntries | 7 | 1 | 0 | 0 | 256 |
 | TileRanges | 3 | 1 | 0 | 0 | 256 |
 | Rasterize | 5 | 1 | 1 (`rgba8unorm`) | 10240 B (256 × (8 + 16 + 16): a batch's means, conics and opacities, colours) | 16 × 16 |
 | Loss | 4 | 1 | 0 | 0 | 256 |
@@ -25,9 +26,9 @@ without subgroups embedded in `splat_render.zgal.ts`):
 | SsimColumns | 8 (at the limit) | 1 | 0 | 0 | 256 |
 | TileLasts | 3 | 1 | 0 | 0 | 64 |
 | BackwardRasterize | 7 | 1 | 0 | 14912 B (128 × (8 + 16 + 16) for a batch, 9 × 256 × 4 and 9 × 16 × 4 for the reduction) | 16 × 16 |
-| InvertEntries | 6 | 1 | 0 | 0 | 256 |
+| InvertEntries | 7 | 1 | 0 | 0 | 256 |
 | PlanChunks | 4 | 1 | 0 | 0 | 1 |
-| GatherGradients | 7 | 1 | 0 | 0 | 64 |
+| GatherGradients | 8 (at the limit) | 1 | 0 | 0 | 64 |
 | BackwardPreprocess | 7 | 1 | 0 | 0 | 64 |
 | Adam | 6 | 1 | 0 | 0 | 64 |
 | Record | 3 | 1 | 0 | 0 | 1 |

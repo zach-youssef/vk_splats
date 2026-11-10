@@ -10,15 +10,11 @@
    (cameras (buffer-array Camera))
    (projected (buffer-array Projected))
    (keys (buffer-array uint)))
-  (push (count uint) (near float) (far float) (shDegree uint))
+  (push (count uint) (near float) (shDegree uint))
   (compute
    (let* ([i globalInvocationId.x])
      (when (< i count)
        (let* ([cam (at cameras 0)]
-              [p (projectSplat (at splats i) cam near shDegree)]
-              [grid (tileGrid cam.size)]
-              [depthBits (depthBitsFor (* grid.x grid.y))])
+              [p (projectSplat (at splats i) cam near shDegree)])
          (write! (at projected i) p)
-         (write! (at keys i)
-                 (keyTile (depthKey (+ (* p.tiles.y grid.x) p.tiles.x) p.depth depthBits near far)
-                          depthBits)))))))
+         (write! (at keys i) (depthSortKey p)))))))

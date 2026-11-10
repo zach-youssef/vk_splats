@@ -107,13 +107,18 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
 
 ## Departures
 
-1. **Sort key**: 32 bits (tile, then the depth quantized by its float bits, close to log spaced:
-   [architecture.md](architecture.md#splat-math)) instead of 64, with ties in splat-index order.
-   Fallback if depth quantization shows: two sorts. It shows on a trained scene: at 1280×720
-   (20 depth bits, near 0.2, far 1000) depths within one step, about 2⁻¹⁶ of the depth, tie, and
-   two nearly opaque splats that tie and overlap blend in index order instead of depth order, up
-   to 22/255 at a pixel ([below](#the-viewer-on-a-real-scene)). A fix is planned in follow-up
-   work: the two sorts (splats by float depth, then the entries stably by tile).
+1. **Sort key** (resolved): two 32-bit sorts instead of one 64-bit one, in the same order. The
+   splats are sorted by their depth's float bits (the reference's low 32 bits; `floatSortKey`
+   sets the sign bit, which keeps the order), then the entries stably by tile (its high 32), so
+   each tile's entries are front to back by the full float depth, with exactly equal depths in
+   splat-index order, as the reference's stable sort leaves them
+   ([architecture.md](architecture.md#splat-math)). It replaced one 32-bit key with the depth
+   quantized to the bits the tile left, whose ties (about 2⁻¹⁶ of the depth with 12 tile bits) let
+   nearly coplanar splats blend in index order: up to 22/255 at a pixel on a real scene, 3–4/255
+   since ([below](#the-viewer-on-a-real-scene)); S1's `near-tie` scene pins the order. The far plane only bounded that key, so the programs'
+   `--far` option is gone. The cost is the depth sort and a ranking pass: 7.2 to 8.6 ms of GPU
+   time a frame at 1280×720 with 327k splats (MoltenVK). The tile sort still runs all 8 of its
+   4-bit passes, where the tile count needs only ⌈tileBits/4⌉.
 2. **Capacity**: a fixed splat capacity (the required `--max-splats`), compacted by scan, where the
    paper's count is unbounded. ZGAL recreates a buffer, losing its contents, when its per-frame
    size changes, so only scratch buffers grow.
@@ -204,7 +209,7 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     not an edge or a band. On S3, Rasterize without the stop changes 9 of 16384
     pixels (camera 0) and 13 of 15360 (camera 24), each by 1/255. On the real scene
     ([below](#the-viewer-on-a-real-scene)) departures 18 and 19 together change a pixel by at most
-    3–4/255; the larger differences there come from departure 1.
+    3–4/255; the larger differences there came from departure 1's old key.
 19. **The viewer blends a splat only inside its 3σ square**: SplatQuad's quad is the square of the
     splat's radius around its mean, the radius being 3σ along the larger axis, rounded up to
     pixels. Rasterize evaluates every pixel of the tiles that square meets (departure 7), so it
@@ -216,15 +221,16 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     footprint is cut at its tile rectangle, a step of the same size at tile edges. On S3 (opacity
     0.3-0.95), clipping Rasterize to the square changes no pixel. On the real scene
     ([below](#the-viewer-on-a-real-scene)) departures 18 and 19 together change a pixel by at most
-    3–4/255, within the bounds above; the larger differences there come from departure 1.
+    3–4/255, within the bounds above; the larger differences there came from departure 1's old key.
 
 ## The viewer on a real scene
 
 On the published cs5330 scene ([results.md](results.md#the-published-scene)), splat_view and
-splat_render differ by up to 22/255 in small clusters and short vertical streaks. These come from
-splat_render's 32-bit sort key (departure 1), not from the viewer's departures: tied depth keys
-blend some overlapping splats in the wrong order. Departures 18 and 19 together stay within
-3–4/255 here, so on this evidence they hold for real scenes too. Most of the rest, the ±1/255
+splat_render differ by at most 3–4/255. Before departure 1's fix they differed by up to 22/255 in
+small clusters and short vertical streaks, which came from splat_render's old 32-bit sort key, not
+from the viewer's departures: tied depth keys blended some overlapping splats in the wrong order.
+Departures 18 and 19 together stay within 3–4/255 here, so on this evidence they hold for real
+scenes too. Most of the rest, the ±1/255
 noise and the viewer's slightly darker mean, is the viewer's f16 `accum`.
 
 The two renderers drew the same splats from the same cameras at 1280×720, background 0, near 0.2,
@@ -237,7 +243,8 @@ splat_view fits it. The PLY columns are those two renders, without any encoding.
 columns are splat_view on the published `scene.stream` against the same splat_render image, so
 they add the web preset's quantization. PSNR is over RGB on 0–255; max is the largest difference
 in any channel, in 1/255; ">1" and ">2" count the pixels whose largest channel difference is over
-1/255 and 2/255, of 921,600.
+1/255 and 2/255, of 921,600. The table was measured before departure 1's fix, with the old
+sort key; the rows after it follow.
 
 | Camera | PLY PSNR | PLY max | PLY >1 | PLY >2 | Stream PSNR | Stream max | Stream >1 | Stream >2 |
 |---|---|---|---|---|---|---|---|---|
@@ -249,6 +256,22 @@ in any channel, in 1/255; ">1" and ">2" count the pixels whose largest channel d
 | 1 | 54.21 dB | 6 | 18,217 | 712 | 53.23 dB | 6 | 23,110 | 1,813 |
 | 0 (held out) | 54.06 dB | 18 | 6,302 | 248 | 53.34 dB | 18 | 13,945 | 622 |
 | 24 (held out) | 55.10 dB | 9 | 15,864 | 1,059 | 53.75 dB | 10 | 22,855 | 2,292 |
+
+After the fix (splat_render sorting by the full float depth), the PLY columns, the same way:
+
+| Camera | PLY PSNR | PLY max | PLY >1 | PLY >2 |
+|---|---|---|---|---|
+| 34 (the start view) | 53.92 dB | 3 | 7,542 | 71 |
+| 4 | 54.58 dB | 3 | 1,463 | 11 |
+| 9 | 53.85 dB | 4 | 20,963 | 1,345 |
+| 41 | 54.39 dB | 4 | 17,789 | 764 |
+| 45 | 54.14 dB | 4 | 15,545 | 935 |
+| 1 | 54.24 dB | 4 | 17,853 | 629 |
+| 0 (held out) | 54.14 dB | 3 | 5,855 | 58 |
+| 24 (held out) | 55.17 dB | 4 | 15,108 | 848 |
+
+The clusters and streaks are gone; the rest is departures 18 and 19 and the f16 `accum`. The
+bullets below describe the measurements before the fix.
 
 - **Against S3's bound**: on the fixtures each departure changes a pixel by at most 1/255. Here,
   without the encoding, 0.17–2.3% of the pixels differ by more than 1/255 (1,544 to 21,568),
@@ -281,8 +304,8 @@ in any channel, in 1/255; ">1" and ">2" count the pixels whose largest channel d
   closely (37 pixels over 8/255, 78% at residues 14, 15, 0 and 1), all move by exactly 8 pixels
   when the camera's cx moves by 8, with the same counts, and the share at those residues drops
   to 0%: they follow the scene, not the tile grid.
-- **The cause: tied sort keys in splat_render (departure 1).** At 1280×720 the key keeps 20
-  depth bits, so with near 0.2 and far 1000 a step is 128 float ulps, about 2⁻¹⁶ of the depth.
+- **The cause: tied sort keys in splat_render (departure 1, since fixed).** At 1280×720 the old
+  key kept 20 depth bits, so with near 0.2 and far 1000 a step is 128 float ulps, about 2⁻¹⁶ of the depth.
   Two splats within a step share a key and blend in splat-index order, the lower index in front;
   the viewer sorts by the float depth. Camera 0's streak at x = 896–897 is two nearly opaque
   splats (α 0.86 and 0.82 there) of different colours at depths 4.845015 and 4.845058, 90 ulps
@@ -306,7 +329,7 @@ in any channel, in 1/255; ">1" and ">2" count the pixels whose largest channel d
   but the largest differences stay within 2/255 of the PLY's: the outliers come from the
   renderers, not the encoding.
 
-The amplified difference (×32) for the start view, camera 34, from the PLY:
+The amplified difference (×32) for the start view, camera 34, from the PLY, before the fix:
 
 ![|splat_view − splat_render| × 32, camera 34](results/site-scene-camera34-diff.png)
 

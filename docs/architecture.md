@@ -99,9 +99,10 @@ Per frame, rendering follows the paper's tile-based rasterizer:
 1. **Preprocess** (per splat): 3D covariance from scale and rotation, EWA projection to a 2D conic
    (plus 0.3 on the diagonal), a 3σ radius, near-plane and off-screen culling, the tile rectangle,
    and the SH colour for the view direction.
-2. **Tile entries**: an exclusive scan of the per-splat tile counts sizes the entry buffer; each
-   splat writes one 32-bit key (tile, then quantized depth) per tile it covers.
-3. **Sort** the keys with their splat indices, once, globally.
+2. **Tile entries**: a sort of the splats by their full float depth, front to back; an exclusive
+   scan of their tile counts, in that order, sizes the entry buffer; each splat writes one entry
+   (its tile as the key, and its index) per tile it covers.
+3. **Sort** the entries by tile, stably, so each tile's entries keep the depth order.
 4. **Tile ranges**: each tile's range of entries, from comparing neighbouring keys.
 5. **Rasterize**: one 16×16 workgroup per tile blends its range front to back, in shared-memory
    batches, writing the colour, the final transmittance and the last contributor (kept for the
@@ -183,38 +184,37 @@ closed-form oracles (`tests/oracle/closed_form.h`) and independent derivations.
   that meet the open square (mean − r, mean + r), so it covers every pixel centre within r of the
   mean in both axes. This departs from the reference code
   ([paper-conformance.md](paper-conformance.md), departure 7).
-- **Sort keys** (departure 1 in [paper-conformance.md](paper-conformance.md)): one 32-bit key per
-  tile entry, the tile index in the high `tileBits` = ⌈log₂ tileCount⌉ (1 to 31) bits and the depth
-  in the low `depthBits` = 32 − tileBits. 748×748 has 2209 tiles: 12 tile bits, 20 depth bits. The
-  depth, clamped to [`near`, `far`], is quantized by its float bits: a positive float's bits grow
-  with its value, 2²³ steps per octave (exponent plus mantissa is log₂ to within 0.09 of an octave),
-  so `bits(depth) − bits(near)`, shifted right by the least shift that fits `bits(far) − bits(near)`
-  in depthBits, is close to log spaced. It uses integer operations only, so the GPU and the C++
-  agree exactly; a log-based key wouldn't: a GPU's `log` needn't round as C++'s does, and an ulp can
-  move a key across a step. With near 0.2 and far 1000, 20 depth bits give steps of at most 2⁻¹⁶ of
-  the depth. The shift depends only on near, far and depthBits, so kernels keying many entries
-  compute it once (`depthShift`, `depthKeyShifted`). The quantized depth is clamped to depthBits
-  too, so not even a NaN depth reaches the tile bits. `depthKey` requires 0 < near < far and
-  tile < 2^tileBits, unchecked. Keys tie for depths within one step and for all depths ≥ far, so
-  ties need a rule for determinism: the render graph's ([below](#render-graph)).
+- **Sort keys** (departure 1 in [paper-conformance.md](paper-conformance.md)): the paper's one
+  64-bit key (tile, then depth) is two 32-bit sorts. `depthSortKey` keys a splat by its depth's
+  `floatSortKey` (ZGAL's `sorting`: a uint that sorts as the float does), so the key orders
+  depths exactly, with no quantization, and the GPU and the C++ agree bit for bit (integer
+  comparisons only). A kept splat's depth is above near > 0 (its key at most infinity's,
+  0xFF800000); a culled one gets 0xFFFFFFFF, so it sorts last. The tile entries are then sorted by the tile alone, stably, so each tile's
+  entries stay front to back. Only exactly equal depths tie, and the render graph's rule settles
+  those ([below](#render-graph)).
 
 ## Render graph
 
 `lib/render_graph.zgal`'s `SplatGraph` runs pipeline steps 1 to 5 for one camera per frame and,
 with a window, draws the image on the surface.
 
-1. `Preprocess`: `projectSplat` per splat into `projected`, and its tile count into `tileCounts`
-   (0 when culled).
-2. An `exclusive-scan` of `tileCounts` into `offsets` (each splat's first entry), and a `reduce`
-   of their total into `counts`.
-3. `PlanEntries` (one invocation): the entries this frame holds, min(total, capacity), the depth
-   bits and shift (`depthShift`, so no entry recomputes it), and the indirect `DispatchCommand` for
-   the entry kernels; `EmitEntries` then runs one invocation per entry, not per splat: entry e
-   binary-searches `offsets` for its splat (the last whose offset is ≤ e), takes tile e − offset of
-   the splat's rectangle (row by row), and writes its key and splat index.
-4. A `sort` of the keys with the splat indices as values, over the entries held; a `clear` of
-   `ranges`; `TileRanges` (the same indirect dispatch) writes each tile's [start, end) where
-   neighbouring keys' tiles differ. Tiles without entries keep (0, 0). `ranges` is two `uint`s a
+1. `Preprocess`: `projectSplat` per splat into `projected` (a tile count of 0 when culled), its
+   `depthSortKey` into `depthKeys` and its index into `depthOrder`.
+2. A `sort` (`sortSplats`) of `depthKeys` with `depthOrder` as values, over the splats in use:
+   `depthOrder` lists the splats front to back. `RankSplats` (per rank r, the splat s =
+   depthOrder[r]) writes s's tile count at r in `tileCounts` and r at s in `splatRanks` (the
+   inverse permutation, which training's gather uses). An `exclusive-scan` of `tileCounts` into
+   `offsets` (each rank's first entry), and a `reduce` of their total into `counts`.
+3. `PlanEntries` (one invocation): the entries this frame holds, min(total, capacity), and the
+   indirect `DispatchCommand` for the entry kernels; `EmitEntries` then runs one invocation per
+   entry, not per splat: entry e binary-searches `offsets` for its rank (the last whose offset is
+   ≤ e), takes that rank's splat from `depthOrder` and tile e − offset of its rectangle (row by
+   row), and writes the tile as the key and the splat index. So before the tile sort the entries
+   are front to back.
+4. A `sort` (`sortEntries`) of the keys with the splat indices as values, over the entries held:
+   ZGAL's sort is stable, so each tile's entries stay front to back. A `clear` of `ranges`;
+   `TileRanges` (the same indirect dispatch) writes each tile's [start, end) where neighbouring
+   keys differ. Tiles without entries keep (0, 0). `ranges` is two `uint`s a
    tile (start at 2t, end at 2t + 1), not a `uvec2`, as different invocations write a tile's start
    and end ([web.md](web.md#portability)).
 5. `Rasterize`: one 16×16 workgroup per tile (a 2D dispatch of the tile grid, at most 181² tiles
@@ -246,7 +246,7 @@ with a window, draws the image on the surface.
    first format, and on a UNORM one the window shows the image darker, with no warning (ZGAL
    doesn't give a shader the surface's format). Captures are unaffected.
 
-`counts` holds (entries, total, capacity, depth bits, depth shift) and is read back every frame.
+`counts` holds (entries, total, capacity) and is read back every frame.
 
 The graph's inputs besides the scene: `background` (a per-frame vec3: a graph parameter can't be
 a vec3), `window` and `capture` (whether to draw on the surface, and to read `rendered` back for
@@ -258,8 +258,8 @@ rather than in the program.
   Rasterize's 2D tile grid is the exception, bounded by the image size: item 5):
   `groupLimit`, 65535, is what every device allows in X (Vulkan's guaranteed
   `maxComputeWorkGroupCount[0]`, lavapipe's, WebGPU's default `maxComputeWorkgroupsPerDimension`),
-  and ZGAL can't query the device's own. Preprocess (64-wide), EmitEntries and TileRanges
-  (256-wide) loop over their elements by grid stride, so 2²⁴ splats or 2²⁵ entries need no more
+  and ZGAL can't query the device's own. Preprocess and RankSplats (64-wide), EmitEntries and
+  TileRanges (256-wide) loop over their elements by grid stride, so 2²⁴ splats or 2²⁵ entries need no more
   groups. `PlanEntries` sizes the indirect dispatch with `groupsFor`; tests pass a smaller
   `maxGroups` (tile_test's `--max-groups`) so the loops go round.
 - **Splat count**: the count of splats in use lives on the GPU, in `splatCounts` (`#:frames
@@ -279,20 +279,21 @@ rather than in the program.
   outside its splat's run gets key 0xFFFFFFFF and TileRanges writes no tile beyond the grid.
 - **Capacity**: the entry buffers' size is a per-frame input (`capacity`), not a compile-time
   constant: a view's entry count isn't known before the preprocess. When a frame needs more, it
-  keeps the first `capacity` entries (whole splats in index order, then part of one), so its
+  keeps the first `capacity` entries (whole splats front to back, then part of one), so its
   image is incomplete, and the app, reading `counts`, grows the capacity with `grownCapacity`
   (the total plus 25%, so a slowly growing view doesn't regrow every frame) for the next frames.
   It never shrinks, and is at most 2²⁵ entries (128 MiB of keys, the binding limit above): a view
   needing more stays incomplete every frame, which `counts` (total > capacity) is the only sign
   of. ZGAL recreates the buffers when it changes, which is fine for scratch.
-- **Determinism**: entries are written at fixed positions (offset + index in the splat's run), so
-  before the sort they're in splat-index order, and ZGAL's `sort` is stable, so keys that tie
-  stay in splat-index order. The blend order is the same on every run and every device.
+- **Determinism**: ZGAL's `sort` is stable, so splats with exactly equal depths stay in index
+  order; entries are written at fixed positions (offset + index in the splat's run), so before the
+  tile sort they're in depth order, which the stable tile sort keeps. The blend order is the same
+  on every run and every device.
 - **GPU against C++** (`programs/tile_test`): the test recomputes stages 2 to 4 on the CPU from the
   GPU's own projections (means, radii, depths), so it compares the tile rectangles (`tileRect`'s
-  floor and ceil), every key and splat position for position, and every range exactly. It checks a
-  frame that overflowed its starting capacity of 16 (the first 16 entries in splat order, sorted,
-  and their ranges), that the capacity grew, then a complete frame, some runs with `--max-groups` 1
+  floor and ceil), every key and splat position for position, and every range exactly (each
+  tile's entries front to back by the GPU's depths). It checks a frame that overflowed its
+  starting capacity of 16 (the nearest splats' first 16 entries, sorted, and their ranges), that the capacity grew, then a complete frame, some runs with `--max-groups` 1
   or 3. `tests/cpp/render_graph_test.cpp` checks `groupsFor`, `grownCapacity` and
   `grownCapacityUpTo` on the CPU. The preprocess itself is compared to float precision (mean 1e-4
   relative, depth 1e-5, radius ±1), since the GPU's `exp`, `sqrt` and division needn't round as
@@ -382,12 +383,13 @@ input).
    walks a tile only from its last down to the chunk's first entry (the entries after the chunk
    still undo the blend, so each pixel's T and R are what one pass would give).
 8. `InvertEntries` writes each sorted entry's index at its place before the sort (its splat's
-   offset plus its index in the splat's tile rectangle, row by row, recovered from the key's
-   tile). `GatherGradients` (one invocation per splat) then sums its entries' gradients in tile
+   offset, found through `splatRanks`, plus its index in the splat's tile rectangle, row by row,
+   recovered from the key's tile). `GatherGradients` (one invocation per rank, its splat from
+   `depthOrder`) then sums its entries' gradients in tile
    order into `splatGradients`. Places no entry maps to (only after a wrapped total) keep the
    clear's 0xFFFFFFFF and are skipped, as are entries past the capacity. In a chunk pass, a
-   splat's entries in the chunk are a contiguous run of its places (they share the depth, so they
-   sort by tile, the order of its places), found by binary search; the sum continues from the
+   splat's entries in the chunk are a contiguous run of its places (the stable tile sort keeps
+   them in the order of its places), found by binary search; the sum continues from the
    previous pass's `splatGradients` (pass 0 starts at 0), so the additions and their order are
    one pass's and the result is the same bits.
 9. `BackwardPreprocess` (64-wide, grid stride over the splats) runs `preprocessBackward`
@@ -643,11 +645,10 @@ square meets; and `accum` rounds to f16 at each blend. The first two are departu
 [paper-conformance.md](paper-conformance.md#departures), each at most about 3/255 at a pixel per unit of colour difference. On S3
 it's within 2/255 of splat_render's goldens (59-60 dB), almost all of it f16: Rasterize with both
 departures applied is within 1/255 of the viewer, and either departure alone changes Rasterize's S3
-images by at most 1/255. Equal keys draw in splat-index order, the lower index behind, where
-Rasterize puts it in front. Exact float ties are negligible, but Rasterize's keys tie for depths
-within one quantization step (about 2⁻¹⁶ of the depth at 1280×720), and those it blends in index
-order: on a trained scene, up to 22/255 against the viewer
-([paper-conformance.md](paper-conformance.md#the-viewer-on-a-real-scene), departure 1).
+images by at most 1/255. Both sort by the full float depth, so they agree on every order except
+exactly equal depths: the viewer draws the lower index behind, where Rasterize puts it in front.
+Such ties are negligible: on a trained scene the two differ by at most 3–4/255
+([paper-conformance.md](paper-conformance.md#the-viewer-on-a-real-scene)).
 Readbacks: `readHeader` (PlanDecode's copy of the header; the app disables it once it has a
 valid one), `readCameras` (once, with `hasCameras`), `readRendered` (a capture or `inspect`),
 `readAccum` (`inspect`: rgba16f as two uints a pixel, r | g << 16 and b | a << 16), and
