@@ -155,8 +155,12 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
     archive: 7.4, 1.26, 1.11 and 10.2 on 24.04), `test-cpp` and `test-programs` (on lavapipe,
     with validation). The data tools' and the C++ tests need no program, so only this shard runs
     them (`cpu-tests`); every other shard would repeat them.
-  - `web`: `make web`, then `test-web` (Node with Dawn on lavapipe), which builds the native
-    library first (splat_train's check reads PLYs through it).
+  - `web-splat_train` and `web-rest`: `make web`, then the web tests (Node with Dawn on
+    lavapipe), which build the native library first (splat_train's check reads PLYs through
+    it), split in two by time: `test-web-splat_train`, and `test-web TEST_WEB_SKIP=splat_train`
+    (`TEST_WEB_SKIP` lists programs `test-web` leaves out). `web-rest` runs every program not
+    skipped, so a new program's web test runs without being assigned to a shard; to move one to
+    the first shard, add it to both lists.
   - `pages`: `make web`, then `test-pages` (headless Chromium on SwiftShader), which builds the
     native library first (splat_view's page test encodes its stream). Only this shard
     (`chromium`) installs Chromium's headless shell, with the steps of vulkan_test's `web.yml`:
@@ -176,9 +180,12 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
   native and web together with `make -j2` was no faster (the program-test step took 15 to 21 min
   across runs, within the runners' +-25% variance), since lavapipe spreads its rasterizing over
   every vCPU of the 4-vCPU runner, so the two tests contend. Separate jobs run on separate
-  runners: the suite's program tests are expected to take about 6 to 8 min (native) and 8 to 11
-  min (web) against the 20-min step timeout, which is what the timeouts are sized from. A stack
-  of N commits is 3N jobs, against GitHub's 20 concurrent. A program's tests must not share files
+  runners. The web suite in one job took 11.5 to 20 min and timed out (runs 42717265046 and
+  42721091082, where the same commit's times varied by up to 1.7x between runners), so it is
+  split: splat_train's web test alone takes 6.5 to 12 min, every other one's 5 to 8 (grad_test
+  4 to 6.5 of them). The native suite's take 8.5 to 14 min, the slowest shard, against the
+  20-min step timeout, which is what the timeouts are sized from. A stack of N commits is 4N
+  jobs, against GitHub's 20 concurrent. A program's tests must not share files
   with another program's or with the other suites' (each writes only to its output directory,
   `build/test/<name>`, `build/test-web/<name>` or `build/test-pages/<name>`). Watch the slowest
   job's time when adding a test.

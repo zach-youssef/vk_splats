@@ -141,12 +141,15 @@ test-programs: $(foreach p,$(TESTED_PROGRAMS),test-$(p))
 test: test-tools test-cpp test-programs
 
 # Web tests: programs/<name>/test-web.sh, run as test-web.sh <main.js> <output dir> <web-check
-# dir> under Node, after its program's web build and its web-check tools
+# dir> under Node, after its program's web build and its web-check tools. TEST_WEB_SKIP lists
+# programs test-web leaves out (CI's shards: one runs those, another every other program's, so a
+# new program is tested without being assigned to a shard)
 WEB_TESTED_PROGRAMS = $(foreach p,$(PROGRAMS),$(if $(wildcard programs/$(p)/test-web.sh),$(p)))
+TEST_WEB_SKIP ?=
 
 $(foreach p,$(WEB_TESTED_PROGRAMS),$(eval test-web-$(p): $(OUT)/web/$(p) $(call web-check-tools,$(p)) $(NATIVE_LIB) ; programs/$(p)/test-web.sh $(OUT)/web/$(p)/$(p).zgal.main.js $(OUT)/test-web/$(p) $(OUT)/web-check))
 
-test-web: $(foreach p,$(WEB_TESTED_PROGRAMS),test-web-$(p))
+test-web: $(foreach p,$(filter-out $(TEST_WEB_SKIP),$(WEB_TESTED_PROGRAMS)),test-web-$(p))
 
 # Page tests: programs/<name>/test-page.sh, run as test-page.sh <web build dir> <output dir>
 # <chromium.ts> after its program's web build: its page (<name>.zgal.html) in headless Chromium on
