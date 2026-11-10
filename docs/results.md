@@ -124,3 +124,72 @@ The 30k run passes `--iterations 30000 --frames 30064`, and the 500-iteration ru
 The trained PLY is in the INRIA 3DGS format ([data-format.md](data-format.md)), so third-party
 viewers that read that format show it. Examples are SuperSplat (in the browser) and the
 reference's SIBR viewer.
+
+## The published scene
+
+The web viewer's scene is the cs5330 7k run with `--max-screen-size 20` above (327,505 splats,
+20.41 dB held out), encoded with the web preset. Its files are the assets of the GitHub release
+`scene-cs5330-7k-ms20-v1`, tagged at the commit that added this section, and the site pins them by
+sha256. The release also carries a test fixture: S3's splats (`programs/splat_render/golden/s3`)
+in the full preset, as `programs/splat_view/test-page.sh` builds them.
+
+| File | Bytes | sha256 |
+|---|---|---|
+| `scene.stream` | 26,200,832 | `39a1f6868c0e8874abded78a047d66b051f5143cf2bfbe5ebbdd172750a9672a` |
+| `cameras.bin` | 5,152 (46 cameras) | `342890c4f80987fe9f695ff493f79e6bb50c9bd9a7238a2699c939ee9a3d4411` |
+| `fixture.stream` | 472,432 (2,000 splats) | `7abbd882490cef8c84ccafabad0c18878f58c2101ab8519c97684b8bc7857f56` |
+| `fixture-cameras.bin` | 2,800 (S3's `cameras.bin`) | `ba05dafa480cdae1fb3a80d37bf8e22329863e8401ca537aec7e14e272cbd843` |
+
+- **The stream**: header version 1, 327,505 splats, SH degree 3, 80 B a splat. The header and the
+  base records (32 B a splat) take the first 10,480,592 B, enough for the first view; the SH
+  records (48 B a splat) are the other 15,720,240 B
+  ([data-format.md](data-format.md#stream-files)).
+- **The start view** is camera 34 of `cameras.bin`, a training view (29.27 dB against its photo
+  at 748×748): `--cameras cameras.bin --camera 34`. The page draws it at `--size 1280x720`:
+  `fitCamera` keeps the square camera's vertical field of view and shows more on each side
+  ([architecture.md](architecture.md#splat_view)).
+- **The converter's report** (the web preset, `tools/stream-configs/web.json`, unchanged):
+
+```
+scene.stream: 327505 splats, SH degree 3, 80 B per splat (base 32, SH 48): 26200832 B, the SH records from byte 10480592
+  group     encoding  max error  activated  (of)         range
+  position  f32               0          0  value        -
+  scale     f16         0.00781    0.00017  exp          -
+  rotation  u8          0.00392     0.0148  angle (rad)  explicit [-1, 1]
+  opacity   u8           0.0446     0.0111  sigmoid      data [-5.542, 17.21]
+  dc        f16         0.00193    0.00193  value        -
+  sh        u8          0.00211    0.00211  value        data [-0.5053, 0.5695]
+```
+
+The files were made at 2a9dd6c from the repository root, with `.venv` made from
+`tools/requirements.txt`, after `make native && make all PYTHON=.venv/bin/python`; `<ply>` is the
+trained PLY of the 7k `--max-screen-size 20` run ([Reproducing](#reproducing) with
+`--max-screen-size 20`) and `<out>` the output directory:
+
+```
+.venv/bin/python tools/convert.py colmap colmap/colmap_exports3 build/data/cs5330 \
+    --images colmap/cs5330_dense_resized
+cp build/data/cs5330/cameras.bin <out>/cameras.bin
+.venv/bin/python tools/convert.py stream <ply> <out> --config tools/stream-configs/web.json \
+    --cameras <out>/cameras.bin
+```
+
+and the fixture, renamed to `fixture.stream` and `fixture-cameras.bin` afterwards:
+
+```
+.venv/bin/python tools/convert.py stream programs/splat_render/golden/s3/splats.bin <fx> \
+    --config tools/stream-configs/full.json --cameras programs/splat_render/golden/s3/cameras.bin
+```
+
+The native viewer draws the start view with `build/splat_view/splat_view <out>/scene.stream
+--cameras <out>/cameras.bin --camera 34 --size 1280x720 --frames 64 --capture view-34.png
+--validation`, which prints no validation message; at the default `--stream-words` the scene is
+whole by frame 7. How the viewer's render compares with splat_render's on this scene is in
+[paper-conformance.md](paper-conformance.md#the-viewer-on-a-real-scene).
+
+**A new release for a new format.** The viewer refuses a stream whose header `version` it
+doesn't know (`checkStreamHeader`), and the site checks the files by sha256, so a release's files
+are never replaced. A change to the stream format (a new `version`), or a new scene or encoding,
+is published as a new release with a new tag (`scene-cs5330-7k-ms20-v2`, or a new scene's name),
+and the site moves to it by updating its pinned tag and sha256s (and its viewer, in the same
+change, when the format changed).

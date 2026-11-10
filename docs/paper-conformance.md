@@ -189,7 +189,7 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
 18. **The viewer has no early stop** (`lib/view_graph.zgal`): it blends back to front, so it can't
     know where a pixel's front-to-back transmittance falls below `transmittanceMin` (1e-4), and it
     blends every splat whose alpha passes. Rasterize, as the reference, leaves out the splat that
-    would take T below it and every splat after. It adds no visible artifact. The splats behind
+    would take T below it and every splat after. On S3 it adds no visible artifact. The splats behind
     that one are seen through T < 1e-4 together: under 0.03/255. The one larger term is the
     crossing splat itself, which Rasterize leaves out (the background shows through its T) and
     the viewer blends. T before it is below `transmittanceMin`/(1 − α) ≤ 0.01 (α ≤ `alphaMax`),
@@ -198,17 +198,110 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     brighter splat scales it, about 5/255 at colour 2), and over 1/255 only where the crossing
     splat is almost opaque (α > 0.975). That is a single-pixel difference of a few levels at most,
     not an edge or a band. On S3, Rasterize without the stop changes 9 of 16384
-    pixels (camera 0) and 13 of 15360 (camera 24), each by 1/255.
+    pixels (camera 0) and 13 of 15360 (camera 24), each by 1/255. On a real scene the viewer differs
+    by more, and near tile edges, which this departure doesn't explain; the cause is under
+    investigation ([below](#the-viewer-on-a-real-scene)).
 19. **The viewer blends a splat only inside its 3σ square**: SplatQuad's quad is the square of the
     splat's radius around its mean, the radius being 3σ along the larger axis, rounded up to
     pixels. Rasterize evaluates every pixel of the tiles that square meets (departure 7), so it
-    also blends beyond the square wherever α passes `alphaMin`. It adds no visible artifact.
+    also blends beyond the square wherever α passes `alphaMin`. On S3 it adds no visible artifact.
     Beyond the square α ≤ opacity·e^−4.5 ≈ 0.011·opacity, so the viewer leaves out at most
     0.011·T·|colour − behind| ≤ 2.8/255 a splat per unit of colour difference (it scales with a
     colour above 1, as in departure 18), and nothing at an opacity below 0.353 (e^4.5/255; α under
     `alphaMin`: why the viewer's closed-form fixtures keep o < 0.35). The reference's own
     footprint is cut at its tile rectangle, a step of the same size at tile edges. On S3 (opacity
-    0.3-0.95), clipping Rasterize to the square changes no pixel.
+    0.3-0.95), clipping Rasterize to the square changes no pixel. On a real scene the viewer differs
+    by more, and its largest differences sit near vertical tile edges: this departure or a bug in
+    the tile coverage, under investigation ([below](#the-viewer-on-a-real-scene)).
+
+## The viewer on a real scene
+
+Departures 18 and 19 bound each pixel's change to 1/255 on S3, but not on a trained scene. On the
+published cs5330 scene ([results.md](results.md#the-published-scene)), splat_view and
+splat_render differ by up to 22/255 in small clusters and short vertical streaks that sit near
+vertical tile edges. The cause is under investigation, so departures 18 and 19 are not settled
+for real scenes.
+
+The two renderers drew the same splats from the same cameras at 1280×720, background 0, near 0.2,
+on MoltenVK with validation and synchronization validation on (no messages). splat_view read the
+trained PLY, which it encodes in full f32, bit for bit its full-preset stream
+([architecture.md](architecture.md#splat_view)); splat_render read `convert.py ply-to-bin` of the
+same PLY, also f32 bit for bit. splat_render takes a camera as it is stored, so its
+`cameras.bin` was fitted to 1280×720 with `fitCamera`'s formula and the untouched pose, as
+splat_view fits it. The PLY columns are those two renders, without any encoding. The stream
+columns are splat_view on the published `scene.stream` against the same splat_render image, so
+they add the web preset's quantization. PSNR is over RGB on 0–255; max is the largest difference
+in any channel, in 1/255; ">1" and ">2" count the pixels whose largest channel difference is over
+1/255 and 2/255, of 921,600.
+
+| Camera | PLY PSNR | PLY max | PLY >1 | PLY >2 | Stream PSNR | Stream max | Stream >1 | Stream >2 |
+|---|---|---|---|---|---|---|---|---|
+| 34 (the start view) | 53.85 dB | 11 | 8,275 | 353 | 52.95 dB | 11 | 17,584 | 1,497 |
+| 4 | 54.57 dB | 3 | 1,544 | 15 | 53.56 dB | 5 | 6,813 | 213 |
+| 9 | 53.78 dB | 22 | 21,568 | 1,550 | 52.33 dB | 22 | 35,171 | 4,718 |
+| 41 | 54.35 dB | 10 | 18,094 | 896 | 52.72 dB | 11 | 29,399 | 3,621 |
+| 45 | 54.08 dB | 20 | 15,979 | 1,119 | 53.03 dB | 20 | 21,631 | 2,140 |
+| 1 | 54.21 dB | 6 | 18,217 | 712 | 53.23 dB | 6 | 23,110 | 1,813 |
+| 0 (held out) | 54.06 dB | 18 | 6,302 | 248 | 53.34 dB | 18 | 13,945 | 622 |
+| 24 (held out) | 55.10 dB | 9 | 15,864 | 1,059 | 53.75 dB | 10 | 22,855 | 2,292 |
+
+- **Against S3's bound**: on the fixtures each departure changes a pixel by at most 1/255. Here,
+  without the encoding, 0.17–2.3% of the pixels differ by more than 1/255 (1,544 to 21,568),
+  at most 0.17% by more than 2/255, and the largest difference is 3 to 22/255; the PSNR is
+  53.8–55.1 dB. The mean absolute difference is 0.18–0.26/255, and the viewer is darker by
+  0.18–0.25/255 on average, depending on the camera (the signed mean over the channels).
+- **What the differences look like**: almost everything is ±1/255 rounding, thin contour bands
+  that follow the image's smooth gradients, and the pixels over 2/255 are less concentrated
+  in x mod 16 than the outliers below (264 to 554 per residue, peaking at x ≡ 13, lowest
+  mid-tile), but lean the same way. The shelves and books, where many splats overlap, show a faint texture at 2–4/255.
+  The largest differences are few (per camera, cameras 34, 4, 9, 41, 45, 1, 0 and 24: 3, 0, 5,
+  2, 6, 0, 25 and 1 pixels over 8/255; 0, 0, 1, 0, 2, 0, 3 and 0 over 12/255), but they aren't
+  isolated pixels: they form small clusters and short vertical streaks. Camera 0 has a streak
+  2 pixels wide and 8 rows tall at x = 896–897 (rows 631–638, 9–12/255), a 4-row one at
+  x = 736 (rows 659–662) and a blob in a 3×3 box at x = 1021–1023 (rows 679–681; 6 of its 9 pixels are over 8/255); camera 9 a 2×3 blob at
+  x = 796–797 and camera 45 a 3×3 one at x = 702–704.
+- **They sit near vertical tile edges**: tiles are 16×16 pixels and 1280×720 divides evenly, so
+  a tile's left edge is at x ≡ 0 (mod 16). Over the 8 cameras, x mod 16 from 0 to 15 counts:
+  - over 4/255: 48, 42, 26, 12, 18, 14, 9, 10, 18, 10, 13, 6, 12, 13, 24, 32; residues 14, 15,
+    0 and 1 hold 146 of 307 (48%, against 25% if spread evenly);
+  - over 8/255: 14, 9, 2, 0, 0, 1, 0, 1, 0, 0, 0, 0, 2, 4, 4, 5; residues 14, 15, 0 and 1 hold
+    32 of 42 (76%).
+
+  In y it is the opposite: over 4/255, y mod 16 peaks mid-tile (8, 11, 16, 19, 20, 20, 24, 27,
+  33, 25, 21, 26, 24, 13, 10, 10).
+- **The cause is under investigation.** The alignment with tile columns points at Rasterize's
+  tile coverage: departure 19 (Rasterize blends a footprint out to its tile rectangle, where the
+  viewer stops at the 3σ square), or a bug in splat_render. Departure 18 is per pixel and
+  wouldn't line up with tiles, so it is the less likely cause. Departure 19 as written doesn't
+  explain why the differences cluster at tile edges in x but mid-tile in y, nor sizes past its
+  bound of 2.8/255 per unit of colour difference without splats several units brighter than
+  what is behind them, so a bug isn't ruled out. No render has isolated the splats at those
+  pixels yet (camera 0's streak at x = 896 is a candidate), and the darker mean isn't explained
+  either.
+- **The web preset's quantization** roughly doubles the pixels over 2/255 and costs about 1 dB,
+  but the largest differences stay within 2/255 of the PLY's: the outliers come from the
+  renderers, not the encoding.
+
+The amplified difference (×32) for the start view, camera 34, from the PLY:
+
+![|splat_view − splat_render| × 32, camera 34](results/site-scene-camera34-diff.png)
+
+To repeat it, from the repository root after `make all`, with `<ply>` the trained PLY,
+`<out>` the published files, `fit-cameras.bin` that `cameras.bin` fitted to 1280×720 and `K`
+the camera:
+
+```
+.venv/bin/python tools/convert.py ply-to-bin <ply> splats.bin
+build/splat_view/splat_view <ply> --cameras <out>/cameras.bin --camera K --size 1280x720 \
+    --frames 64 --capture view-K.png --validation
+build/splat_render/splat_render --splats splats.bin --cameras fit-cameras.bin \
+    --splat-count 327505 --camera K --width 1280 --height 720 --frames 8 \
+    --capture render-K.png --validation
+.venv/bin/python programs/splat_render/psnr.py view-K.png render-K.png 0
+```
+
+(`psnr.py` prints the PSNR and the largest difference, not the pixel counts; replace `<ply>` by
+`<out>/scene.stream` for the stream columns.)
 
 ## How correctness is checked
 
