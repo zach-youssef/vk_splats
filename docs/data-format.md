@@ -231,6 +231,8 @@ for precision (`tools/splatdata/stream.py` checks it, naming the file and key of
   for SH), `[lo, hi]` for every component, or one `[lo, hi]` per component (not for SH, which
   shares one range). Values outside an explicit range are clamped; `lo` ≤ `hi`, finite in
   float32.
+- Every key is required, `sh` included at `"shDegree": 0` (where its encoding goes unused): a
+  config without it is refused ("missing sh"), so a degree-0 config still names an `sh` encoding.
 - Unknown keys are refused.
 
 The presets in the table below are `tools/stream-configs/{full,f16,web}.json`, all at
@@ -335,6 +337,14 @@ Each frame:
 The kernels take the stream's size on trust: whatever supplies `arrived` (the app in stream_test,
 from its stream-buffer's `streamed` events in splat_view) keeps it within the buffer. `programs/stream_test` tests them
 ([building-and-testing.md](building-and-testing.md#stream-decode-check)).
+
+How the bytes arrive differs by backend, so a test aiming at a frame partway through a stream
+must know which it runs on. Natively `zgal::openStream` reads the header before the first frame,
+so frame 0's stream-buffer holds the header only, and frame f holds 432 + f·perFrame bytes (until
+the stream ends): a fixed schedule, so a case can pick the frame a record lands in. On the web a
+frame takes whatever has arrived, at most perFrame bytes more: the header and more in one read,
+fewer than perFrame, or nothing, so a run lands wherever the source's chunks put it
+([web.md](web.md#tests)).
 
 ### Encoder
 

@@ -84,6 +84,10 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   that needs none ignores the third argument). It runs the program headless with `--validation` (which fails
   unless validation and synchronization validation are both available) and exits non-zero on any
   failure; a validation message is a failure.
+  A POSIX sh function's variables are global, so a helper that assigns one (splat_view's
+  `view()` sets `name`) overwrites a caller's variable of that name: a loop around such a call
+  needs another name (splat_view's `case_name`). For a per-run environment variable around a
+  function call, use a subshell with `export`: an assignment before a function call may outlive it.
   A training test ends several hundred iterations after its last densification or opacity reset
   (splat_train's `--densify-until 1500` in 2000 and 1800-iteration runs): right after one, fresh
   clones and splits are untrained and a reset has just cut every opacity, so the score says

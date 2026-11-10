@@ -150,6 +150,14 @@ Training adds Adam, and densification and pruning on a fixed capacity, compacted
   whose winding isn't fixed (a splat's corners, either way round) needs `#:cull none`. Draw quads
   as a triangle list (6 vertices), not a 4-vertex strip: MoltenVK can't turn primitive restart
   off for a strip, and validation reports it.
+- **ZGAL graphs**: a material's `#:push` values can't name a module's `define`s, so they're
+  literals with the name in a comment (`(slot 9)  ; viewUndecoded`). A graph `constant` can't
+  read the `stream-header` of a buffer declared after it, and the stream-buffer's `#:words` is
+  declared before the constants that use the header, so the size expression is written out in
+  `#:words` and again in the constant (`streamWords` in `lib/view_graph.zgal`). ZGAL neither
+  clamps nor splits a 1D dispatch over 65,535 workgroups (WebGPU's and Vulkan's guaranteed
+  limit; [Dispatch sizes](#render-graph)), so a grid-strided kernel caps its own workgroups at
+  65,535 and loops (PoisonUnarrived, [View graph](#view-graph)).
 - **Capacity**: the splat count is bounded by a required `--max-splats`. ZGAL recreates a buffer,
   losing its contents, when its per-frame size changes, so only scratch buffers (tile entries)
   grow: the tile entries' capacity is a per-frame input the app grows after an overflow
