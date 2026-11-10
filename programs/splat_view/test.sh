@@ -15,10 +15,12 @@
 # prints both, so a log shows the margin.
 # Then the start camera without --cameras must be the header's: the stream's header camera (bytes
 # 32 to 144) written as a one-camera cameras.bin, rendered with and without --cameras at its size,
-# gives the same capture, with splats in it (--inspect: some pixel covered). And natively (the web
-# opener doesn't check the header) a header that checkStreamHeader refuses (too many splats) fails
-# before the first frame, and S3 as an INRIA PLY (which the native opener encodes in full, f32)
-# renders bit for bit as its full-preset stream, from --cameras and from the header's camera.
+# gives the same capture, with splats in it (--inspect: some pixel covered). Then the opener (native
+# and web) must refuse a header checkStreamHeader refuses (too many splats; a splat count whose
+# stream size wraps a uint) and a stream ending within its header, failing before the first frame,
+# before the graph sizes anything from the header. And natively (the web opener reads streams only)
+# S3 as an INRIA PLY (which the native opener encodes in full, f32) renders bit for bit as its
+# full-preset stream, from --cameras and from the header's camera.
 # Then streaming (below): a frame partway through the stream draws the scene its arrived bytes
 # hold, with the decode checked in every frame (--check-decode).
 # Then the closed-form oracle (below, and docs/architecture.md, "splat_view").
@@ -110,28 +112,42 @@ else
     status=1
 fi
 
+# Headers the opener must refuse, so the graph never sizes its buffers from them: one with more splats
+# than a stream may hold (streamMaxSplats + 1, lib/splat_stream.zgal), one with 2^30 splats and its
+# shOffset where it must be at that count in a uint (432: the strides' products are multiples of
+# 2^32), whose stream-buffer would size to 108 words, and a stream ending within its 432-byte header.
+# Each must fail before the first frame on the opener's refusal (the app's later check, on the header
+# PlanDecode copies out, prints another message: a run passing the header on, as the web's plain
+# loadAssetStream did, fails this).
+"$python" - "$out/full/scene.stream" "$out" <<'EOF'
+import struct, sys
+with open(sys.argv[1], "rb") as f:
+    data = f.read()
+oversized = bytearray(data)
+struct.pack_into("<I", oversized, 8, 559241)  # StreamHeader.splatCount, at offset 8: streamMaxSplats + 1
+wrapping = bytearray(data)
+struct.pack_into("<I", wrapping, 8, 1 << 30)
+struct.pack_into("<I", wrapping, 28, (432 + (1 << 30) * 56) % (1 << 32))  # shOffset, at offset 28: 432
+for name, contents in (("oversized", oversized), ("wrapping", wrapping), ("short", data[:400])):
+    with open("%s/%s.stream" % (sys.argv[2], name), "wb") as f:
+        f.write(contents)
+EOF
+for refused in "oversized:checkStreamHeader refuses, code 4 " "wrapping:checkStreamHeader refuses, code 4 " \
+    "short:ends within its 432-byte stream header (400 bytes)"; do
+    case_name=${refused%%:*}
+    log=$out/$case_name.log
+    if program --validation --frames 16 "$out/$case_name.stream" > "$log" 2>&1; then
+        fail "$log" "the $case_name header passing"
+    elif grep -qF "${refused#*:}" "$log"; then
+        echo "splat_view: the $case_name header refused by the opener"
+    else
+        fail "$log" "the $case_name header (not refused by the opener)"
+    fi
+done
+
 case $binary in
     *.js) ;;
     *)
-        # A header with more splats than a stream may hold (streamMaxSplats, lib/splat_stream.zgal)
-        # must be refused before the graph sizes its buffers from it
-        "$python" - "$out/full/scene.stream" "$out/oversized.stream" <<'EOF'
-import struct, sys
-with open(sys.argv[1], "rb") as f:
-    data = bytearray(f.read())
-struct.pack_into("<I", data, 8, 559241)  # StreamHeader.splatCount, at offset 8: streamMaxSplats + 1
-with open(sys.argv[2], "wb") as f:
-    f.write(data)
-EOF
-        log=$out/oversized.log
-        if program --validation --frames 16 "$out/oversized.stream" > "$log" 2>&1; then
-            fail "$log" "an oversized header passing"
-        elif grep -q 'checkStreamHeader refuses, code 4 ' "$log"; then
-            echo "splat_view: an oversized header refused"
-        else
-            fail "$log" "an oversized header (not refused for its splat count)"
-        fi
-
         # A PLY, encoded by the opener, against its full-preset stream: bit for bit, from --cameras
         # and from the header's camera (the encoder's default camera, the same for both)
         "$python" - "$tools" "$golden/s3/splats.bin" "$out/s3.ply" <<'EOF'

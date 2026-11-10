@@ -659,7 +659,9 @@ group f32 at the PLY's own SH degree, so it renders bit for bit as its full-pres
 encoding is freed once streamed: the graph keeps a stream's source for the program's life); anything
 else is read as a `scene.stream`. Either way it refuses a header `checkStreamHeader` refuses (or a
 file ending within its header), which fails the program before its first frame. The web's opener
-(`splat_view.inputs.ts`) is `loadAssetStream`: no PLY and no header check yet.
+(`splat_view.inputs.ts`) reads streams only, checking the header the same way, through
+`checkStreamHeader`'s TypeScript export, before the graph sizes anything
+([web.md](web.md#tests)).
 
 The start camera is the stream header's, or `--camera k` of `--cameras FILE`, fitted to the window
 (or `--size`) by `fitCamera` with the untouched pose, so at the camera's own size it is that

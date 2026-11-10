@@ -93,9 +93,20 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 - **stream_test**: every run of the native test; its checks, `checkStreamHeader` among them, are
   in the app, so the web runs the TypeScript export.
 - **splat_view**: the native test (S3 against splat_render's goldens and full against web
-  preset, both at 50 dB and a largest difference of 8/255; the header's camera; mid-stream frames
-  against their truncated scenes) at the same bars, but for the PLY and the refused header (the
-  web's opener, `loadAssetStream`, reads streams only and doesn't check the header); its checks are in the app, but for the closed-form oracle on
+  preset, both at 50 dB and a largest difference of 8/255; the header's camera; the refused
+  headers; mid-stream frames against their truncated scenes) at the same bars, but for the PLY (the
+  web's opener reads streams only: [Not supported](#not-supported-on-the-web)). Measured on an M4
+  (Dawn on Metal): 59.0 to 59.9 dB against the goldens and 61.9 dB web preset against full, each
+  within 2/255. The opener (`splat_view.inputs.ts`) opens the stream with `loadAssetStream`,
+  takes its first 432 bytes with `peekStream` (which waits for them, `ready(432)`) and checks them
+  with `checkStreamHeader`'s TypeScript export, the function the native opener and PlanDecode
+  run, then hands the graph a stream replaying them before the rest. It rejects a refused header
+  or a stream ending within its header, failing the graph's build before anything is sized from
+  the header, as natively; the test's oversized, wrapping (2³⁰ splats, whose stream size wraps a
+  `uint` to 432 bytes) and short streams fail a web build opening with a plain `loadAssetStream`.
+  A frame takes what has arrived (the header and more in one read, or fewer bytes than
+  `--stream-words`), unlike native's fixed schedule, so the mid-stream runs land wherever they do
+  and need only be partway. Its checks are in the app, but for the closed-form oracle on
   S1's faint variants, which `build/web-check/view_oracle_check` runs on the `accum` the app writes
   to `$SPLAT_VIEW_ACCUM` (natively too), so the web build's `saveAccum` needs Node's `fs`, and for
   the sort's frame count (the native `--timings`; the web has none). Dawn on Metal gave the same
@@ -145,7 +156,10 @@ SwiftShader, which the Node tests don't reach:
   M4). With W pressed once (`--keys w`: a keyDown and keyUp together, once the page runs),
   it must differ from the untouched canvas by at least 8/255 at some pixel (measured 17/255): the
   latched press moved the camera. A mutant moving with the held keys only (no latch) draws the
-  untouched image (inf dB) and fails.
+  untouched image (inf dB) and fails. Then the opener's fetch path: 2500 words a frame
+  (`stream-words=2500`) for 24 frames must stop still loading with base records arrived
+  (measured 240,000 of 472,432 bytes, 2000 base and 708 SH records), and a stream with an
+  oversized header must fail the page on the opener's refusal.
 
 ## Not supported on the web
 
@@ -156,7 +170,8 @@ SwiftShader, which the Node tests don't reach:
 - **Paths in externs**: a ZGAL extern can't take a `path` (or string) parameter, so
   render_test's and grad_test's readback directories and splat_train's PLY are environment
   variables rather than options.
-- **splat_view's PLY and header check**: the web's opener (`splat_view.inputs.ts`) is
-  `loadAssetStream`, so the page and the Node build read `scene.stream` files only, and a header
-  `checkStreamHeader` refuses reaches the graph, which sizes its buffers from it before PlanDecode
-  refuses it (a web opener that checks the header with `peekStream` is planned).
+- **splat_view's PLY**: the web's opener (`splat_view.inputs.ts`) reads `scene.stream` files
+  only, in the page and under Node. The native opener reads a PLY and encodes it with
+  `lib/native/`'s C++ (`ply_reader.h`, `stream_encoder.h`), which the web build can't call;
+  reading one on the web would mean a second PLY reader and encoder in TypeScript, or the C++
+  built to WebAssembly. Convert a PLY first (`tools/convert.py stream`).

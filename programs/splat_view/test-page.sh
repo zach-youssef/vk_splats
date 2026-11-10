@@ -11,6 +11,12 @@
 #     least $moved_difference/255 at some pixel. The key may land before the app has its camera
 #     (the move then lands in the frame it gets it) or after; $frames frames leave room for the
 #     poll's delay either way, and the still frames after the move for the projection to show.
+# Then two runs of the page's opener (fetching the stream: main-browser.ts's streaming asset loader):
+#   - partway: $partway_words words a frame (--stream-words) for $partway_frames frames, too few for
+#     the stream's 472,432 bytes, so the page must stop still loading, with some base records
+#     arrived (decoded and drawn: the Node test, test.sh, checks such frames' images);
+#   - refused: a stream whose header has more splats than a stream may hold must fail the page on
+#     the opener's refusal (checkStreamHeader, before the graph sizes anything from the header).
 # A missing Chromium fails the test rather than skipping it: set CHROMIUM, or run
 # npx playwright install chromium-headless-shell. $NODE (node by default) runs the checker,
 # $PYTHON (python3 by default) the encoder (with the native library: make native) and the PSNR,
@@ -25,6 +31,8 @@ golden=$here/../splat_render/golden
 frames=48
 minimum=45
 moved_difference=8  # measured 17/255 (44.4 dB); the untouched canvas is within 1/255 of the golden
+partway_words=2500  # 10,000 bytes a frame
+partway_frames=24   # at most 240,000 bytes
 
 rm -rf "$out"
 mkdir -p "$out/site/scene"
@@ -35,21 +43,37 @@ ln -s "$(cd "$golden/s3" && pwd)/cameras.bin" "$out/site/scene/cameras.bin"
 "$python" tools/convert.py stream "$golden/s3/splats.bin" "$out/site/scene" \
     --config tools/stream-configs/full.json > "$out/convert.log" ||
     { cat "$out/convert.log"; echo "splat_view: page FAILED, encoding the stream"; exit 1; }
-query="arg=/scene/scene.stream&cameras=/scene/cameras.bin&camera=0&frames=$frames&size=128x128"
+# The oversized header: StreamHeader.splatCount (at offset 8) streamMaxSplats + 1 (lib/splat_stream.zgal)
+"$python" - "$out/site/scene/scene.stream" "$out/site/scene/oversized.stream" <<'EOF'
+import struct, sys
+with open(sys.argv[1], "rb") as f:
+    data = bytearray(f.read())
+struct.pack_into("<I", data, 8, 559241)
+with open(sys.argv[2], "wb") as f:
+    f.write(data)
+EOF
+query="arg=/scene/scene.stream&cameras=/scene/cameras.bin&camera=0&size=128x128"
 
-page() {  # page <name> [checker options]: screenshots $out/<name>.png
-    name=$1
-    shift
+run_page() {  # run_page <name> <query> [checker options]: screenshots $out/<name>.png; sets status
+    name=$1 page_query=$2
+    shift 2
     status=0
     # The explicit timeout leaves a wide margin on CI's SwiftShader
     "${NODE:-node}" "$checker" --serve "$out/site" --timeout 120000 --screenshot "$out/$name.png" "$@" \
-        "page/splat_view.zgal.html?$query" > "$out/$name.log" 2>&1 || status=$?
+        "page/splat_view.zgal.html?$page_query" > "$out/$name.log" 2>&1 || status=$?
     cat "$out/$name.log"
     if [ $status -eq 3 ]; then
         echo "splat_view: page FAILED, no Chromium (set CHROMIUM, or npx playwright install chromium-headless-shell)"
         exit 1
-    elif [ $status -ne 0 ]; then
-        echo "splat_view: page $name FAILED"
+    fi
+}
+
+page() {  # page <name> [checker options]: the scene for $frames frames, which must pass
+    page_name=$1
+    shift
+    run_page "$page_name" "$query&frames=$frames" "$@"
+    if [ $status -ne 0 ]; then
+        echo "splat_view: page $page_name FAILED"
         exit 1
     fi
 }
@@ -65,4 +89,21 @@ if "$python" "$here/../splat_render/psnr.py" "$out/moved.png" "$out/still.png" 0
     echo "splat_view: page FAILED, pressing W didn't move the camera"
     exit 1
 fi
-echo "splat_view: page passed, W moved the camera"
+echo "splat_view: page: W moved the camera"
+
+run_page partway "$query&frames=$partway_frames&stream-words=$partway_words"
+# "streamed A of T bytes, B base and S SH records", the last frame's
+base=$(sed -n 's/^.*splat_view: streamed [0-9]* of [0-9]* bytes, \([0-9]*\) base and [0-9]* SH records$/\1/p' \
+    "$out/partway.log" | tail -1)
+if [ $status -ne 0 ] || ! grep -q 'splat_view: still loading' "$out/partway.log" || [ "${base:-0}" -eq 0 ]; then
+    echo "splat_view: page FAILED, not partway through the stream with records arrived ('${base:-}' base)"
+    exit 1
+fi
+echo "splat_view: page: partway through the stream after $partway_frames frames, $base base records arrived"
+
+run_page refused "arg=/scene/oversized.stream&cameras=/scene/cameras.bin&camera=0&size=128x128&frames=$frames"
+if [ $status -eq 0 ] || ! grep -q 'checkStreamHeader refuses, code 4 ' "$out/refused.log"; then
+    echo "splat_view: page FAILED, the oversized header wasn't refused by the opener"
+    exit 1
+fi
+echo "splat_view: page passed, the oversized header refused by the opener"
