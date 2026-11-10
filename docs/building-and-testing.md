@@ -358,7 +358,7 @@ check in the app (so the web runs them too, `checkStreamHeader` through its Type
 Each frame it makes `--chunk` more bytes of the stream arrive (`arrived` = min(`--stream-bytes`,
 frame × chunk)): a small kernel (CopyArrived) copies only the arrived words into the buffer the
 decode reads and fills the rest with 0xFFFFFFFF (a NaN as f32 or f16, all ones quantized), and
-after the decode another (CheckUndecoded) counts, into `counts[7]`, the splats past the decoded
+after the decode another (CheckUndecoded, `lib/stream_check.zgal`) counts, into `counts[7]`, the splats past the decoded
 records that aren't still zero. So a kernel that decodes a record before it has arrived fails,
 even though a later frame decodes it again correctly. It checks each counts readback on its own
 (PlanDecode records its `arrived`):

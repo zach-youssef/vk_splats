@@ -27,10 +27,8 @@
 ;; It fails on a mismatch or when the frames run out first.
 
 (import "../../lib/splat_stream.zgal")
+(import "../../lib/stream_check.zgal")  ; undecodedWord and CheckUndecoded
 
-;; The words past `arrived` in the decode's stream buffer: a NaN as f32 or as f16, all ones as u8 or
-;; u16, so a record decoded from them is never all zeros
-(define undecodedWord (uint #xFFFFFFFF))
 ;; counts' element past decodeCountsSize: CheckUndecoded's count, never reset
 (define undecodedSplats (uint 7))
 
@@ -45,34 +43,6 @@
   (compute
    (for ([i (range globalInvocationId.x words (* 256 workgroupCount.x))])
      (write! (at stream i) (if (< i (shr arrived (uint 2))) (at file i) undecodedWord)))))
-
-;; Adds to counts[undecodedSplats] the splats that have a value written past the records decoded:
-;; any base value (position, opacity, logScale, rotation, sh[0..2]) at or past decodeBaseDecoded, any
-;; sh[3..] at or past decodeShDecoded (the buffer starts zeroed)
-(compute-material CheckUndecoded
-  (workgroup 64)
-  (bindings
-   (counts (buffer-array uint read-write))
-   (splats (buffer-array Splat read)))
-  (push (splatCount uint))
-  ;; The bits of a Splat's values [from, to), or'd: 0 when they are all +0.0
-  (define (valueBits [s : Splat] [from : uint] [to : uint]) : uint
-    (fold ([acc (uint 0)]) ([k (range from to)])
-      (bitor acc (floatBitsToUint
-                  (cond [(< k (uint 3)) (at s.position k)]
-                        [(= k (uint 3)) s.opacity]
-                        [(< k (uint 7)) (at s.logScale (- k (uint 4)))]
-                        [(< k (uint 11)) (at s.rotation (- k (uint 7)))]
-                        [else (at s.sh (- k (uint 11)))])))))
-  (compute
-   (for ([i (range globalInvocationId.x splatCount (* 64 workgroupCount.x))])
-     ;; values 0-13: position, opacity, logScale, rotation, sh[0..2]; 14-58: sh[3..]
-     (let* ([s (at splats i)]
-            [base (valueBits s (uint 0) (uint 14))]
-            [sh (valueBits s (uint 14) (uint 59))])
-       (when (or (and (>= i (at counts decodeBaseDecoded)) (not= base (uint 0)))
-                 (and (>= i (at counts decodeShDecoded)) (not= sh (uint 0))))
-         (atomic-add! (at counts undecodedSplats) (uint 1)))))))
 
 (graph StreamTestGraph
   (parameter splatCount uint)
@@ -97,7 +67,8 @@
             #:push ((arrived arrived) (capacity splatCount)) #:invocations (1))
   (material decodingBase DecodeBase stream header counts splats)
   (material decodingSh DecodeSh stream header counts splats)
-  (material checking CheckUndecoded counts splats #:push ((splatCount splatCount)) #:invocations (splatCount))
+  (material checking CheckUndecoded counts splats
+            #:push ((splatCount splatCount) (slot 7)) #:invocations (splatCount))  ; undecodedSplats
 
   (dispatch copy copying)
   (dispatch plan planning)

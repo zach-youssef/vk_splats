@@ -45,6 +45,11 @@
     ([below](#train-graph)).
   - `splat_stream.zgal`: the stream format's header, its check and its decode
     ([data-format.md](data-format.md#stream-files)); it imports `splat_math.zgal`.
+  - `stream_check.zgal`: test kernels around that decode: `PoisonUnarrived` fills a stream
+    buffer's words past `arrived` with `undecodedWord`, and `CheckUndecoded` counts the splats
+    with a value past the records decoded, so a kernel decoding a record before it has arrived
+    fails (`programs/stream_test`, and splat_view's `--check-decode`); it imports
+    `splat_stream.zgal`.
   - `view_camera.zgal`: the viewer's camera controls, a pose relative to a start camera turned
     by mouse deltas, moved by keys and fitted to the window's size ([below](#view-camera)); it
     imports `splat_math.zgal`.

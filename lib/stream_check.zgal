@@ -1,0 +1,52 @@
+;; Test kernels around lib/splat_stream.zgal's decode, which programs/stream_test and the viewer's
+;; --check-decode (lib/view_graph.zgal) run each frame, so a kernel that decodes a record before it
+;; has arrived fails even though a later frame decodes it again:
+;;   - the words of the decode's stream buffer past `arrived` hold undecodedWord (stream_test copies
+;;     only the arrived words in; the viewer poisons its stream-buffer's tail, PoisonUnarrived);
+;;   - after the decode, CheckUndecoded counts the splats past the records decoded that aren't still
+;;     zero (the working buffer starts zeroed).
+;; Programs import it, (import "../../lib/stream_check.zgal").
+
+(import "splat_stream.zgal")
+
+;; The words past `arrived` in the decode's stream buffer: a NaN as f32 or as f16, all ones as u8 or
+;; u16, so a value decoded from them is never zero
+(define undecodedWord (uint #xFFFFFFFF))
+
+;; Writes undecodedWord to the stream buffer's words [arrived / 4, words): those that haven't arrived
+;; (a stream-buffer copies each frame's new words in before the frame's nodes, over these)
+(compute-material PoisonUnarrived
+  (workgroup 256)
+  (bindings (stream (buffer-array uint write)))
+  (push (arrived uint) (words uint))
+  (compute
+   (for ([i (range (+ (shr arrived (uint 2)) globalInvocationId.x) words (* 256 workgroupCount.x))])
+     (write! (at stream i) undecodedWord))))
+
+;; Adds to counts[slot] the splats that have a value written past the records decoded: any base
+;; value (position, opacity, logScale, rotation, sh[0..2]) at or past decodeBaseDecoded, any sh[3..]
+;; at or past decodeShDecoded (the buffer starts zeroed)
+(compute-material CheckUndecoded
+  (workgroup 64)
+  (bindings
+   (counts (buffer-array uint read-write))
+   (splats (buffer-array Splat read)))
+  (push (splatCount uint) (slot uint))
+  ;; The bits of a Splat's values [from, to), or'd: 0 when they are all +0.0
+  (define (valueBits [s : Splat] [from : uint] [to : uint]) : uint
+    (fold ([acc (uint 0)]) ([k (range from to)])
+      (bitor acc (floatBitsToUint
+                  (cond [(< k (uint 3)) (at s.position k)]
+                        [(= k (uint 3)) s.opacity]
+                        [(< k (uint 7)) (at s.logScale (- k (uint 4)))]
+                        [(< k (uint 11)) (at s.rotation (- k (uint 7)))]
+                        [else (at s.sh (- k (uint 11)))])))))
+  (compute
+   (for ([i (range globalInvocationId.x splatCount (* 64 workgroupCount.x))])
+     ;; values 0-13: position, opacity, logScale, rotation, sh[0..2]; 14-58: sh[3..]
+     (let* ([s (at splats i)]
+            [base (valueBits s (uint 0) (uint 14))]
+            [sh (valueBits s (uint 14) (uint 59))])
+       (when (or (and (>= i (at counts decodeBaseDecoded)) (not= base (uint 0)))
+                 (and (>= i (at counts decodeShDecoded)) (not= sh (uint 0))))
+         (atomic-add! (at counts slot) (uint 1)))))))
