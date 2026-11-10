@@ -7,8 +7,8 @@
   one needs no Makefile change ([building-and-testing.md](building-and-testing.md)).
   - `splat_render`: renders a camera of a scene in a window, or headless with a PNG capture
     ([below](#splat_render)).
-  - `splat_view`: the viewer, on a `scene.stream` decoded on the GPU, headless for now
-    ([below](#splat_view)).
+  - `splat_view`: the viewer, in a window or headless with a PNG capture, on a `scene.stream` (or
+    natively an INRIA PLY) streamed in and decoded on the GPU ([below](#splat_view)).
   - `splat_train`: trains a scene's splats against its images, headless, scores the held-out
     views and writes an INRIA PLY ([below](#splat_train)).
   - `tile_test` and `render_test`: the render graph's GPU tests against the CPU and the
@@ -73,8 +73,8 @@
 - `tools/`: offline Python (numpy, scipy, Pillow): the converter from COLMAP text and INRIA PLY files to the
   programs' inputs, the synthetic scene generator (which also renders a scene's ground truth with
   splat_render), and `scene_args.py`, which prints splat_render's arguments for a scene and a
-  camera, splat_train's (`--train`) for a scene with images, or splat_view's (`--view`) for a
-  `scene.stream`; `--query <url dir>` before any of these prints them as a page's query string,
+  camera, or splat_train's (`--train`) for a scene with images (splat_view needs none: the stream
+  header sizes its graph); `--query <url dir>` before either prints them as a page's query string,
   with the paths made `<url dir>/<file name>` (for page tests).
 - `tests/`: C++ tests (`tests/cpp/`), closed-form oracles (`tests/oracle/`). The Python tests are in
   `tools/tests/`.
@@ -789,7 +789,9 @@ rounds the fragment's output and the result), plus the GPU's exp; a pixel with a
 the opacity scaled by 0.99.
 
 Its `test-page.sh` runs the page in Chromium ([web.md](web.md#tests)): untouched, it must match
-splat_render's golden; with W pressed once, the camera must move.
+splat_render's golden; with W pressed once, the camera must move; a few words a frame must leave
+it partway through the stream with base records arrived; and an oversized header must fail it on the
+opener's refusal.
 
 ## splat_train
 

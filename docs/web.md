@@ -165,8 +165,9 @@ SwiftShader, which the Node tests don't reach:
 
 - **tile_test**: builds, but its checks are native only (its `.inputs.ts` stubs throw), so it has
   no web test.
-- **The window**: splat_render's present path runs only in a page (`splat_render.zgal.html`):
-  the Node tests are headless, and the page test ([Tests](#tests)) covers it in Chromium.
+- **The window**: splat_render's and splat_view's present paths run only in a page
+  (`<name>.zgal.html`): under Node they run headless only (`--frames N`; without it they exit
+  with 2), and the page tests ([Tests](#tests)) cover the present paths in Chromium.
 - **Paths in externs**: a ZGAL extern can't take a `path` (or string) parameter, so
   render_test's and grad_test's readback directories and splat_train's PLY are environment
   variables rather than options.
