@@ -6,7 +6,8 @@ rewritten from scratch; the pre-ZGAL code is in git history before this rewrite.
 
 Read the docs for the area you touch:
 
-- [docs/architecture.md](docs/architecture.md): the directory layout, the pipeline and the conventions (cameras, buffers, budgets) every kernel follows.
+- [docs/architecture.md](docs/architecture.md): the directory layout, the pipeline, the conventions (cameras, buffers, budgets) every kernel follows, the render, train and view graphs, and each program's options and tests (splat_render, splat_view, splat_train).
+- [README.md](README.md#viewing-a-scene): how to view a scene, natively and in a page, and encode a stream for the web.
 - [docs/building-and-testing.md](docs/building-and-testing.md): before building, testing, adding a program or test, or bumping the wrapper.
 - [docs/data-format.md](docs/data-format.md): the converter (`tools/`) and the files the programs read: the `Splat` and `Camera` buffers, the packed images, `manifest.json`, INRIA PLY, and the stream files (`lib/splat_stream.zgal`, encoded by `lib/native/`).
 - [docs/web.md](docs/web.md): the programs on WebGPU: every kernel's binding and workgroup-memory budget against WebGPU's default limits, the web tests, and what the web doesn't support.

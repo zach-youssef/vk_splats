@@ -30,10 +30,38 @@ training options are in [docs/data-format.md](docs/data-format.md) and the
 from conversion through `tools/scene_args.py --train` to the evaluation, is in
 [docs/results.md](docs/results.md#reproducing).
 
-## Viewer controls
+## Viewing a scene
 
-`splat_view` shows a scene (a stream, or natively an INRIA PLY) in a window (its options are in the
-[splat_view section](docs/architecture.md#splat_view)):
+`splat_view` draws a scene while it streams in: natively an INRIA PLY (as splat_train writes) or a
+`scene.stream`, the compact form the web reads. Every option is in the
+[splat_view section](docs/architecture.md#splat_view) of the architecture doc.
+
+### Encoding a stream
+
+`tools/convert.py stream` encodes a PLY (or a converted scene's `splats.bin`) as `scene.stream` in
+an output directory, with a preset from `tools/stream-configs/`: `full` (every value f32, drawn
+exactly as the PLY), `f16` or `web`, the smallest (80 bytes a splat at SH degree 3 against
+`full`'s 236). `--cameras` copies a `cameras.bin` beside it. It calls the C++ encoder through the
+native library, so build that first (`make native`, which `make` does too):
+
+```
+tools/convert.py stream scene.ply out --config tools/stream-configs/web.json --cameras cameras.bin
+```
+
+The presets and their errors are in [docs/data-format.md](docs/data-format.md#stream-files).
+
+### Natively
+
+```
+build/splat_view/splat_view scene.ply
+build/splat_view/splat_view out/scene.stream --cameras out/cameras.bin --camera 3
+build/splat_view/splat_view out/scene.stream --frames 16 --capture view.png --size 640x480
+```
+
+It opens an 800×800 window (`--size WxH` for another) at the camera the encoder wrote into the
+stream's header, or at camera k of a `cameras.bin` with `--cameras FILE --camera k`, and the view
+fills in as the file loads (`--stream-words`, 4 MiB a frame by default). `--frames N` runs N frames
+headless instead, and `--capture FILE` writes the last one to a PNG.
 
 | Input | Does |
 | --- | --- |
@@ -42,6 +70,38 @@ from conversion through `tools/scene_args.py --train` to the evaluation, is in
 | drag (left mouse button) | look around |
 | scroll | move faster (up) or slower (down) |
 | Escape | quit |
+
+The speed starts at a quarter of the cameras' spread a second with `--cameras`; without it, or when
+the file's cameras don't spread (one camera, or coincident ones), of the start camera's distance
+from the world origin, which suits only a scene around the origin, so scroll when it's off.
+
+### On the web
+
+`make web` builds every program for WebGPU (`make build/web/splat_view` the viewer alone). The
+page, `splat_view.zgal.html`, takes its arguments from the query string (`arg=` for the scene,
+`name=value` for the options) and fetches the files by URL, so serve the build and the scene
+together, e.g. from `build/site`:
+
+```
+mkdir -p build/site/scene
+ln -s ../web/splat_view build/site/viewer
+cp out/scene.stream out/cameras.bin build/site/scene/
+python3 -m http.server 8000 --bind 127.0.0.1 --directory build/site
+```
+
+then open
+`http://127.0.0.1:8000/viewer/splat_view.zgal.html?arg=/scene/scene.stream&cameras=/scene/cameras.bin&camera=0`
+in a browser with WebGPU. A relative path resolves against the page's `assets/` directory, so give
+the scene's path from the server's root. WebGPU needs a secure context, which `127.0.0.1` is.
+Under Node the same build runs headless only:
+
+```
+node build/web/splat_view/splat_view.zgal.main.js out/scene.stream --frames 16 --capture view.png
+```
+
+The web reads streams only: a PLY is refused as a stream whose header is bad (code 1), so convert
+it first. The rest of what the web doesn't support is in
+[docs/web.md](docs/web.md#not-supported-on-the-web).
 
 ## Layout
 
@@ -56,9 +116,9 @@ The fuller version is [docs/architecture.md](docs/architecture.md#layout).
 
 ## Docs
 
-- [docs/architecture.md](docs/architecture.md): the layout, the render and train pipelines, and the conventions every kernel follows.
+- [docs/architecture.md](docs/architecture.md): the layout, the render and train pipelines, the view graph, and the conventions every kernel follows.
 - [docs/building-and-testing.md](docs/building-and-testing.md): building, testing, adding programs and tests, CI.
-- [docs/data-format.md](docs/data-format.md): the converter, the scene files and the INRIA PLY format.
+- [docs/data-format.md](docs/data-format.md): the converter, the scene files, the INRIA PLY format and the stream files.
 - [docs/web.md](docs/web.md): the WebGPU build, its limits and tests.
 - [docs/paper-conformance.md](docs/paper-conformance.md): where the code follows the paper and where it departs.
 - [docs/results.md](docs/results.md): training runs on real scenes.
