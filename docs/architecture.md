@@ -644,7 +644,10 @@ square meets; and `accum` rounds to f16 at each blend. The first two are departu
 it's within 2/255 of splat_render's goldens (59-60 dB), almost all of it f16: Rasterize with both
 departures applied is within 1/255 of the viewer, and either departure alone changes Rasterize's S3
 images by at most 1/255. Equal keys draw in splat-index order, the lower index behind, where
-Rasterize puts it in front; exact float ties are negligible.
+Rasterize puts it in front. Exact float ties are negligible, but Rasterize's keys tie for depths
+within one quantization step (about 2⁻¹⁶ of the depth at 1280×720), and those it blends in index
+order: on a trained scene, up to 22/255 against the viewer
+([paper-conformance.md](paper-conformance.md#the-viewer-on-a-real-scene), departure 1).
 Readbacks: `readHeader` (PlanDecode's copy of the header; the app disables it once it has a
 valid one), `readCameras` (once, with `hasCameras`), `readRendered` (a capture or `inspect`),
 `readAccum` (`inspect`: rgba16f as two uints a pixel, r | g << 16 and b | a << 16), and

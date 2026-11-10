@@ -109,7 +109,11 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
 
 1. **Sort key**: 32 bits (tile, then the depth quantized by its float bits, close to log spaced:
    [architecture.md](architecture.md#splat-math)) instead of 64, with ties in splat-index order.
-   Fallback if depth quantization shows: two sorts.
+   Fallback if depth quantization shows: two sorts. It shows on a trained scene: at 1280×720
+   (20 depth bits, near 0.2, far 1000) depths within one step, about 2⁻¹⁶ of the depth, tie, and
+   two nearly opaque splats that tie and overlap blend in index order instead of depth order, up
+   to 22/255 at a pixel ([below](#the-viewer-on-a-real-scene)). A fix is planned in follow-up
+   work: the two sorts (splats by float depth, then the entries stably by tile).
 2. **Capacity**: a fixed splat capacity (the required `--max-splats`), compacted by scan, where the
    paper's count is unbounded. ZGAL recreates a buffer, losing its contents, when its per-frame
    size changes, so only scratch buffers grow.
@@ -198,9 +202,9 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     brighter splat scales it, about 5/255 at colour 2), and over 1/255 only where the crossing
     splat is almost opaque (α > 0.975). That is a single-pixel difference of a few levels at most,
     not an edge or a band. On S3, Rasterize without the stop changes 9 of 16384
-    pixels (camera 0) and 13 of 15360 (camera 24), each by 1/255. On a real scene the viewer differs
-    by more, and near tile edges, which this departure doesn't explain; the cause is under
-    investigation ([below](#the-viewer-on-a-real-scene)).
+    pixels (camera 0) and 13 of 15360 (camera 24), each by 1/255. On the real scene
+    ([below](#the-viewer-on-a-real-scene)) departures 18 and 19 together change a pixel by at most
+    3–4/255; the larger differences there come from departure 1.
 19. **The viewer blends a splat only inside its 3σ square**: SplatQuad's quad is the square of the
     splat's radius around its mean, the radius being 3σ along the larger axis, rounded up to
     pixels. Rasterize evaluates every pixel of the tiles that square meets (departure 7), so it
@@ -210,17 +214,18 @@ Training, from the reference repository's `arguments/__init__.py`, `train.py` an
     colour above 1, as in departure 18), and nothing at an opacity below 0.353 (e^4.5/255; α under
     `alphaMin`: why the viewer's closed-form fixtures keep o < 0.35). The reference's own
     footprint is cut at its tile rectangle, a step of the same size at tile edges. On S3 (opacity
-    0.3-0.95), clipping Rasterize to the square changes no pixel. On a real scene the viewer differs
-    by more, and its largest differences sit near vertical tile edges: this departure or a bug in
-    the tile coverage, under investigation ([below](#the-viewer-on-a-real-scene)).
+    0.3-0.95), clipping Rasterize to the square changes no pixel. On the real scene
+    ([below](#the-viewer-on-a-real-scene)) departures 18 and 19 together change a pixel by at most
+    3–4/255, within the bounds above; the larger differences there come from departure 1.
 
 ## The viewer on a real scene
 
-Departures 18 and 19 bound each pixel's change to 1/255 on S3, but not on a trained scene. On the
-published cs5330 scene ([results.md](results.md#the-published-scene)), splat_view and
-splat_render differ by up to 22/255 in small clusters and short vertical streaks that sit near
-vertical tile edges. The cause is under investigation, so departures 18 and 19 are not settled
-for real scenes.
+On the published cs5330 scene ([results.md](results.md#the-published-scene)), splat_view and
+splat_render differ by up to 22/255 in small clusters and short vertical streaks. These come from
+splat_render's 32-bit sort key (departure 1), not from the viewer's departures: tied depth keys
+blend some overlapping splats in the wrong order. Departures 18 and 19 together stay within
+3–4/255 here, so on this evidence they hold for real scenes too. Most of the rest, the ±1/255
+noise and the viewer's slightly darker mean, is the viewer's f16 `accum`.
 
 The two renderers drew the same splats from the same cameras at 1280×720, background 0, near 0.2,
 on MoltenVK with validation and synchronization validation on (no messages). splat_view read the
@@ -258,26 +263,45 @@ in any channel, in 1/255; ">1" and ">2" count the pixels whose largest channel d
   2, 6, 0, 25 and 1 pixels over 8/255; 0, 0, 1, 0, 2, 0, 3 and 0 over 12/255), but they aren't
   isolated pixels: they form small clusters and short vertical streaks. Camera 0 has a streak
   2 pixels wide and 8 rows tall at x = 896–897 (rows 631–638, 9–12/255), a 4-row one at
-  x = 736 (rows 659–662) and a blob in a 3×3 box at x = 1021–1023 (rows 679–681; 6 of its 9 pixels are over 8/255); camera 9 a 2×3 blob at
-  x = 796–797 and camera 45 a 3×3 one at x = 702–704.
-- **They sit near vertical tile edges**: tiles are 16×16 pixels and 1280×720 divides evenly, so
-  a tile's left edge is at x ≡ 0 (mod 16). Over the 8 cameras, x mod 16 from 0 to 15 counts:
+  x = 736 (rows 659–662) and a blob in a 3×3 box at x = 1021–1023 (rows 679–681; 6 of its 9
+  pixels are over 8/255); camera 9 a 2×3 blob at x = 796–797 and camera 45 a 3×3 one at
+  x = 702–704.
+- **Many sit near vertical tile edges, by coincidence**: tiles are 16×16 pixels and 1280×720
+  divides evenly, so a tile's left edge is at x ≡ 0 (mod 16). Over the 8 cameras, x mod 16 from 0
+  to 15 counts:
   - over 4/255: 48, 42, 26, 12, 18, 14, 9, 10, 18, 10, 13, 6, 12, 13, 24, 32; residues 14, 15,
     0 and 1 hold 146 of 307 (48%, against 25% if spread evenly);
   - over 8/255: 14, 9, 2, 0, 0, 1, 0, 1, 0, 0, 0, 0, 2, 4, 4, 5; residues 14, 15, 0 and 1 hold
     32 of 42 (76%).
 
   In y it is the opposite: over 4/255, y mod 16 peaks mid-tile (8, 11, 16, 19, 20, 20, 24, 27,
-  33, 25, 21, 26, 24, 13, 10, 10).
-- **The cause is under investigation.** The alignment with tile columns points at Rasterize's
-  tile coverage: departure 19 (Rasterize blends a footprint out to its tile rectangle, where the
-  viewer stops at the 3σ square), or a bug in splat_render. Departure 18 is per pixel and
-  wouldn't line up with tiles, so it is the less likely cause. Departure 19 as written doesn't
-  explain why the differences cluster at tile edges in x but mid-tile in y, nor sizes past its
-  bound of 2.8/255 per unit of colour difference without splats several units brighter than
-  what is behind them, so a bug isn't ruled out. No render has isolated the splats at those
-  pixels yet (camera 0's streak at x = 896 is a candidate), and the darker mean isn't explained
-  either.
+  33, 25, 21, 26, 24, 13, 10, 10). The pixels over 8/255 come from about ten clusters, six of
+  which happen to sit by a column edge. The shift test ran on a CPU model of the two renderers
+  (below) rather than on the measured renders: the model's tie differences, which match these
+  closely (37 pixels over 8/255, 78% at residues 14, 15, 0 and 1), all move by exactly 8 pixels
+  when the camera's cx moves by 8, with the same counts, and the share at those residues drops
+  to 0%: they follow the scene, not the tile grid.
+- **The cause: tied sort keys in splat_render (departure 1).** At 1280×720 the key keeps 20
+  depth bits, so with near 0.2 and far 1000 a step is 128 float ulps, about 2⁻¹⁶ of the depth.
+  Two splats within a step share a key and blend in splat-index order, the lower index in front;
+  the viewer sorts by the float depth. Camera 0's streak at x = 896–897 is two nearly opaque
+  splats (α 0.86 and 0.82 there) of different colours at depths 4.845015 and 4.845058, 90 ulps
+  apart: the farther one has the lower index, so splat_render draws it in front. The evidence:
+  - A CPU model of Rasterize (projectSplat, the tile rectangles, front to back with the stop)
+    with the quantized key and ties in index order reproduces splat_render's images within
+    1/255 at every pixel on six cameras (cameras 45 and 24: all but 6 and 17 pixels, by up to
+    6/255, likely keys on a step boundary where the model's float64 depth rounds differently).
+    The same model in float depth order differs from splat_render at every one of the 307
+    pixels over 4/255, and a model of the viewer (float order, 3σ square, no stop) matches
+    splat_view's images within 3–4/255.
+  - On the GPU, splat_view sorting on splat_render's quantized key (ties with the lower index
+    in front; an experiment, not committed) brings the largest difference down from 3–22/255 to
+    3–4/255 on all 8 cameras, and the pixels over 2/255 by 13–80%.
+- **Departures 18 and 19** together, the model's viewer against Rasterize in float order: at
+  most 3–4/255 a pixel, a signed mean of +0.003 to +0.015/255. They hold here as on S3.
+- **The f16 `accum`**: the model of the viewer in f32 against splat_view's images accounts for
+  most of the pixels over 1/255 (800 to 20,000 a camera) and for the darker mean (−0.18 to
+  −0.26/255): each blend into the rgba16f `accum` rounds.
 - **The web preset's quantization** roughly doubles the pixels over 2/255 and costs about 1 dB,
   but the largest differences stay within 2/255 of the PLY's: the outliers come from the
   renderers, not the encoding.
