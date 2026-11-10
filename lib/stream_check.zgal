@@ -23,6 +23,29 @@
    (for ([i (range (+ (shr arrived (uint 2)) globalInvocationId.x) words (* 256 workgroupCount.x))])
      (write! (at stream i) undecodedWord))))
 
+;; A mutant decode, for the test that shows the two above catch a decode ahead (splat_view's
+;; --decode-ahead-mutant): once the header has passed, it writes the next base record's last word,
+;; raw, as splat counts[decodeBaseDecoded]'s position.x. That record isn't whole, so its last word
+;; hasn't arrived: it's PoisonUnarrived's undecodedWord, a NaN, which CheckUndecoded must count
+;; (unpoisoned, the word would be zero and go unseen). One invocation.
+(compute-material DecodeAheadMutant
+  (workgroup 1)
+  (bindings
+   (stream (buffer-array uint read))
+   (header (buffer-array StreamHeader read))
+   (counts (buffer-array uint read))
+   (splats (buffer-array Splat write)))
+  (push (capacity uint))
+  (compute
+   (let* ([h (at header 0)]
+          [next (at counts decodeBaseDecoded)])
+     (when (and (= (at counts decodeHeaderState) (uint 1)) (= (at counts decodeHeaderCode) streamOk)
+                (< next h.splatCount) (< next capacity))
+       (write! (.position (at splats next))
+               (vec3 (uintBitsToFloat
+                      (at stream (- (shr (+ h.baseOffset (* (+ next (uint 1)) h.baseStride)) (uint 2)) (uint 1))))
+                     0.0 0.0))))))
+
 ;; Adds to counts[slot] the splats that have a value written past the records decoded: any base
 ;; value (position, opacity, logScale, rotation, sh[0..2]) at or past decodeBaseDecoded, any sh[3..]
 ;; at or past decodeShDecoded (the buffer starts zeroed)

@@ -48,8 +48,8 @@
   - `stream_check.zgal`: test kernels around that decode: `PoisonUnarrived` fills a stream
     buffer's words past `arrived` with `undecodedWord`, and `CheckUndecoded` counts the splats
     with a value past the records decoded, so a kernel decoding a record before it has arrived
-    fails (`programs/stream_test`, and splat_view's `--check-decode`); it imports
-    `splat_stream.zgal`.
+    fails (`programs/stream_test`, and splat_view's `--check-decode`); `DecodeAheadMutant` is
+    such a kernel, for the test that shows they catch it; it imports `splat_stream.zgal`.
   - `view_camera.zgal`: the viewer's camera controls, a pose relative to a start camera turned
     by mouse deltas, moved by keys and fitted to the window's size ([below](#view-camera)); it
     imports `splat_math.zgal`.
@@ -577,12 +577,27 @@ the x axis stays level over thousands of random looks, and the speed's exact way
 
 `lib/view_graph.zgal`'s `ViewGraph` draws a `scene.stream` ([data-format.md](data-format.md#stream-files))
 from a camera the app gives each frame, as a `uniform` (`cameraInput`: `fitCamera` of a start
-camera, [above](#view-camera)). For now it loads the stream whole through `buffer-file`
-(`--stream-bytes` of it: the decode trusts that size). Each frame:
+camera, [above](#view-camera)). The stream comes through a `stream-buffer` (`stream`, opened by
+the program's `open` input from the `streamFile` path): the wrapper reads the header first and
+sizes the buffer from it (`#:words`: the SH records' end, `shOffset + splatCount·shStride`, over
+4), and the graph's other sizes come from the header too (`splatCount`, at least 1, and the SH
+degree), so nothing about the scene is an option. The opener must give the whole stream, header
+included, and refuse a header `checkStreamHeader` refuses: a refused header would size the
+buffers before PlanDecode refuses it. Each frame copies at most `perFrame` more bytes in before
+the frame's nodes, and the app passes that frame's byte count as `arrived` (the `streamed`
+event's). Each frame:
 
-1. The decode ([data-format.md](data-format.md#decode)): PlanDecode with `arrived` the whole
-   stream, then DecodeBase and DecodeSh, indirectly. With the stream all there, frame 0 decodes
-   every record and later frames none.
+1. The decode ([data-format.md](data-format.md#decode)): PlanDecode with `arrived`, then
+   DecodeBase and DecodeSh, indirectly, over the records that are whole for the first time, so
+   each record is decoded once, in the frame it completes. With `checkDecode`, `poison`
+   (`PoisonUnarrived`, [lib/stream_check.zgal](#layout)) first writes 0xFFFFFFFF over the buffer's
+   words past `arrived` (grid-strided, at most 65,535 workgroups of 256: the format's largest
+   stream is about 33M words), and `check` (`CheckUndecoded`) after the decode counts into
+   `counts[viewUndecoded]` (9) the splats with a value past the records decoded, which the app
+   requires stay 0: a kernel decoding a record before it has arrived would decode the poison.
+   With `decodeAheadMutant` (tests), `mutate` (`DecodeAheadMutant`) writes the next, unfinished
+   base record's last word into its splat after the decode: such a kernel, which the check must
+   catch.
 2. `Project` over the working buffer's capacity (`splatCount`, at most 8,739 workgroups of 64),
    doing work for i < `counts[decodeBaseDecoded]`: `projectSplat` with the header's SH degree (a
    push constant the app reads back, which keeps Project at 7 storage buffers of the web's 8),
@@ -622,32 +637,52 @@ it's within 2/255 of splat_render's goldens (59-60 dB), almost all of it f16: Ra
 departures applied is within 1/255 of the viewer, and either departure alone changes Rasterize's S3
 images by at most 1/255. Equal keys draw in splat-index order, the lower index behind, where
 Rasterize puts it in front; exact float ties are negligible.
-Readbacks: `readHeader` (once), `readCameras` (once, with `hasCameras`), `readRendered` (a capture
-or `inspect`) and `readAccum` (`inspect`: rgba16f as two uints a pixel, r | g << 16 and b | a << 16).
+Readbacks: `readHeader` (PlanDecode's copy of the header; the app disables it once it has a
+valid one), `readCameras` (once, with `hasCameras`), `readRendered` (a capture or `inspect`),
+`readAccum` (`inspect`: rgba16f as two uints a pixel, r | g << 16 and b | a << 16), and
+`readCounts` (`inspect` or `checkDecode`).
 
 ## splat_view
 
 `programs/splat_view` runs `ViewGraph`: in a window by default ([controls](#controls)), or headless with
-`--frames N` and `--capture FILE` (the last frame's `rendered`). ZGAL can't read a file's size or
-header, so `tools/scene_args.py --view <scene.stream>` prints the stream and its required
-`--splat-count` (the header's) and `--stream-bytes` (the file's size):
+`--frames N` and `--capture FILE` (the last frame's `rendered`):
 
 ```
-build/splat_view/splat_view $(tools/scene_args.py --view <scene.stream>) [--cameras cameras.bin --camera k] [--size WxH]
+build/splat_view/splat_view <scene.stream or scene.ply> [--cameras cameras.bin --camera k] [--size WxH]
 ```
+
+The scene streams in, `--stream-words` 4-byte words a frame at most (1,048,576, 4 MiB, by
+default), and the view fills in as it loads. The opener (`splat_view.cpp`, the `open` extern
+input) finds the file as assets are found and opens it by its first bytes: an INRIA PLY
+([data-format.md](data-format.md#inria-ply)) is read whole and encoded in full in memory, every
+group f32 at the PLY's own SH degree, so it renders bit for bit as its full-preset stream (the
+encoding is freed once streamed: the graph keeps a stream's source for the program's life); anything
+else is read as a `scene.stream`. Either way it refuses a header `checkStreamHeader` refuses (or a
+file ending within its header), which fails the program before its first frame. The web's opener
+(`splat_view.inputs.ts`) is `loadAssetStream`: no PLY and no header check yet.
 
 The start camera is the stream header's, or `--camera k` of `--cameras FILE`, fitted to the window
 (or `--size`) by `fitCamera` with the untouched pose, so at the camera's own size it is that
-camera exactly. The app reads the header back once and checks it as PlanDecode does
-(`checkStreamHeader`) and against the arguments (its splat count, and its SH records ending at
-`--stream-bytes`), failing (exit 1) on a mismatch, a `--camera` past the file, or frames running
-out before it has its camera. `--near` (0.2) and `--background` (a grey level) are splat_render's.
-`--inspect` also reads back `accum`, `counts` and the DrawCommand, and on the last frame checks
+camera exactly. The app reads the header back until it has one (a zero magic is a readback from
+before PlanDecode wrote it) and checks it as PlanDecode does (`checkStreamHeader`), keeping its
+record layout. It checks each `streamed` event (the bytes arrived rise, by whole words, to at most
+the buffer's), and fails (exit 1) on a bad one, a refused header, a `--camera` past the file, or
+frames running out before it has its camera. On the last frame it prints the bytes arrived and
+the base and SH records they hold (`completeRecords`: the truncated scene the frame drew), the
+frame the stream finished loading in (or the last that brought bytes) and the frames Project ran
+in. `--near` (0.2) and `--background` (a grey level) are splat_render's.
+`--check-decode` (a test option, implied by `--inspect`) runs the graph's `checkDecode` (poison
+and check, [above](#view-graph)) and reads `counts` back every frame: each readback (once the
+header is in) must have the header passed, nothing decoded past the records decoded, and exactly
+the records its own `decodeArrived` holds decoded; the run fails if no readback was checked.
+`--decode-ahead-mutant` (tests, implying `--check-decode`) adds the graph's `DecodeAheadMutant`,
+which those checks must fail.
+`--inspect` also reads back `accum` and the DrawCommand, and on the last frame checks
 that the image is `encodeAccum` of `accum` within a unit with some pixel covered, and that every
 splat was drawn: the base and SH records decoded, the splats sorted and the DrawCommand's
-instances are all `--splat-count`, with 6 vertices (each readback handled at least
+instances are all the header's splat count, with 6 vertices (each readback handled at least
 framesInFlight + 3 frames after the camera arrived). The newest readbacks can be of different
-frames, so it holds for a still camera only. It also checks that `counts[viewProjections]` (the
+frames, so it holds for a still camera and a loaded scene only. It also checks that `counts[viewProjections]` (the
 frames the GPU ran Project in) is the app's count, and prints that count; the readbacks must be
 framesInFlight + 3 frames after Project last ran, so the run must end still.
 
@@ -677,10 +712,11 @@ released between two frames (Chromium's page tests send both at once, and quick 
 still moves for one frame: a latched press.
 
 Project and the sort run (`#:enabled`, the app's `project`) only in a frame whose camera differs
-from the one they last ran for: the app became ready, or the pose or the surface's size differs
-from the pose and size they last ran for (compared exactly, whatever changed them: a key, a drag
-or the script); the rest of the graph runs every frame, drawing the cached order. So a
-still camera costs the draw and Encode only. A `resize!` applies after the handlers but before the
+from the one they last ran for, or that holds more of the stream: the app became ready, the pose
+or the surface's size differs from the pose and size they last ran for (compared exactly,
+whatever changed them: a key, a drag or the script), or a `streamed` event came; the rest of the
+graph runs every frame, drawing the cached order. So a still camera on a loaded scene costs the
+draw and Encode only. A `resize!` applies after the handlers but before the
 frame's camera is computed, so the frame calling it projects for the new size; a window resized
 by the user is seen by the frame handler a frame late, so that one frame draws the old projection
 at the new size.
@@ -700,14 +736,28 @@ which the largest difference catches (mutants: a DrawCommand one instance short 
 counts, Project skipping the last splat fails at 34-36/255). Each comparison prints its PSNR and
 largest difference. It renders the header's camera without
 `--cameras` and from a one-camera file of the header's bytes 32 to 144, which must capture the
-same PNG, and a wrong `--splat-count` must be refused. Every still run above must have run Project
-in one frame. Then, at 2 and 3 frames in flight, `--scripted-moves 6` must run Project in exactly
-8 frames (ready, the shrink and the 6 moves) and capture, still after the last move, the same PNG
-byte for byte as the same script with `--project-every-frame`: the cached projection is a fresh
-one. (Mutants: dropping the pose or the size from the change check fails the count and the
-comparison.) Natively, the same script with `--timings` must have run Project and the sort in the
-same 8 frames (the table's frame counts): sorting sorted keys changes no image or count, so only
-this catches a sort running every frame. The web has no `--timings`.
+same PNG. Natively, a header with more splats than `streamMaxSplats` must be refused before the
+first frame (the opener's message, code 4), and S3 written as an INRIA PLY must capture the same
+PNG as its full-preset stream, at camera 0 and at the header's camera.
+Then streaming, at 2 and 3 frames in flight with `--check-decode` and small `--stream-words`: the
+last frame of a run that ends partway through must capture the same PNG, byte for byte, as the
+scene its arrived bytes hold (the first B splats, the SH above degree 0 of only the first S,
+from the log's line) encoded whole, and when that is the whole base without SH, as S3 encoded at
+SH degree 0. Natively the frame counts are chosen to end mid-base, mid-SH and exactly at the base
+records' end (the stream-buffer gives the header alone in frame 0, then the words a frame); the
+web takes what has arrived, so its runs land where they do and need only be partway. The
+mid-base run with `--decode-ahead-mutant` must fail, first on the check's "written past the
+records decoded": the poison and the check aren't vacuous (unpoisoned, the mutant's word would be
+zero and go unseen). Every still run above (whole in one frame) must have run Project in one frame.
+Then, at 2 and 3 frames in flight, `--scripted-moves 6` must run Project in exactly 8 frames (ready,
+the shrink and the 6 moves) and capture, still after the last move, the same PNG byte for byte as
+the same script with `--project-every-frame`: the cached projection is a fresh one. (Mutants:
+dropping the pose or the size from the change check fails the count and the comparison.) Natively,
+the same script with `--timings` must have run Project and the sort in the same 8 frames (the
+table's frame counts): sorting sorted keys changes no image or count, so only this catches a sort
+running every frame. And a still run loading the stream 5000 words a frame (all of it in frame 24)
+must run Project and the sort in the frames the app counts, the last of them frame 24, the one that
+loaded it. The web has no `--timings`.
 
 Then the closed-form oracle (`tests/oracle/closed_form.h`), the viewer's S1 check: S1's `faint`
 (one anisotropic splat off the axis, three cameras rotated about z) and `faint-overlap` (three

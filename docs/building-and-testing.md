@@ -60,7 +60,9 @@ also holds the stream encoder and the default camera (`lib/native/stream_encoder
 `default_camera.h`; [data-format.md](data-format.md#stream-files)): the binding mirrors the
 encoder's `EncodeConfig` and `EncodeReport` as ctypes structs and raises a refusal as
 `native.EncodeError`, naming the group and splat. The PLY writer is the one piece still
-duplicated in Python ([data-format.md](data-format.md#inria-ply)).
+duplicated in Python ([data-format.md](data-format.md#inria-ply)). Programs include the headers
+directly, without the library: splat_view's native opener reads and encodes a PLY with them
+(`programs/splat_view/program.mk` makes its object depend on `lib/native/*.h`).
 
 ## Adding programs and tests
 

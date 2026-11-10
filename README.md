@@ -32,7 +32,7 @@ from conversion through `tools/scene_args.py --train` to the evaluation, is in
 
 ## Viewer controls
 
-`splat_view` shows a scene's stream in a window (its options are in the
+`splat_view` shows a scene (a stream, or natively an INRIA PLY) in a window (its options are in the
 [splat_view section](docs/architecture.md#splat_view)):
 
 | Input | Does |

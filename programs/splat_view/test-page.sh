@@ -35,8 +35,7 @@ ln -s "$(cd "$golden/s3" && pwd)/cameras.bin" "$out/site/scene/cameras.bin"
 "$python" tools/convert.py stream "$golden/s3/splats.bin" "$out/site/scene" \
     --config tools/stream-configs/full.json > "$out/convert.log" ||
     { cat "$out/convert.log"; echo "splat_view: page FAILED, encoding the stream"; exit 1; }
-query="$("$python" tools/scene_args.py --query /scene --view "$out/site/scene/scene.stream")"
-query="$query&cameras=/scene/cameras.bin&camera=0&frames=$frames&size=128x128"
+query="arg=/scene/scene.stream&cameras=/scene/cameras.bin&camera=0&frames=$frames&size=128x128"
 
 page() {  # page <name> [checker options]: screenshots $out/<name>.png
     name=$1

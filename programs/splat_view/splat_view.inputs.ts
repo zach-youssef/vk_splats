@@ -1,6 +1,8 @@
-// splat_view on the web: the failure exit (every check is in the app), and --inspect's accum
-// written to $SPLAT_VIEW_ACCUM for the closed-form oracle (web-check/view_oracle_check.cpp), under
-// Node only
+// splat_view on the web: the scene's opener, the failure exit (every other check is in the app),
+// and --inspect's accum written to $SPLAT_VIEW_ACCUM for the closed-form oracle
+// (web-check/view_oracle_check.cpp), under Node only. The opener streams a stream file through the
+// context's assets as it is: unlike the native one (splat_view.cpp) it reads no PLY and doesn't
+// check the header first.
 import * as zgal from './zgal/index.ts';
 import { type MainInputs } from './splat_view.zgal.ts';
 
@@ -8,6 +10,7 @@ type Fs = typeof import('node:fs');
 
 export function mainInputs(_context: zgal.Context): MainInputs {
   return {
+    open: (path, context) => context.loadAssetStream(path),
     fail() {
       globalThis.process?.exit(1);
       throw new Error('splat_view failed');

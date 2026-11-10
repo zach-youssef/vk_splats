@@ -1,31 +1,41 @@
-;; splat_view: the viewer (lib/view_graph.zgal's ViewGraph) on a scene.stream (docs/data-format.md,
-;; "Stream"), in a window or headless (--frames N), writing the last frame to a PNG (--capture FILE).
-;; It loads the stream whole and decodes it on the GPU; ZGAL can't read a file's header or size, so
-;; tools/scene_args.py --view prints the arguments for a stream:
+;; splat_view: the viewer (lib/view_graph.zgal's ViewGraph) on a scene (docs/data-format.md), in a
+;; window or headless (--frames N), writing the last frame to a PNG (--capture FILE):
 ;;
-;;     build/splat_view/splat_view $(tools/scene_args.py --view <scene.stream>) [more arguments]
+;;     build/splat_view/splat_view <scene.stream or scene.ply> [more arguments]
+;;
+;; The scene streams in over frames (--stream-words a frame) and the GPU decodes each record as it
+;; arrives, so the view fills in while it loads. The program's opener (splat_view.cpp natively)
+;; opens the file: a scene.stream as it is, or (natively) an INRIA PLY read and encoded in full
+;; (f32, its own SH degree) in memory; either way it refuses a header checkStreamHeader refuses,
+;; which fails the program before its first frame. The header sizes the graph's buffers.
 ;;
 ;; The camera starts as the stream header's, or --camera k of --cameras FILE (a cameras.bin), fitted
 ;; to the window or --size (lib/view_camera.zgal's fitCamera: with the start camera's size it's the
 ;; start camera exactly). Until the header has been read back (a few frames) nothing is drawn.
-;; The app checks the header as the decode does (checkStreamHeader) and against --splat-count and
-;; --stream-bytes, and fails (exit 1) on a mismatch, a missing camera or when the frames run out
-;; before it has a camera. --inspect also reads back accum, counts and the DrawCommand and checks,
-;; on the last frame, that the image is Encode's of accum (encodeAccum), within a unit of rounding,
-;; and that every splat was decoded (base and SH), sorted and drawn: each count is --splat-count,
-;; and that Project ran as often as the app enabled it (the GPU's viewProjections). The newest
-;; readbacks may be of different frames, so this holds for a still camera only: the run must end
-;; still for framesInFlight + 3 frames. Once those pass, it writes accum's readback to the file
-;; $SPLAT_VIEW_ACCUM names, if set (an extern can't take a path option), for
-;; web-check/view_oracle_check's closed-form oracle (test.sh).
+;; The app checks each streamed event (the bytes arrived, a multiple of 4, at most the buffer's) and
+;; fails (exit 1) on a bad one, a missing camera or when the frames run out before it has a camera.
+;; On the last frame it prints what had arrived and the records that held (the truncated scene a
+;; test renders whole to compare with), the frame the stream finished loading in and the frame
+;; Project last ran in. --check-decode (implied by --inspect and --decode-ahead-mutant) poisons the
+;; stream buffer past what has arrived each frame and reads the counts back every frame: each must
+;; show nothing written past the records decoded, and exactly the records the arrived bytes hold
+;; decoded (completeRecords), and the header passed. --inspect also reads back accum and the
+;; DrawCommand and checks, on the last frame, that the image is Encode's of accum (encodeAccum),
+;; within a unit of rounding, and that every splat was decoded (base and SH), sorted and drawn: each
+;; count is the header's, and that Project ran as often as the app enabled it (the GPU's
+;; viewProjections). The newest readbacks may be of different frames, so this holds for a still,
+;; loaded scene only: the run must end still for framesInFlight + 3 frames. Once those pass, it
+;; writes accum's readback to the file $SPLAT_VIEW_ACCUM names, if set (an extern can't take a path
+;; option), for web-check/view_oracle_check's closed-form oracle (test.sh).
 ;;
 ;; Controls (docs/architecture.md, "splat_view"): W, A, S and D move forward, left, back and right,
 ;; Q and E sink and rise, dragging with the left button looks around, and scrolling changes the
 ;; speed. A key pressed and released between two frames still moves for one frame (a latched
 ;; press). Project and the sort run only in a frame whose camera differs from the last projected
-;; one (the pose, the size, or the app becoming ready): their outputs are #:frames shared, so a
-;; still camera reuses them in every frame slot. --scripted-moves, --project-every-frame and
-;; --frames-in-flight are for tests.
+;; one (the pose, the size, or the app becoming ready) or that holds more of the stream: their
+;; outputs are #:frames shared, so a still, loaded scene reuses them in every frame slot.
+;; --scripted-moves, --project-every-frame, --frames-in-flight, --check-decode and
+;; --decode-ahead-mutant (lib/stream_check.zgal's DecodeAheadMutant) are for tests.
 
 (import "../../lib/view_graph.zgal")
 (import "../../lib/view_camera.zgal")
@@ -115,16 +125,15 @@
 
 (app SplatView
   (parameter streamFile path)
-  (parameter splatCount uint)
-  (parameter countGiven bool)
-  (parameter streamBytes uint)
-  (parameter bytesGiven bool)
+  (parameter streamWords uint)
   (parameter cameraFile path)
   (parameter hasCameras bool)
   (parameter cameraIndex uint)
   (parameter near float)
   (parameter background float)
   (parameter inspect bool)
+  (parameter checkDecode bool)
+  (parameter decodeAheadMutant bool)
   ;; Tests: the frame after the app becomes ready, the surface shrinking to three quarters
   ;; (resize!), then scriptedMoves frames moving forward and looking (W and a drag, through the
   ;; controls' code), then still; Project in every frame (a fresh render, to compare the cache
@@ -139,8 +148,20 @@
   ;; $SPLAT_VIEW_ACCUM names, if set
   (extern (saveAccum [accum : (data uvec2)]) : void)
   (state
-   (headerReady bool #f)   ; the header has been read back and passed the checks
-   (shDegree uint 0)       ; the header's
+   (headerReady bool #f)   ; the header has been read back
+   ;; The header's splats and record layout (completeRecords'), once it has been read back
+   (splatCount uint 0)
+   (baseOffset uint 0)
+   (baseStride uint 0)
+   (shOffset uint 0)
+   (shStride uint 0)
+   ;; The stream: the bytes the coming frame holds and the buffer's (the streamed event's), the
+   ;; frame it finished loading in, and --check-decode's counts readbacks checked against the header
+   (arrived uint 0)
+   (total uint 0)
+   (loaded bool #f)
+   (loadedFrame uint 0)
+   (decodeChecks uint 0)
    (cameraReady bool #f)   ; the start camera is known
    (start Camera (placeholderCamera))
    (readyFrame uint 0)     ; the frame both became ready in
@@ -196,29 +217,24 @@
   ;; Scrolling up is faster
   (on (scrolled offset)
     (with state #:steps (clamp (+ state.steps offset.y) (- viewMaxSteps) viewMaxSteps)))
+  ;; The header PlanDecode copied out (all zeros until a frame holds all of it), read back until
+  ;; the app has it. The opener has checked it: this checks the copy again.
   (on (read readHeader d)
     (let* ([h (at d 0)]
-           [code (checkStreamHeader h)]
-           [expectedBytes (+ h.shOffset (* splatCount h.shStride))])
+           [code (checkStreamHeader h)])
       (cond
+        [(or state.headerReady (= h.magic (uint 0))) state]
         [(not= code streamOk)
          (begin (print! "splat_view: FAILED, the stream's header is refused, code " code) (fail) state)]
-        [(not= h.splatCount splatCount)
-         (begin (print! "splat_view: FAILED, the stream holds " h.splatCount " splats, not --splat-count's "
-                        splatCount)
-                (fail) state)]
-        [(not= expectedBytes streamBytes)
-         (begin (print! "splat_view: FAILED, the stream's records end at " expectedBytes
-                        " bytes, not --stream-bytes' " streamBytes)
-                (fail) state)]
         [else
          (let* ([cameraReady (or state.cameraReady (not hasCameras))]
                 [speed (if hasCameras state.baseSpeed (viewBaseSpeed 0.0 h.camera))])
-           (print! "splat_view: " splatCount " splats at SH degree " h.shDegree)
+           (print! "splat_view: " h.splatCount " splats at SH degree " h.shDegree)
            (unless hasCameras (print! "splat_view: base speed " speed " (from the header's camera)"))
-           (with state #:headerReady #t #:shDegree h.shDegree #:cameraReady cameraReady
-                 #:start (if hasCameras state.start h.camera) #:baseSpeed speed #:readyFrame frameNumber
-                 #:dirty #t))])))
+           (with state #:headerReady #t #:splatCount h.splatCount #:baseOffset h.baseOffset
+                 #:baseStride h.baseStride #:shOffset h.shOffset #:shStride h.shStride
+                 #:cameraReady cameraReady #:start (if hasCameras state.start h.camera) #:baseSpeed speed
+                 #:readyFrame frameNumber #:dirty #t))])))
   (on (read readCameras d)
     (if (< cameraIndex (count d))
         (let* ([n (count d)]
@@ -237,16 +253,49 @@
         (begin (print! "splat_view: FAILED, --camera " cameraIndex " but --cameras holds " (count d))
                (fail) state)))
   (on (read readAccum d) (with state #:accum d #:accumFrame frameNumber))
-  (on (read readCounts d) (with state #:counts d #:countsFrame frameNumber))
+  ;; --check-decode: every counts readback (of the frame that read `arrived` bytes,
+  ;; counts[decodeArrived]) shows no splat written past the records decoded and, once the header
+  ;; is known, the header passed and exactly the records arrived holds decoded
+  (on (read readCounts d)
+    (let* ([next (with state #:counts d #:countsFrame frameNumber)])
+      (cond
+        [(not (or checkDecode inspect decodeAheadMutant)) next]
+        [(< (count d) viewCountsSize)
+         (begin (print! "splat_view: FAILED, the counts readback holds " (count d) " counts") (fail) next)]
+        [(not= (at d viewUndecoded) (uint 0))
+         (begin (print! "splat_view: FAILED, " (at d viewUndecoded) " splats (summed over frames) written past "
+                        "the records decoded, at " (at d decodeArrived) " bytes")
+                (fail) next)]
+        [(not state.headerReady) next]
+        [else
+         (let* ([arrived (at d decodeArrived)]
+                [base (completeRecords arrived state.baseOffset state.baseStride state.splatCount)]
+                [sh (completeRecords arrived state.shOffset state.shStride state.splatCount)])
+           (if (and (= (at d decodeHeaderState) (uint 1)) (= (at d decodeHeaderCode) streamOk)
+                    (= (at d decodeBaseDecoded) base) (= (at d decodeShDecoded) sh))
+               (with next #:decodeChecks (+ state.decodeChecks (uint 1)))
+               (begin (print! "splat_view: FAILED, at " arrived " bytes the decode has code "
+                              (at d decodeHeaderCode) " (state " (at d decodeHeaderState) "), "
+                              (at d decodeBaseDecoded) " base and " (at d decodeShDecoded)
+                              " SH records decoded, not " base " and " sh)
+                      (fail) next)))])))
+  ;; Each frame holding more of the stream: what it holds, which Project must see
+  (on (streamed stream arrived total)
+    (if (or (> arrived total) (not= (remainder arrived (uint 4)) (uint 0)) (<= arrived state.arrived))
+        (begin (print! "splat_view: FAILED, the stream gave " arrived " of " total " bytes after "
+                       state.arrived)
+               (fail) state)
+        (with state #:arrived arrived #:total total #:dirty #t #:loaded (= arrived total)
+              #:loadedFrame frameNumber)))
   (on (read readDraws d) (with state #:draws d #:drawsFrame frameNumber))
   (on (read readRendered d) (if inspect (with state #:image d #:imageFrame frameNumber) state))
   ;; Each frame: moves the pose by the keys (and the script), then decides whether Project and the
   ;; sort run (state.project, their #:enabled): once ready, when the start camera, the pose or the
   ;; surface's size differs from what they last ran for (whatever changed the pose: a key, a drag
-  ;; or the script). A resize! applies after the handlers but before
-  ;; the camera's computed, so a frame resizing projects for its new size; a window resized by the
-  ;; user is seen here a frame late, so that one frame draws the old projection at the new size.
-  ;; Then the checks, and on the last frame --inspect's.
+  ;; or the script), or the frame holds more of the stream (dirty). A resize! applies after the
+  ;; handlers but before the camera's computed, so a frame resizing projects for its new size; a
+  ;; window resized by the user is seen here a frame late, so that one frame draws the old
+  ;; projection at the new size. Then the checks, and on the last frame --inspect's.
   (on (frame dt)
     (let* ([ready (and state.headerReady state.cameraReady)]
            [last (and (> frameLimit 0) (>= (+ frameNumber 1) frameLimit))]
@@ -281,16 +330,22 @@
                        #:lastProjectFrame (if project frameNumber state.lastProjectFrame))])
       (when (and framesGiven (= frameNumber (uint 0))) (set-frames-in-flight! framesInFlightOption))
       (when shrinking (resize! smaller.x smaller.y))
+      ;; The last frame: what it holds (the truncated scene it draws), and when it loaded
+      (when last
+        (print! "splat_view: streamed " state.arrived " of " state.total " bytes, "
+                (completeRecords state.arrived state.baseOffset state.baseStride state.splatCount) " base and "
+                (completeRecords state.arrived state.shOffset state.shStride state.splatCount) " SH records")
+        (if state.loaded
+            (print! "splat_view: loaded in frame " state.loadedFrame "; Project ran in " next.projections
+                    " frames, the last frame " next.lastProjectFrame)
+            (print! "splat_view: still loading (last streamed in frame " state.loadedFrame "); Project ran in "
+                    next.projections " frames, the last frame " next.lastProjectFrame)))
       (cond
-        [(not (and countGiven bytesGiven))
-         (begin (print! "splat_view: FAILED, --splat-count and --stream-bytes are required "
-                        "(tools/scene_args.py --view prints them)")
-                (fail) next)]
-        [(< streamBytes streamHeaderSize)
-         (begin (print! "splat_view: FAILED, --stream-bytes is below the header's " streamHeaderSize " bytes")
-                (fail) next)]
         [(and last (not ready))
          (begin (print! "splat_view: FAILED, " frameLimit " frames weren't enough to read the header back")
+                (fail) next)]
+        [(and last (or checkDecode inspect decodeAheadMutant) (= state.decodeChecks (uint 0)))
+         (begin (print! "splat_view: FAILED, " frameLimit " frames weren't enough to check a counts readback")
                 (fail) next)]
         [(and last scripted (<= frameNumber scriptEnd))
          (begin (print! "splat_view: FAILED, " frameLimit " frames weren't enough for --scripted-moves "
@@ -313,16 +368,16 @@
               (begin (print! "splat_view: FAILED, --inspect's readbacks hold " (count state.counts) " counts and "
                              (count state.draws) " DrawCommands")
                      (fail) next)]
-             [(not (and (= (at state.counts decodeBaseDecoded) splatCount)
-                        (= (at state.counts decodeShDecoded) splatCount)
-                        (= (at state.counts viewProjected) splatCount)
-                        (= (.instanceCount (at state.draws 0)) splatCount)
+             [(not (and (= (at state.counts decodeBaseDecoded) state.splatCount)
+                        (= (at state.counts decodeShDecoded) state.splatCount)
+                        (= (at state.counts viewProjected) state.splatCount)
+                        (= (.instanceCount (at state.draws 0)) state.splatCount)
                         (= (.vertexCount (at state.draws 0)) (uint 6))))
               (begin (print! "splat_view: FAILED, not every splat drawn: " (at state.counts decodeBaseDecoded)
                              " base and " (at state.counts decodeShDecoded) " SH records decoded, "
                              (at state.counts viewProjected) " sorted, " (.instanceCount (at state.draws 0))
                              " instances of " (.vertexCount (at state.draws 0)) " vertices drawn, of "
-                             splatCount " splats")
+                             state.splatCount " splats")
                      (fail) next)]
              [(not= (at state.counts viewProjections) next.projections)
               (begin (print! "splat_view: FAILED, Project ran in " (at state.counts viewProjections)
@@ -344,32 +399,34 @@
                     (begin (saveAccum state.accum) (print! "splat_view: passed") next)
                     (begin (print! "splat_view: FAILED, the image isn't Encode's of accum") (fail) next)))]))]
         [else next])))
-  (run ViewGraph (streamFile streamFile) (splatCount splatCount) (streamBytes streamBytes)
+  (run ViewGraph (streamFile streamFile) (perFrame (* streamWords (uint 4))) (arrived state.arrived)
        (hasCameras hasCameras) (cameraFile cameraFile)
        (cameraInput (if (and state.headerReady state.cameraReady (> surfaceSize.y 0.0))
                         (fitCamera state.pose state.start (uvec2 surfaceSize))
                         state.start))
-       (near near) (shDegree state.shDegree) (background (vec3 background))
+       (near near) (background (vec3 background))
        (window (not headless)) (capture capture) (inspect inspect)
-       #:enabled ((project state.project) (sortSplats state.project))))
+       (checkDecode (or checkDecode inspect decodeAheadMutant))
+       (decodeAheadMutant decodeAheadMutant)
+       #:enabled ((project state.project) (sortSplats state.project) (readHeader (not state.headerReady)))))
 
 (main SplatView
   (about "Views a splat scene's stream, in a window or headless (--frames N, --capture FILE)")
   (window "splat_view" 800 800)
   (timestep #:max 0.1 #:fixed 0.016)
   (capture readRendered)
-  (positional streamFile "the scene's stream (scene.stream)")
-  (option splatCount "--splat-count" "the splats in it (its header's; required)" #:default 1
-          #:range (1 559240) #:given countGiven)
-  (option streamBytes "--stream-bytes" "its size in bytes (required; at most the file's)" #:default 0
-          #:given bytesGiven)
+  (positional streamFile "the scene: a stream (scene.stream), or natively an INRIA PLY")
+  (option streamWords "--stream-words" "the stream's 4-byte words read a frame, at most" #:default 1048576
+          #:range (1 16777216))
   (option cameraFile "--cameras" "a cameras.bin to start from (otherwise the stream header's camera)"
           #:default "" #:given hasCameras)
   (option cameraIndex "--camera" "the camera of --cameras to start from" #:default 0)
   (option near "--near" "the near plane" #:default 0.2)
   (option background "--background" "the background's grey level (0 black, 1 white)" #:default 0.0
           #:range (0.0 1.0))
-  (flag inspect "--inspect" "also read back accum, the counts and the DrawCommand and check them and the image (tests)")
+  (flag inspect "--inspect" "also read back accum, the counts and the DrawCommand and check them and the image (tests; implies --check-decode)")
+  (flag checkDecode "--check-decode" "tests: poison the stream past what has arrived and check each frame's decode")
+  (flag decodeAheadMutant "--decode-ahead-mutant" "tests: decode a word of a record before it has arrived (implies --check-decode, which must fail)")
   (option scriptedMoves "--scripted-moves" "tests: once ready, shrink the surface, then move this many frames"
           #:default 0 #:range (0 1000))
   (flag projectEveryFrame "--project-every-frame" "tests: project and sort in every frame, the camera still or not")

@@ -144,7 +144,8 @@ values, used as stored (the reference code trains on them without linearizing).
 
 This is the reference code's format, read and written by `splatdata.splats`: `read_ply` calls the
 C++ reader the programs share (`lib/native/ply_reader.h`, through `libsplat_native`,
-[building-and-testing.md](building-and-testing.md#the-native-library)), while `write_ply` is
+[building-and-testing.md](building-and-testing.md#the-native-library); splat_view's native opener
+reads a PLY with it and encodes it in full, f32, into a stream in memory), while `write_ply` is
 still Python, the one remaining duplicate of C++ (splat_train's export), until that writer moves
 to `lib/native/` too. It is binary
 little-endian, with one `vertex` element of float properties:
@@ -331,8 +332,8 @@ Each frame:
    field, leaving `sh[3..]`.
 3. **DecodeSh** likewise writes the new SH records' `sh[3..]` (none at degree 0).
 
-The kernels take the stream's size on trust: whatever supplies `arrived` (the app in stream_test, the
-streaming buffer later) keeps it within the buffer. `programs/stream_test` tests them
+The kernels take the stream's size on trust: whatever supplies `arrived` (the app in stream_test,
+from its stream-buffer's `streamed` events in splat_view) keeps it within the buffer. `programs/stream_test` tests them
 ([building-and-testing.md](building-and-testing.md#stream-decode-check)).
 
 ### Encoder

@@ -15,9 +15,13 @@
 # prints both, so a log shows the margin.
 # Then the start camera without --cameras must be the header's: the stream's header camera (bytes
 # 32 to 144) written as a one-camera cameras.bin, rendered with and without --cameras at its size,
-# gives the same capture, with splats in it (--inspect: some pixel covered). And a --splat-count
-# that isn't the header's fails.
-# Last, the closed-form oracle (below, and docs/architecture.md, "splat_view").
+# gives the same capture, with splats in it (--inspect: some pixel covered). And natively (the web
+# opener doesn't check the header) a header that checkStreamHeader refuses (too many splats) fails
+# before the first frame, and S3 as an INRIA PLY (which the native opener encodes in full, f32)
+# renders bit for bit as its full-preset stream, from --cameras and from the header's camera.
+# Then streaming (below): a frame partway through the stream draws the scene its arrived bytes
+# hold, with the decode checked in every frame (--check-decode).
+# Then the closed-form oracle (below, and docs/architecture.md, "splat_view").
 # A <binary> ending in .js is the web build (test-web.sh), run under $NODE (node by default), held to
 # the same bars. $PYTHON (python3 by default) needs numpy and Pillow, and the native library (make
 # native) for convert.py.
@@ -50,12 +54,10 @@ fail() {  # fail <log> <message>
     status=1
 }
 
-view() {  # view <name> <stream> [arguments]: writes $out/<name>.png
-    name=$1 stream=$2
+view() {  # view <name> <scene> [arguments]: writes $out/<name>.png
+    name=$1 scene=$2
     shift 2
-    # shellcheck disable=SC2046 # the arguments are words without spaces
-    program --validation --frames 16 --capture "$out/$name.png" \
-        $("$python" "$tools/scene_args.py" --view "$stream") "$@" > "$out/$name.log" 2>&1
+    program --validation --frames 16 --capture "$out/$name.png" "$scene" "$@" > "$out/$name.log" 2>&1
 }
 
 psnr() {  # psnr <capture> <reference> <minimum> <log>: prints the PSNR and largest difference
@@ -108,15 +110,147 @@ else
     status=1
 fi
 
-# A --splat-count that isn't the header's must fail (as must the header checks behind it)
-log=$out/wrong-count.log
-if program --validation --frames 16 "$out/full/scene.stream" --splat-count 1999 \
-    --stream-bytes "$(wc -c < "$out/full/scene.stream" | tr -d " ")" > "$log" 2>&1; then
-    fail "$log" "a wrong --splat-count passing"
-elif grep -q 'splats, not --splat-count' "$log"; then
-    echo "splat_view: a wrong --splat-count refused"
+case $binary in
+    *.js) ;;
+    *)
+        # A header with more splats than a stream may hold (streamMaxSplats, lib/splat_stream.zgal)
+        # must be refused before the graph sizes its buffers from it
+        "$python" - "$out/full/scene.stream" "$out/oversized.stream" <<'EOF'
+import struct, sys
+with open(sys.argv[1], "rb") as f:
+    data = bytearray(f.read())
+struct.pack_into("<I", data, 8, 559241)  # StreamHeader.splatCount, at offset 8: streamMaxSplats + 1
+with open(sys.argv[2], "wb") as f:
+    f.write(data)
+EOF
+        log=$out/oversized.log
+        if program --validation --frames 16 "$out/oversized.stream" > "$log" 2>&1; then
+            fail "$log" "an oversized header passing"
+        elif grep -q 'checkStreamHeader refuses, code 4 ' "$log"; then
+            echo "splat_view: an oversized header refused"
+        else
+            fail "$log" "an oversized header (not refused for its splat count)"
+        fi
+
+        # A PLY, encoded by the opener, against its full-preset stream: bit for bit, from --cameras
+        # and from the header's camera (the encoder's default camera, the same for both)
+        "$python" - "$tools" "$golden/s3/splats.bin" "$out/s3.ply" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from splatdata.splats import from_std430, write_ply
+with open(sys.argv[2], "rb") as f:
+    write_ply(sys.argv[3], from_std430(f.read()))
+EOF
+        for args in "--cameras $golden/s3/cameras.bin --camera 0 --size 128x128" "--size $size"; do
+            # shellcheck disable=SC2086 # the arguments are words without spaces
+            if view ply "$out/s3.ply" $args && view ply-stream "$out/full/scene.stream" $args &&
+                cmp -s "$out/ply.png" "$out/ply-stream.png"; then
+                echo "splat_view: the PLY renders as its stream ($args)"
+            else
+                cat "$out/ply-stream.log"
+                fail "$out/ply.log" "the PLY against its stream ($args)"
+            fi
+        done
+        ;;
+esac
+
+# Streaming: --stream-words small enough that a frame's stream-buffer holds part of the stream. At
+# 2 and 3 frames in flight the last frame of each run, partway through, must be the image, byte for
+# byte, of the scene its arrived bytes hold (the first B splats, with the SH above degree 0 of only
+# the first S: the log's "B base and S SH records") encoded whole, and when that is the whole base
+# without SH (B 2000, S 0), S3 encoded at SH degree 0. Natively the stream-buffer gives the header
+# alone in frame 0 (zgal::openStream reads it first), then that many words a frame, so frame f holds
+# 432 + 4 f words bytes, and each case must land where it says:
+#   - mid-base: 2500 words, 8 frames (70,432 bytes: B under 2000, S 0);
+#   - mid-SH: 5000 words, 12 frames (220,432 bytes: B 2000, S under 2000);
+#   - base-only: 4000 words, 8 frames (112,432 bytes, the base records' end: B 2000, S 0).
+# On the web a frame takes what has arrived (the header and more in one read, or less than the
+# words), so a run lands wherever it does, and need only be partway (docs/web.md).
+# --check-decode poisons the stream-buffer's words past arrived in each frame and fails the run on
+# any splat decoded from them, or a decoded count that isn't what the arrived bytes hold.
+cat > "$out/degree0.json" <<'EOF'
+{"shDegree": 0, "position": {"encoding": "f32"}, "scale": {"encoding": "f32"},
+ "rotation": {"encoding": "f32"}, "opacity": {"encoding": "f32"}, "dc": {"encoding": "f32"}, "sh": {"encoding": "f32"}}
+EOF
+"$python" "$tools/convert.py" stream "$golden/s3/splats.bin" "$out/degree0" --config "$out/degree0.json" \
+    > "$out/degree0-convert.log" ||
+    { cat "$out/degree0-convert.log"; echo "splat_view: encoding S3 at degree 0 FAILED"; exit 1; }
+records() {  # records <log>: the last frame's base and SH records, "B S"
+    sed -n 's/^splat_view: streamed .* bytes, \([0-9]*\) base and \([0-9]*\) SH records$/\1 \2/p' "$1"
+}
+for frames_in_flight in 2 3; do
+    for case in "mid-base 2500 8" "mid-sh 5000 12" "base-only 4000 8"; do
+        # shellcheck disable=SC2086 # the case's name, words and frames
+        set -- $case
+        run=stream-$1-$frames_in_flight
+        if ! program --validation --frames "$3" --frames-in-flight $frames_in_flight --stream-words "$2" \
+            --check-decode --capture "$out/$run.png" "$out/full/scene.stream" \
+            --cameras "$golden/s3/cameras.bin" --camera 0 --size 128x128 > "$out/$run.log" 2>&1; then
+            fail "$out/$run.log" "$run's run"
+            continue
+        fi
+        # shellcheck disable=SC2046 # two numbers
+        set -- "$1" $(records "$out/$run.log")
+        if [ -z "${3:-}" ] || ! grep -q '^splat_view: still loading' "$out/$run.log" || ! case $binary:$1 in
+            *.js:*) true ;;
+            *:mid-base) [ "$2" -gt 0 ] && [ "$2" -lt 2000 ] && [ "$3" = 0 ] ;;
+            *:mid-sh) [ "$2" = 2000 ] && [ "$3" -gt 0 ] && [ "$3" -lt 2000 ] ;;
+            *) [ "$2" = 2000 ] && [ "$3" = 0 ] ;;
+        esac; then
+            fail "$out/$run.log" "$run: not partway through as the case needs ('${2:-}' base, '${3:-}' SH)"
+            continue
+        fi
+        "$python" - "$tools" "$golden/s3/splats.bin" "$out/$run-splats.bin" "$2" "$3" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from splatdata.splats import Splats, from_std430, to_std430
+with open(sys.argv[2], "rb") as f:
+    s = from_std430(f.read())
+base, sh = int(sys.argv[4]), int(sys.argv[5])
+coefficients = s.sh[:base].copy()
+coefficients[sh:, 1:, :] = 0  # the SH above degree 0 of the splats whose SH record hasn't arrived
+with open(sys.argv[3], "wb") as f:
+    f.write(to_std430(Splats(s.position[:base], s.log_scale[:base], s.rotation[:base],
+                             s.opacity_logit[:base], coefficients)))
+EOF
+        if ! "$python" "$tools/convert.py" stream "$out/$run-splats.bin" "$out/$run-whole" \
+            --config "$tools/stream-configs/full.json" > "$out/$run-convert.log"; then
+            fail "$out/$run-convert.log" "encoding $run's truncated scene"
+            continue
+        fi
+        if view "$run-whole" "$out/$run-whole/scene.stream" --cameras "$golden/s3/cameras.bin" --camera 0 \
+            --size 128x128 && cmp -s "$out/$run.png" "$out/$run-whole.png"; then
+            echo "splat_view: $run: $2 base and $3 SH records arrived, the image is that scene's whole"
+        else
+            cat "$out/$run-whole.log"
+            fail "$out/$run.log" "$run against its truncated scene"
+            continue
+        fi
+        if [ "$2" = 2000 ] && [ "$3" = 0 ]; then
+            if view "$run-degree0" "$out/degree0/scene.stream" --cameras "$golden/s3/cameras.bin" --camera 0 \
+                --size 128x128 && cmp -s "$out/$run.png" "$out/$run-degree0.png"; then
+                echo "splat_view: $run: the base without SH is S3 at degree 0"
+            else
+                cat "$out/$run-degree0.log"
+                fail "$out/$run.log" "$run against S3 at degree 0"
+            fi
+        fi
+    done
+done
+# The mutant that shows --check-decode isn't vacuous: --decode-ahead-mutant (which implies it)
+# writes a word of the next, unfinished base record (one that hasn't arrived, so PoisonUnarrived's
+# poison) into its splat each frame. The mid-base run must then fail on the check's "written past the records decoded",
+# its first failure (not a validation message, a crash or another check). Without the poison the
+# word would be zero and go unseen, so this also shows the poison is written.
+run=stream-mutant
+if program --validation --frames 8 --stream-words 2500 --decode-ahead-mutant \
+    --capture "$out/$run.png" "$out/full/scene.stream" --cameras "$golden/s3/cameras.bin" --camera 0 \
+    --size 128x128 > "$out/$run.log" 2>&1; then
+    fail "$out/$run.log" "$run passed, but must fail:"
+elif grep -m 1 FAILED "$out/$run.log" | grep -q 'splats (summed over frames) written past the records decoded'; then
+    echo "splat_view: $run: failed on the records decoded ahead, as it must"
 else
-    fail "$log" "a wrong --splat-count (not refused for it)"
+    fail "$out/$run.log" "$run failed, but not on the records decoded ahead:"
 fi
 # The closed-form oracle: S1's faint variants (tools/make_synthetic.py: opacity below 0.35 and at
 # most 3 splats, so the 3-sigma quad drops nothing the oracle blends) as full-preset (f32) streams,
@@ -238,9 +372,7 @@ moves=6
 script() {  # script <log> [arguments]: the moves on the full preset's camera 0, 40 frames
     log=$1
     shift
-    # shellcheck disable=SC2046 # the arguments are words without spaces
-    program --validation --frames 40 $("$python" "$tools/scene_args.py" --view "$out/full/scene.stream") \
-        --cameras "$golden/s3/cameras.bin" --camera 0 --size 128x128 --scripted-moves $moves "$@" \
+    program --validation --frames 40 "$out/full/scene.stream" --cameras "$golden/s3/cameras.bin" --camera 0 --size 128x128 --scripted-moves $moves "$@" \
         > "$log" 2>&1 || fail "$log" "$log's run"
 }
 for frames_in_flight in 2 3; do
@@ -271,6 +403,24 @@ case $binary in
             echo "splat_view: Project and the sort ran in $((moves + 2)) of 40 frames"
         else
             fail "$log" "Project in '$project' frames and the sort in '$sort', not $((moves + 2)):"
+        fi
+        # And while the stream loads (5000 words a frame: all 472,432 bytes in frame 24), still: each
+        # frame bringing bytes projects and sorts, and none after the one that loads it
+        log=$out/load-frames.log
+        if program --validation --frames 40 --stream-words 5000 --timings "$out/full/scene.stream" \
+            --cameras "$golden/s3/cameras.bin" --camera 0 --size 128x128 > "$log" 2>&1; then
+            project=$(awk '$1 == "project" { print $NF }' "$log")
+            sort=$(awk '$1 == "sortSplats" { print $NF }' "$log")
+            # "loaded in frame L; Project ran in P frames, the last frame F"
+            # shellcheck disable=SC2046 # three numbers
+            set -- $(sed -n 's/^splat_view: loaded in frame \([0-9]*\); Project ran in \([0-9]*\) frames, the last frame \([0-9]*\)$/\1 \2 \3/p' "$log")
+            if [ "${1:-}" = 24 ] && [ "$3" = 24 ] && [ "$project" = "$2" ] && [ "$sort" = "$2" ]; then
+                echo "splat_view: loading, Project and the sort ran in $2 of 40 frames, the last the one that loaded"
+            else
+                fail "$log" "loading: Project in '$project' frames and the sort in '$sort', not the app's (loaded in frame '${1:-}', the last projection '${3:-}', not 24):"
+            fi
+        else
+            fail "$log" "the loading run"
         fi
         ;;
 esac

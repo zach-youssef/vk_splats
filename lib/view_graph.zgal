@@ -1,6 +1,7 @@
-;; The viewer graph (docs/architecture.md, "View graph"): a scene.stream decoded on the GPU
-;; (lib/splat_stream.zgal's PlanDecode, DecodeBase and DecodeSh), then per frame, for the app's
-;; camera (a uniform: lib/view_camera.zgal's fitCamera of a start camera):
+;; The viewer graph (docs/architecture.md, "View graph"): a scene's stream, streamed into a
+;; stream-buffer over frames and decoded on the GPU as its records arrive (lib/splat_stream.zgal's
+;; PlanDecode, DecodeBase and DecodeSh), then per frame, for the app's camera (a uniform:
+;; lib/view_camera.zgal's fitCamera of a start camera):
 ;;   1. Project: projectSplat (lib/splat_math.zgal) per decoded splat, a back-to-front sort key and
 ;;      the splat's index, and the splat draw's DrawCommand;
 ;;   2. a sort of the keys, moving the indices with them: far splats first, culled ones last;
@@ -24,17 +25,20 @@
 (import sorting)
 (import "splat_math.zgal")
 (import "splat_stream.zgal")
+(import "stream_check.zgal")  ; --check-decode's PoisonUnarrived and CheckUndecoded
 (import "present.zgal")  ; Present: the image on a window
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Constants
 ;; ---------------------------------------------------------------------------------------------
 ;; `counts`' elements past the decode's (decodeCountsSize): the splats Project keyed, the sort's
-;; count and the draw's instances; and how many times Project has run (an app disables it on a still
-;; camera, which tests check with this)
+;; count and the draw's instances; how many times Project has run (an app disables it on a still
+;; camera, which tests check with this); and with checkDecode, CheckUndecoded's count of splats
+;; written past the records decoded (summed over frames: it must stay 0)
 (define viewProjected (uint 7))
 (define viewProjections (uint 8))
-(define viewCountsSize (uint 9))  ; the elements (the graph says 9: it can't use this)
+(define viewUndecoded (uint 9))
+(define viewCountsSize (uint 10))  ; the elements (the graph says 10: it can't use this)
 
 ;; A culled splat's key: above every visible one's, so the sort puts it last
 (define culledKey (uint #xFFFFFFFF))
@@ -59,7 +63,7 @@
 ;; splat), so the draw always covers what the sort sorted, and counts the run (viewProjections).
 ;; Dispatched over the working buffer's capacity (at most streamMaxSplats: 8739 workgroups, within
 ;; every device's limit); the invocations past the decoded splats do nothing. shDegree is the stream
-;; header's (the app gives it, which keeps the bindings at 7 of WebGPU's 8).
+;; header's (a push constant, which keeps the bindings at 7 of WebGPU's 8).
 (compute-material Project
   (workgroup 64)
   (bindings
@@ -135,38 +139,54 @@
 ;; The graph
 ;; ---------------------------------------------------------------------------------------------
 (graph ViewGraph
-  ;; The stream: streamFile, of streamBytes bytes (a multiple of 4: the stream format's), holding
-  ;; splatCount splats (the working buffer's capacity, at most streamMaxSplats). The decode trusts
-  ;; streamBytes to be at most the file's size.
-  (parameter splatCount uint)
-  (parameter streamBytes uint)
+  ;; The scene: the stream `open` opens at streamFile (its header checked: the opener refuses a
+  ;; header checkStreamHeader refuses, so the sizes below hold), streamed into `stream` at most
+  ;; perFrame bytes a frame (a multiple of 4). `arrived` is the bytes this frame holds (the app's
+  ;; streamed event's), which the decode takes on trust: at most the buffer's.
+  (input open (stream StreamHeader))
   (input streamFile path)
+  (parameter perFrame uint)
+  (input arrived (per-frame uint))
   ;; The start cameras: cameraFile when hasCameras (otherwise the stream header's camera)
   (parameter hasCameras bool)
   (input cameraFile path)
   ;; The camera to draw from, each frame (fitCamera), its size the surface's
   (input cameraInput (per-frame Camera))
-  ;; Splats at most `near` from the camera are culled; shDegree is the header's (the app's, once
-  ;; it has read the header back)
+  ;; Splats at most `near` from the camera are culled
   (parameter near float)
-  (input shDegree (per-frame uint))
   ;; The colour behind the splats (per frame: a graph parameter can't be a vec3)
   (input background (per-frame vec3))
   ;; Whether the graph draws the image on the surface (a program with a window), whether it reads
-  ;; the image back (a capture), and whether it also reads back accum, counts and the DrawCommand
-  ;; (for tests)
+  ;; the image back (a capture), whether it also reads back accum, counts and the DrawCommand (for
+  ;; tests), and whether each frame poisons the stream past `arrived` and counts the splats written
+  ;; past the records decoded (counts[viewUndecoded], read back each frame: tests)
   (parameter window bool)
   (parameter capture bool)
   (parameter inspect bool)
+  (parameter checkDecode bool)
+  ;; Tests: DecodeAheadMutant after the decode, which checkDecode must catch
+  (parameter decodeAheadMutant bool)
 
-  (buffer-file stream uint streamFile)
+  ;; The whole stream (header, base records, SH records), and from its header the splats (the
+  ;; working buffers' capacity: at least 1, as a buffer can't be empty) and the SH degree.
+  ;; streamWords repeats #:words: a constant can't read the header of a buffer declared after it.
+  (stream-buffer stream open streamFile
+                 #:words (/ (+ (.shOffset (stream-header stream))
+                               (* (.splatCount (stream-header stream)) (.shStride (stream-header stream))))
+                            4)
+                 #:per-frame perFrame)
+  (constant splatCount (max (uint 1) (.splatCount (stream-header stream))))
+  (constant shDegree (.shDegree (stream-header stream)))
+  (constant streamWords (/ (+ (.shOffset (stream-header stream))
+                              (* (.splatCount (stream-header stream)) (.shStride (stream-header stream))))
+                           4))
   (buffer-file cameras Camera cameraFile #:when hasCameras)
   (uniform camera Camera cameraInput)
   ;; The decode's (lib/splat_stream.zgal), then Project's and the sort's
   (buffer splats Splat splatCount #:frames shared)
   (buffer header StreamHeader 1 #:frames shared)
-  ;; decodeCountsSize, viewProjected and viewProjections: viewCountsSize
-  (buffer counts uint 9 #:frames shared)
+  ;; decodeCountsSize, viewProjected, viewProjections and viewUndecoded: viewCountsSize
+  (buffer counts uint 10 #:frames shared)
   (buffer commands DispatchCommand 2 #:frames shared)  ; decodeBaseCommand, decodeShCommand
   (buffer projected Projected splatCount #:frames shared)
   (buffer keys uint splatCount #:frames shared)
@@ -181,10 +201,18 @@
   (target renderedTarget (color rendered))
   (target screen (surface #:clear (0.0 0.0 0.0 1.0) #:depth none) #:when window)
 
+  ;; Grid-strided, so capped at 65,535 workgroups of 256 (every device's limit), which the
+  ;; format's largest stream (about 33M words) would exceed
+  (material poisoning PoisonUnarrived stream #:push ((arrived arrived) (words streamWords))
+            #:invocations ((min streamWords (uint 16776960))) #:when checkDecode)
   (material planning PlanDecode stream header counts commands
-            #:push ((arrived streamBytes) (capacity splatCount)) #:invocations (1))
+            #:push ((arrived arrived) (capacity splatCount)) #:invocations (1))
   (material decodingBase DecodeBase stream header counts splats)
   (material decodingSh DecodeSh stream header counts splats)
+  (material mutating DecodeAheadMutant stream header counts splats #:push ((capacity splatCount))
+            #:invocations (1) #:when decodeAheadMutant)
+  (material checking CheckUndecoded counts splats #:push ((splatCount splatCount) (slot 9))  ; viewUndecoded
+            #:invocations (splatCount) #:when checkDecode)
   (material projecting Project splats camera counts projected keys indices draws
             #:push ((near near) (shDegree shDegree)) #:invocations (splatCount))
   (material quads SplatQuad projected keys indices camera
@@ -193,21 +221,24 @@
   (material presenting Present (picture rendered) (pictureSampler nearest)
             #:push ((scale (vec2 1.0 1.0))) #:when window)
 
+  (dispatch poison poisoning #:when checkDecode)
   (dispatch plan planning)
   (dispatch decodeBase decodingBase #:indirect (at commands 0))
   (dispatch decodeSh decodingSh #:indirect (at commands 1))
+  (dispatch mutate mutating #:when decodeAheadMutant)
+  (dispatch check checking #:when checkDecode)
   (dispatch project projecting)
   (sort sortSplats keys #:values indices #:count (at counts 7))  ; viewProjected
   (draw drawSplats accumTarget quads #:indirect (at draws 0))
   (draw encode renderedTarget encoding 3)
   (draw present screen presenting 6 #:when window)
 
-  ;; The header PlanDecode copied out (in the first frame: the whole stream is there), for the
-  ;; app's checks, its camera and its SH degree, and the start cameras
-  (readback readHeader header #:once #t)
+  ;; The header PlanDecode copied out (zeros until the frame holding all of it), for the app's
+  ;; camera and its record layout (an app disables it once it has the header), and the start cameras
+  (readback readHeader header)
   (readback readCameras cameras #:once #t #:when hasCameras)
   ;; The image, for a capture, and what tests check: accum, and the splats decoded, sorted and drawn
   (readback readRendered rendered #:when (or capture inspect))
   (readback readAccum accum #:when inspect)
-  (readback readCounts counts #:when inspect)
+  (readback readCounts counts #:when (or inspect checkDecode))
   (readback readDraws draws #:when inspect))

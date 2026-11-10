@@ -93,8 +93,9 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
 - **stream_test**: every run of the native test; its checks, `checkStreamHeader` among them, are
   in the app, so the web runs the TypeScript export.
 - **splat_view**: the native test (S3 against splat_render's goldens and full against web
-  preset, both at 50 dB and a largest difference of 8/255; the header's camera; a wrong
-  `--splat-count`) at the same bars; its checks are in the app, but for the closed-form oracle on
+  preset, both at 50 dB and a largest difference of 8/255; the header's camera; mid-stream frames
+  against their truncated scenes) at the same bars, but for the PLY and the refused header (the
+  web's opener, `loadAssetStream`, reads streams only and doesn't check the header); its checks are in the app, but for the closed-form oracle on
   S1's faint variants, which `build/web-check/view_oracle_check` runs on the `accum` the app writes
   to `$SPLAT_VIEW_ACCUM` (natively too), so the web build's `saveAccum` needs Node's `fs`, and for
   the sort's frame count (the native `--timings`; the web has none). Dawn on Metal gave the same
@@ -155,3 +156,7 @@ SwiftShader, which the Node tests don't reach:
 - **Paths in externs**: a ZGAL extern can't take a `path` (or string) parameter, so
   render_test's and grad_test's readback directories and splat_train's PLY are environment
   variables rather than options.
+- **splat_view's PLY and header check**: the web's opener (`splat_view.inputs.ts`) is
+  `loadAssetStream`, so the page and the Node build read `scene.stream` files only, and a header
+  `checkStreamHeader` refuses reaches the graph, which sizes its buffers from it before PlanDecode
+  refuses it (a web opener that checks the header with `peekStream` is planned).
