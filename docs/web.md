@@ -1,6 +1,7 @@
 # The web
 
-Every program is also built for WebGPU (`make web`, ZGAL's `zgal-web-program`) and runs under
+Every program is also built for WebGPU (`make web`, ZGAL's `zgal-web-program`; locally it and
+`make test-web` need no emscripten) and runs under
 Node with Dawn (`node build/web/<name>/<name>.zgal.main.js <options>`) or in a page
 (`<name>.zgal.html`). The ZGAL side is in `external/vulkan_test/docs/web.md`; this file has what is
 specific to the splatting programs.
@@ -103,7 +104,8 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   with `checkStreamHeader`'s TypeScript export, the function the native opener and PlanDecode
   run, then hands the graph a stream replaying them before the rest. It rejects a refused header
   or a stream ending within its header, failing the graph's build before anything is sized from
-  the header, as natively; the test's oversized, wrapping (2³⁰ splats, whose stream size wraps a
+  the header, as natively (the message reads "loading <Graph>'s stream-buffer …", and the exit
+  code is 1); the test's oversized, wrapping (2³⁰ splats, whose stream size wraps a
   `uint` to 432 bytes) and short streams fail a web build opening with a plain `loadAssetStream`.
   A frame takes what has arrived (the header and more in one read, or fewer bytes than
   `--stream-words`), unlike native's fixed schedule, so the mid-stream runs land wherever they do
@@ -111,7 +113,12 @@ components of one storage element; TileRanges' tile ranges are two `uint`s a til
   S1's faint variants, which `build/web-check/view_oracle_check` runs on the `accum` the app writes
   to `$SPLAT_VIEW_ACCUM` (natively too), so the web build's `saveAccum` needs Node's `fs`, and for
   the sort's frame count (the native `--timings`; the web has none). Dawn on Metal gave the same
-  PSNRs as MoltenVK.
+  PSNRs as MoltenVK. On lavapipe the margins against the 50 dB and 8/255 bars are about 59 dB and
+  a largest difference of 2/255. No page test sends real mouse events, so the drag wiring is
+  untested, and none covers the cap of 65,535 workgroups on the grid-strided PoisonUnarrived (it needs a stream of about
+  67 MB on lavapipe). Under Node a file asset's stream arrives at about 0.1 MB a frame whatever
+  `--stream-words` says (an M4 loads the 26 MB site scene in about 280 frames, lavapipe in 3), and
+  a headless run prints "streamed" and "loaded in frame" only at its end.
 
 ## Training on the web
 

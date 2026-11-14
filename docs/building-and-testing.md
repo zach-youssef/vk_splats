@@ -7,7 +7,8 @@ Racket 8 and, for the web, Node 24 and npm (`external/vulkan_test/docs/building-
 has the details and the platform paths). The data tools need Python 3 with pytest, numpy,
 scipy and Pillow (`tools/requirements.txt`); a virtualenv in `.venv/` is ignored by git, e.g.
 `python3 -m venv .venv && .venv/bin/pip install -r tools/requirements.txt`, then
-`make test PYTHON=.venv/bin/python`. Clone with `--recursive`, or run `git submodule update --init --recursive`.
+`make test PYTHON=.venv/bin/python` (the Mac's system `python3` has no scipy, so make needs
+`PYTHON` there; every worktree needs its own `.venv`). Clone with `--recursive`, or run `git submodule update --init --recursive`.
 The data tools also call C++ through the native library ([below](#the-native-library)), so they
 need it built (`make native`, which the test targets do first), and with it the C++ compiler and
 Racket (for its ZGAL-generated header).
@@ -26,7 +27,8 @@ Racket (for its ZGAL-generated header).
 - `make web`: builds every program for the web into `build/web/<name>`.
 - `make test-web`: each program's `test-web.sh` under Node (`make test-web-<name>` runs one),
   after building its web-check tools and the native library; it needs Python as `make test` does
-  (`PYTHON=...`).
+  (`PYTHON=...`). It runs locally without emscripten (Node and Dawn). splat_view's web frame-count
+  tests can fail under `make -j8`, so run `test-web` serially.
 - `make test-pages`: each program's `test-page.sh` (`make test-pages-<name>` runs one), after its
   web build and the native library (a page test may encode its scene): its page in headless
   Chromium on SwiftShader, through the wrapper's `web/tools/chromium.ts`. It needs Python as `make test` does, and Chromium's headless shell:
@@ -50,7 +52,8 @@ ctypes doesn't check the signatures, so the binding refuses a library whose stru
 from its own, and `tools/tests/test_native.py` calls every C function. Adding a function means: the
 header in `lib/native/` (and its C++ test), its wrapper in `c_api.cpp`, its signature in
 `native.py`, and a test in `test_native.py`. The library's generated header comes from
-`lib/native/c_api.zgal`, which imports the modules whose structs it uses.
+`lib/native/c_api.zgal`, which imports the modules whose structs it uses; a material in a module it
+imports compiles into the library without Vulkan symbols.
 
 It holds the INRIA PLY reader (`lib/native/ply_reader.h`), which `splatdata.splats.read_ply`
 calls, so the data tools' tests and every tool reading a PLY need the library built, and the
@@ -138,6 +141,8 @@ The Makefile loops over what's on disk, so adding these needs no Makefile change
   (`glm::vec3{u(rng), u(rng), u(rng)}`, evaluated left to right), never as the arguments of one
   call or parenthesized constructor, whose order is unspecified (GCC on x86-64 can go right to
   left).
+  A ZGAL constant must not be named like a C macro (`FLT_MAX`): the generated C++ is compiled
+  alongside `<cfloat>`.
 - **A Python test**: `test_*.py` anywhere under `tools/` or `tests/`. They run in one pytest
   invocation without `__init__.py` files, so each basename must be unique (pytest otherwise fails
   with "import file mismatch").
@@ -190,7 +195,10 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
   42721091082, where the same commit's times varied by up to 1.7x between runners), so it is
   split: splat_train's web test alone takes 6.5 to 12 min, every other one's 5 to 8 (grad_test
   4 to 6.5 of them). The native suite's take 8.5 to 14 min, the slowest shard, against the
-  20-min step timeout, which is what the timeouts are sized from. A stack of N commits is 4N
+  20-min step timeout, which is what the timeouts are sized from: split it when it nears that.
+  A job's per-program times come from its log
+  (`gh api --allow-escape-sequences repos/zach-youssef/vk_splats/actions/jobs/<id>/logs`): diff the
+  timestamps of successive `programs/<p>/test-web.sh` lines. A stack of N commits is 4N
   jobs, against GitHub's 20 concurrent. A program's tests must not share files
   with another program's or with the other suites' (each writes only to its output directory,
   `build/test/<name>`, `build/test-web/<name>` or `build/test-pages/<name>`). Watch the slowest
@@ -488,7 +496,9 @@ mean, printed and written to `<out dir>/metrics.json`. splat_train's own PSNR sc
 render, so the two differ a little (within about 0.5 dB, as `check.py` requires).
 `--side-by-side <camera> ...` also writes each camera's image beside its render, each scaled to
 `--thumbnail` px on its longer side. Its tests
-(`tools/tests/test_evaluate.py`) use a fake renderer.
+(`tools/tests/test_evaluate.py`) use a fake renderer. It fails when a render's capacity grows to
+2²⁵ entries, splat_render's maximum, conservatively: there it can no longer tell whether a frame
+overflowed.
 
 ```
 tools/evaluate.py build/data/cs5330 <trained.ply> build/splat_render/splat_render <out dir> \
@@ -510,4 +520,6 @@ trained PLYs bit for bit only between runs that don't grow (start them with enou
 
 `external/vulkan_test` is pinned to a commit of github.com/zach-youssef/vulkan_testing. Bump it to
 a pushed commit (`git -C external/vulkan_test checkout <sha>`, then commit the submodule), and
-read that repository's `docs/consumers.md` and `docs/MIGRATING.md` for what changed.
+read that repository's `docs/consumers.md` and `docs/MIGRATING.md` for what changed. After a
+rebase moves the gitlink, run `git submodule update external/vulkan_test` in the worktree, or the
+stale checkout shows as modified.

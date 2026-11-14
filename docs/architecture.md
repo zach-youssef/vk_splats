@@ -138,6 +138,8 @@ Training adds Adam, and densification and pruning on a fixed capacity, compacted
   image to 2²³ pixels; ZGAL can't check the product of two options, so the programs cap each side
   at 2896 (`--width`, `--height`), which also rejects some sizes within the budget, such as
   3840×2160 (8.3 Mpx).
+- **State sentinels**: a value that can be "unset" is a bool flag beside it, not a sentinel like
+  `-1.0` tested with `>= 0`, which breaks when the value can round below 0.
 - **Subgroups**: never assume a size. lavapipe's is 4, 8 or 16 depending on the CPU and MoltenVK's
   is 32 (the old sort broke on exactly this), so sorts and scans use ZGAL's `sort` and `scan`, and
   no kernel hard-codes 32 or 64.
@@ -145,7 +147,8 @@ Training adds Adam, and densification and pruning on a fixed capacity, compacted
   forward and 128 backward.
 - **Names**: ZGAL refuses a declared name that is a GLSL or C++ keyword or type (`shared`, `half`)
   or a GLSL built-in function (`step`, `sign`, `distance`; hence `StreamField`'s `stepSize`), and
-  a function or struct named like a body form (`values`, `count`, `sum`). The lists are
+  a function or struct named like a body form (`values`, `count`, `sum`). A constant also can't
+  be named like a C macro (`FLT_MAX`): the generated C++ is compiled alongside `<cfloat>`. The lists are
   `external/vulkan_test/dsl/private/names.rkt`.
 - **Draws**: a graphics material culls back faces by default, so one drawing screen-space quads
   whose winding isn't fixed (a splat's corners, either way round) needs `#:cull none`. Draw quads
@@ -190,7 +193,7 @@ closed-form oracles (`tests/oracle/closed_form.h`) and independent derivations.
   depths exactly, with no quantization, and the GPU and the C++ agree bit for bit (integer
   comparisons only). A kept splat's depth is above near > 0 (its key at most infinity's,
   0xFF800000); a culled one gets 0xFFFFFFFF, so it sorts last. The tile entries are then sorted by the tile alone, stably, so each tile's
-  entries stay front to back. Only exactly equal depths tie, and the render graph's rule settles
+  entries stay front to back. ZGAL's `sort` is 8 4-bit LSD passes, whatever the key's width. Only exactly equal depths tie, and the render graph's rule settles
   those ([below](#render-graph)).
 
 ## Render graph
@@ -480,6 +483,9 @@ are read too, and `history` and the trained splats when the app enables `readHis
   costs one barrier per 256 entries). `TileLasts` cuts the walk at the last entry any pixel
   blended, so a saturated tile's tail past every pixel's stop costs only its zero writes. On a
   real scene it costs 4× the forward rasterize ([splat_train](#splat_train)'s numbers).
+- **Binding limits**: `LossDelta` (grad_test's finite differences) uses all 8 storage bindings,
+  WebGPU's limit, so a further extension needs another kernel; `GatherGradients` is at the same
+  limit.
 - **Capacity**: two required parameters. `maxEntries` is the most entries a frame may hold (at
   most 2²⁵, the 128 MiB binding of the 4-byte keys, sort and entry buffers; a larger `capacity`
   counts as it), and `chunkEntries` the entries one backward pass holds (at most 3·2²⁰,
@@ -867,13 +873,15 @@ Its phases, in one graph:
 
 The tile entries' capacity starts at `--initial-entries` and grows (`grownCapacityUpTo`, at most
 `--max-entries`, default and most 2²⁵) after a
-frame that needed more, from the counts read back after iteration 1's frame (loading's frames
+frame that needed more (the entry counts come from the buffer camera's full size, not the frame's
+size), from the counts read back after iteration 1's frame (loading's frames
 train nothing, and this way iteration 1 runs at `--initial-entries` whether a platform delivers a
 frame's reads before or after its frame event). On the web a tick's reads apply before its frame
 event, so iteration 1's own counts are dropped: with `--iterations 1`, an overflowing or over-cap
 iteration 1 neither grows the capacity nor fails the run, it is only reported as skipped (a later
 pick of the same view is checked, so any longer run is covered). Adam skips a frame whose entries overflowed (its
-gradients are incomplete), so that iteration is lost (history −1) and counted in the report. A
+gradients are incomplete), so that iteration is lost (history −1) and counted in the report (the report's skipped-iteration count is one more than the
+printed capacity growths: uninvestigated, harmless). A
 frame needing more than `--max-entries` entries, which no growth can hold, fails the
 program, and so does an overflowing test view: each renders once, so a held-out camera needing
 more entries than any training view grew the capacity to fails the run after its training, with
