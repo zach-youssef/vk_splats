@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 env:
-  # The Playwright release whose Chromium headless shell runs the pages (vulkan_test's web.yml's)
+  # The Playwright release whose Chromium headless shell runs the pages (ZGAL's web.yml's)
   PLAYWRIGHT_VERSION: 1.63.0
 
 defaults:
@@ -107,7 +107,7 @@ jobs:
       - uses: ./.ci/.github/actions/setup-zgal
         with:
           toolchain: native
-          npm-lockfile: external/vulkan_test/web/package-lock.json
+          npm-lockfile: external/zgal/web/package-lock.json
 
       # The data tools' Python packages, from Ubuntu's archive (no pip, so nothing outside it runs)
       - name: Install pytest, numpy, scipy and Pillow
@@ -115,7 +115,7 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends python3-pytest python3-numpy python3-scipy python3-pil
           python3 -c 'import numpy, scipy, pytest, PIL; print("numpy", numpy.__version__, "scipy", scipy.__version__, "pytest", pytest.__version__, "Pillow", PIL.__version__)'
 
-      # From vulkan_test's web.yml. Ubuntu 24.04's AppArmor forbids the unprivileged user namespaces
+      # From ZGAL's web.yml. Ubuntu 24.04's AppArmor forbids the unprivileged user namespaces
       # Chromium's sandbox needs. CHROMIUM names the shell, so the pages fail if it's missing.
       - name: Cache Playwright's browsers
         if: ${{ matrix.suite.chromium }}

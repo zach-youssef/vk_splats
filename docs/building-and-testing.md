@@ -3,7 +3,7 @@
 ## Requirements
 
 The wrapper's: the Vulkan SDK (or the system's Vulkan headers and loader), `glslc`, GLFW, GLM,
-Racket 8 and, for the web, Node 24 and npm (`external/vulkan_test/docs/building-and-testing.md`
+Racket 8 and, for the web, Node 24 and npm (`external/zgal/docs/building-and-testing.md`
 has the details and the platform paths). The data tools need Python 3 with pytest, numpy,
 scipy and Pillow (`tools/requirements.txt`); a virtualenv in `.venv/` is ignored by git, e.g.
 `python3 -m venv .venv && .venv/bin/pip install -r tools/requirements.txt`, then
@@ -174,7 +174,7 @@ working branch, each commit beyond `main` (the newest 50); on `main`, the pushed
     the first shard, add it to both lists.
   - `pages`: `make web`, then `test-pages` (headless Chromium on SwiftShader), which builds the
     native library first (splat_view's page test encodes its stream). Only this shard
-    (`chromium`) installs Chromium's headless shell, with the steps of vulkan_test's `web.yml`:
+    (`chromium`) installs Chromium's headless shell, with the steps of ZGAL's `web.yml`:
     Playwright's (`PLAYWRIGHT_VERSION`, cached), after lifting Ubuntu 24.04's AppArmor ban on the
     unprivileged user namespaces its sandbox needs, and checked to be exactly one shell, which
     `CHROMIUM` then names. Its page tests take well under a minute (on an M4, splat_render's
@@ -518,8 +518,8 @@ trained PLYs bit for bit only between runs that don't grow (start them with enou
 
 ## Bumping the wrapper
 
-`external/vulkan_test` is pinned to a commit of github.com/zach-youssef/vulkan_testing. Bump it to
-a pushed commit (`git -C external/vulkan_test checkout <sha>`, then commit the submodule), and
+`external/zgal` is pinned to a commit of github.com/zach-youssef/zgal. Bump it to
+a pushed commit (`git -C external/zgal checkout <sha>`, then commit the submodule), and
 read that repository's `docs/consumers.md` and `docs/MIGRATING.md` for what changed. After a
-rebase moves the gitlink, run `git submodule update external/vulkan_test` in the worktree, or the
+rebase moves the gitlink, run `git submodule update external/zgal` in the worktree, or the
 stale checkout shows as modified.

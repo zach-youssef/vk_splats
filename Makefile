@@ -17,7 +17,7 @@ CXX = $(if $(filter Darwin,$(ZGAL_OS)),c++,clang++)
 endif
 
 # The Vulkan wrapper and ZGAL (git submodule); ZGAL_ROOT=<path> builds with another checkout
-ZGAL_ROOT ?= external/vulkan_test
+ZGAL_ROOT ?= external/zgal
 
 # The platform's include and library paths (the Vulkan SDK's, GLFW's, GLM's) come from zgal.mk's
 # ZGAL_CFLAGS and ZGAL_LDFLAGS

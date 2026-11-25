@@ -1,7 +1,7 @@
 # vulkan_splatting
 
 3D Gaussian splatting (Kerbl et al., SIGGRAPH 2023): rendering and training of splat scenes, written
-in ZGAL, the language of the Vulkan wrapper in `external/vulkan_test`. Every program builds
+in ZGAL, the language of the Vulkan wrapper in `external/zgal`. Every program builds
 for native Vulkan and for the web (WebGPU, under Node with Dawn or in a page); what the web does
 not support is in [docs/web.md](docs/web.md#not-supported-on-the-web).
 
@@ -112,7 +112,7 @@ The fuller version is [docs/architecture.md](docs/architecture.md#layout).
 - `tools/`: the offline Python converter, evaluator and synthetic scene generator, with tests.
 - `tests/`: C++ tests and closed-form oracles.
 - `colmap/`: the committed COLMAP scene and its images.
-- `external/vulkan_test`: the wrapper and ZGAL.
+- `external/zgal`: the wrapper and ZGAL.
 
 ## Docs
 

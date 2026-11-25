@@ -3,7 +3,7 @@
 Every program is also built for WebGPU (`make web`, ZGAL's `zgal-web-program`; locally it and
 `make test-web` need no emscripten) and runs under
 Node with Dawn (`node build/web/<name>/<name>.zgal.main.js <options>`) or in a page
-(`<name>.zgal.html`). The ZGAL side is in `external/vulkan_test/docs/web.md`; this file has what is
+(`<name>.zgal.html`). The ZGAL side is in `external/zgal/docs/web.md`; this file has what is
 specific to the splatting programs.
 
 ## Limits

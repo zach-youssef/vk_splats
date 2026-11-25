@@ -81,7 +81,7 @@
 - `colmap/`: the one real scene: `colmap_exports3`, a COLMAP text export (one SIMPLE_RADIAL
   camera, 46 images, sparse points; CRLF line endings), and its images, `cs5330_dense_resized`
   (748×748 JPEGs, named as in `images.txt`), committed directly (6.2 MB, no LFS).
-- `external/vulkan_test`: the wrapper and ZGAL.
+- `external/zgal`: the wrapper and ZGAL.
 
 ## Pipeline
 
@@ -149,7 +149,7 @@ Training adds Adam, and densification and pruning on a fixed capacity, compacted
   or a GLSL built-in function (`step`, `sign`, `distance`; hence `StreamField`'s `stepSize`), and
   a function or struct named like a body form (`values`, `count`, `sum`). A constant also can't
   be named like a C macro (`FLT_MAX`): the generated C++ is compiled alongside `<cfloat>`. The lists are
-  `external/vulkan_test/dsl/private/names.rkt`.
+  `external/zgal/dsl/private/names.rkt`.
 - **Draws**: a graphics material culls back faces by default, so one drawing screen-space quads
   whose winding isn't fixed (a splat's corners, either way round) needs `#:cull none`. Draw quads
   as a triangle list (6 vertices), not a 4-vertex strip: MoltenVK can't turn primitive restart

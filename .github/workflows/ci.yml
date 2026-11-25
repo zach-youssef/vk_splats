@@ -45,14 +45,14 @@ jobs:
         run: |
           git config --global url."https://github.com/".insteadOf git@github.com:
           git submodule update --init --recursive
-          url=$(git config -f .gitmodules submodule.external/vulkan_test.url)
+          url=$(git config -f .gitmodules submodule.external/zgal.url)
           repository=${url#git@github.com:}
           repository=${repository#https://github.com/}
           echo "repository=${repository%.git}" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD:external/vulkan_test)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD:external/zgal)" >> "$GITHUB_OUTPUT"
 
       - id: commits
-        uses: ./external/vulkan_test/.github/actions/commits
+        uses: ./external/zgal/.github/actions/commits
         # zgal-render stacks a whole milestone, so test more than the action's default 20 commits
         with:
           max: "50"
